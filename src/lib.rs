@@ -1,4 +1,4 @@
-pub mod io;
+pub mod io; // 加了pub之后为公共模块可以为外部调用
 pub mod logs;
 
 pub fn bar() {
