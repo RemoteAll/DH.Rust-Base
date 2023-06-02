@@ -1,3 +1,11 @@
+mod io;
+mod logs;
+
+pub fn bar() {
+    io::foo();
+    logs::baz();
+}
+
 pub fn add(left: usize, right: usize) -> usize {
     left + right
 }
