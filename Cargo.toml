@@ -1,6 +1,6 @@
 [package]
 name = "dhrust"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["Berin <100538511@qq.com>", "湖北登灏科技有限公司 <dingchuan@deng-hao.com>"]
 

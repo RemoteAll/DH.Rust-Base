@@ -1,5 +1,5 @@
-mod io;
-mod logs;
+pub mod io;
+pub mod logs;
 
 pub fn bar() {
     io::foo();
