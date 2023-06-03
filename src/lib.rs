@@ -1,9 +1,11 @@
 pub mod io; // 加了pub之后为公共模块可以为外部调用
 pub mod logs;
+pub mod times;
 
 pub fn bar() {
     io::foo();
     logs::baz();
+    times::foo();
 }
 
 pub fn add(left: usize, right: usize) -> usize {
