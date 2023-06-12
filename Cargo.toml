@@ -8,3 +8,4 @@ authors = ["Berin <100538511@qq.com>", "湖北登灏科技有限公司 <dingchua
 
 [dependencies]
 rand = "0.8.5"
+sha1 = "0.10.5"
