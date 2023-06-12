@@ -12,7 +12,6 @@ pub fn getrand(length: usize) -> String {
         .take(length)
         .map(char::from)
         .collect();
-    println!("Random string: {}", random_string);
 
     random_string
 }
