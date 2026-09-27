@@ -1,11 +1,15 @@
 [package]
 name = "dhrust"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 authors = ["Berin <100538511@qq.com>", "湖北登灏科技有限公司 <dingchuan@deng-hao.com>"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+# 时间文本格式/解析（与 C# 兼容的 yyyy-MM-dd HH:mm:ss 系列）
+chrono = "0.4"
+# MD5 摘要（NewLife `MD5()` 扩展等价实现）
+md-5 = "0.10"
 rand = "0.8.5"
 sha1 = "0.10.5"

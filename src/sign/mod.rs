@@ -1,3 +1,4 @@
+use md5::Md5;
 use rand::Rng;
 use sha1::{Digest, Sha1};
 
@@ -27,4 +28,33 @@ pub fn getrand(length: usize) -> String {
         .collect();
 
     random_string
+}
+
+/// 计算字符串的 MD5（32 位小写十六进制），对齐 NewLife 的 `MD5()` 扩展。
+pub fn md5_hex(text: &str) -> String {
+    let digest = Md5::digest(text.as_bytes());
+    let mut out = String::with_capacity(32);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn md5_hex_matches_newlife() {
+        assert_eq!(md5_hex("abc"), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(md5_hex(""), "d41d8cd98f00b204e9800998ecf8427e");
+    }
+
+    #[test]
+    fn signature_and_rand_are_stable() {
+        // 参数排序后拼接：SHA1 十六进制应为 40 位
+        let sign = create_signature("123".into(), "7".into(), "key".into());
+        assert_eq!(sign.len(), 40);
+        assert_eq!(getrand(12).chars().count(), 12);
+    }
 }
