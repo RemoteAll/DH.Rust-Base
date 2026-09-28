@@ -90,6 +90,14 @@ pub enum TokenKind {
     Code(String),
     /// `@model T` 的类型原文
     Model(String),
+    /// `@section 名称`（F008；名称后的块体由后续 LeftBrace 流承载）
+    Section(String),
+    /// `@RenderBody()`（F008 固定模式）
+    RenderBody,
+    /// `@await RenderSectionAsync(...)` 的括号内原文（F008 固定模式）
+    AwaitSection(String),
+    /// `@await Html.PartialAsync(...)` 的括号内原文（F009 固定模式）
+    AwaitPartial(String),
     /// 块开始 `{`
     LeftBrace,
     /// 块结束 `}`
@@ -198,11 +206,17 @@ impl Lexer {
 
     /// 扫描 `{ ... }` 块体（对齐原生 Razor 的「C# 上下文 / 标记区」切换语义）。
     ///
+    /// `start_in_markup`：块体起始上下文——`@if`/`@foreach`/`else` 从 C# 上下文开始
+    /// （前导空白按规则整理）；`@section` 从标记区开始（前导换行原样保留，实测对齐）。
     /// 规则见模块文档「块边界约定」；返回时位于块结束的 `}`（不消耗）。
-    fn scan_body(&mut self, tokens: &mut Vec<Token>) -> Result<(), ParseError> {
+    fn scan_body(
+        &mut self,
+        tokens: &mut Vec<Token>,
+        start_in_markup: bool,
+    ) -> Result<(), ParseError> {
         let mut text = String::new();
         let mut text_pos = (self.line, self.col);
-        let mut in_code = true; // C# 上下文
+        let mut in_code = !start_in_markup; // C# 上下文或标记区起始
         let mut depth = 0usize; // 标记区已打开元素深度
         loop {
             let Some(c) = self.peek() else {
@@ -597,7 +611,7 @@ impl Lexer {
                 let (cond, cpos) = self.expect_parenthesized("if", line, col)?;
                 tokens
                     .push(Token::new(TokenKind::If(cond), line, col).with_content(cpos.0, cpos.1));
-                self.scan_block_body("if", line, col, tokens)?;
+                self.scan_block_body("if", line, col, tokens, false)?;
                 self.try_scan_else(tokens)
             }
             "foreach" => {
@@ -605,7 +619,7 @@ impl Lexer {
                 tokens.push(
                     Token::new(TokenKind::ForEach(head), line, col).with_content(cpos.0, cpos.1),
                 );
-                self.scan_block_body("foreach", line, col, tokens)
+                self.scan_block_body("foreach", line, col, tokens, false)
             }
             "model" => {
                 let cpos = (self.line, self.col);
@@ -643,10 +657,40 @@ impl Lexer {
                 format!("不支持 @{word} 语句"),
             )
             .with_hint("子集规约 v0.1 不含该语句；请改用 @if / @foreach 或把逻辑移入页面模型")),
-            "await" => Err(ParseError::new(line, col, "暂不支持 @await")
-                .with_hint("@await Html.PartialAsync / RenderSectionAsync 固定模式规划于迭代 3")),
-            "section" => Err(ParseError::new(line, col, "暂不支持 @section")
-                .with_hint("布局与分区（F008）规划于迭代 3")),
+            "await" => self.scan_await(tokens, line, col),
+            "section" => {
+                self.skip_whitespace();
+                if !matches!(self.peek(), Some(c) if is_ident_start(c)) {
+                    return Err(ParseError::new(line, col, "@section 后缺少分区名")
+                        .with_hint("形如：@section Side { ... }"));
+                }
+                let (nl, nc) = (self.line, self.col);
+                let name = self.scan_identifier();
+                tokens.push(Token::new(TokenKind::Section(name), nl, nc));
+                self.scan_block_body("section", line, col, tokens, true)
+            }
+            "RenderBody" => {
+                self.skip_whitespace();
+                if self.peek() != Some('(') {
+                    return Err(
+                        ParseError::new(line, col, "RenderBody 固定模式为 @RenderBody()")
+                            .with_hint("布局中输出页面体：@RenderBody()"),
+                    );
+                }
+                let (inner, cpos) = self.scan_balanced('(', ')', "RenderBody 参数", line, col)?;
+                if !inner.trim().is_empty() {
+                    return Err(ParseError::new(
+                        line,
+                        col,
+                        "RenderBody 固定模式为 @RenderBody()（无参数）",
+                    )
+                    .with_hint("如需参数请改用 Partial；RenderBody 仅输出页面体"));
+                }
+                tokens.push(
+                    Token::new(TokenKind::RenderBody, line, col).with_content(cpos.0, cpos.1),
+                );
+                Ok(())
+            }
             _ => {
                 let expr = self.scan_implicit_expr(word.to_string())?;
                 tokens.push(
@@ -655,6 +699,59 @@ impl Lexer {
                 );
                 Ok(())
             }
+        }
+    }
+
+    /// `@await` 固定模式：`RenderSectionAsync("X", false)` / `Html.PartialAsync("Name", model)`。
+    fn scan_await(
+        &mut self,
+        tokens: &mut Vec<Token>,
+        line: usize,
+        col: usize,
+    ) -> Result<(), ParseError> {
+        self.skip_whitespace();
+        if !matches!(self.peek(), Some(c) if is_ident_start(c)) {
+            return Err(ParseError::new(line, col, "@await 后缺少内容").with_hint(
+                "仅支持 @await RenderSectionAsync(\"Name\", false) / @await Html.PartialAsync(\"Name\", model)",
+            ));
+        }
+        let word = self.scan_identifier();
+        match word.as_str() {
+            "RenderSectionAsync" => {
+                let (inner, cpos) = self.expect_parenthesized("RenderSectionAsync", line, col)?;
+                tokens.push(
+                    Token::new(TokenKind::AwaitSection(inner), line, col).with_content(cpos.0, cpos.1),
+                );
+                Ok(())
+            }
+            "Html" => {
+                self.skip_whitespace();
+                if self.peek() != Some('.') {
+                    return Err(ParseError::new(line, col, "不支持的 @await Html 用法")
+                        .with_hint("仅支持 @await Html.PartialAsync(\"Name\", model) 固定模式"));
+                }
+                self.bump(); // '.'
+                self.skip_whitespace();
+                if !matches!(self.peek(), Some(c) if is_ident_start(c)) {
+                    return Err(ParseError::new(line, col, "Html. 后缺少方法名")
+                        .with_hint("仅支持 @await Html.PartialAsync(\"Name\", model)"));
+                }
+                let method = self.scan_identifier();
+                if method != "PartialAsync" {
+                    return Err(ParseError::new(line, col, format!("不支持的 @await Html.{method}"))
+                        .with_hint("仅支持 @await Html.PartialAsync(\"Name\", model) 固定模式"));
+                }
+                let (inner, cpos) = self.expect_parenthesized("Html.PartialAsync", line, col)?;
+                tokens.push(
+                    Token::new(TokenKind::AwaitPartial(inner), line, col).with_content(cpos.0, cpos.1),
+                );
+                Ok(())
+            }
+            other => Err(
+                ParseError::new(line, col, format!("不支持的 @await {other}")).with_hint(
+                    "仅支持 @await RenderSectionAsync(\"Name\", false) / @await Html.PartialAsync(\"Name\", model)",
+                ),
+            ),
         }
     }
 
@@ -681,6 +778,7 @@ impl Lexer {
         line: usize,
         col: usize,
         tokens: &mut Vec<Token>,
+        start_in_markup: bool,
     ) -> Result<(), ParseError> {
         self.skip_whitespace();
         if self.peek() != Some('{') {
@@ -693,7 +791,7 @@ impl Lexer {
         let (bl, bc) = (self.line, self.col);
         self.bump(); // '{'
         tokens.push(Token::new(TokenKind::LeftBrace, bl, bc));
-        self.scan_body(tokens)?;
+        self.scan_body(tokens, start_in_markup)?;
         // scan_body 在块体未闭合时已报错，此处 peek 必为 '}'
         let (rl, rc) = (self.line, self.col);
         self.bump(); // '}'
@@ -720,13 +818,13 @@ impl Lexer {
             self.consume_word("if");
             let (cond, cpos) = self.expect_parenthesized("else if", el, ec)?;
             tokens.push(Token::new(TokenKind::ElseIf(cond), el, ec).with_content(cpos.0, cpos.1));
-            self.scan_block_body("else if", el, ec, tokens)?;
+            self.scan_block_body("else if", el, ec, tokens, false)?;
             // 允许链式 else if ... else
             self.try_scan_else(tokens)
         } else {
             self.restore(save2);
             tokens.push(Token::new(TokenKind::Else, el, ec));
-            self.scan_block_body("else", el, ec, tokens)?;
+            self.scan_block_body("else", el, ec, tokens, false)?;
             // 结构错误（多个 else 等）交由 parser 报错，这里继续产出以便诊断
             self.try_scan_else(tokens)
         }
@@ -1422,8 +1520,8 @@ mod tests {
             ("@switch (x) { }", "switch"),
             ("@while (true) { }", "while"),
             ("@for (var i = 0; i < 3; i++) { }", "for"),
-            ("@await Html.PartialAsync(\"x\")", "await"),
-            ("@section Head { }", "section"),
+            ("@await FooAsync()", "await"),
+            ("@section 123 { }", "section"),
             ("@inject IFoo Foo", "inject"),
             ("@functions { }", "functions"),
         ] {

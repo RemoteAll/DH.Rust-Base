@@ -1,0 +1,7 @@
+@{ Layout = "_layout"; }
+@section Title {<title>@Model.Title</title>}
+@section Side {
+<div class="side">站点：@Model.Name</div>
+}
+<h1>@Model.Title</h1>
+@foreach (var row in Model.Rows) {<li>@row.Name</li>}

@@ -22,6 +22,10 @@
 //!   （互操作用例 8/8 `RAZOR INTEROP PASSED`）
 //! - F014 ✅ 原生编译 v1：模板 → Rust 源码（`codegen`）→ cdylib（`native` 加载，`rt` 共享内核）；
 //!   实测 p50 13.7µs / 吞吐 2.07x C#；解释器保留为回退（`tools/razor-native`）
+//! - F008 ✅ 布局与分区：`@{ Layout }`/`@RenderBody()`/`@section`/`RenderSectionAsync`（`view` 编排布局链，上限 8）
+//! - F009 ✅ Partials：`@await Html.PartialAsync` 递归渲染（深度上限 8，禁 Layout/分区）
+//! - F010 ✅ 模板缓存：名称+变更戳（mtime 纳秒+长度）失效，命中零文件读取
+//! - 页面基准：原生 p50 2.7µs / 336k ops（4.51x C#）；互操作用例 10/10 `RAZOR INTEROP PASSED`
 
 pub mod codegen;
 pub mod error;
@@ -32,6 +36,7 @@ pub mod parser;
 mod render;
 pub mod rt;
 pub mod value;
+pub mod view;
 
 pub use error::{ParseError, RenderError};
 pub use parser::{Node, Stmt, Template};

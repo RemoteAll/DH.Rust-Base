@@ -29,17 +29,32 @@ impl Template {
 
     /// 按指定选项渲染模板。
     pub fn render_with(&self, model: &Value, options: &Options) -> Result<String, RenderError> {
-        let mut renderer = Renderer {
-            options,
-            root: model,
-            // 预分配输出缓冲（小页面一次分配到位，避免热路径反复扩容）
-            out: String::with_capacity(4096),
-            scopes: Vec::with_capacity(8),
-            depth: 0,
-        };
-        renderer.render_nodes(&self.nodes).map_err(|e| *e)?;
-        Ok(renderer.out)
+        let state = rt::RenderState::standalone();
+        let mut out = String::with_capacity(4096);
+        render_into(self, model, options, &state, &mut out).map_err(|e| *e)?;
+        Ok(out)
     }
+}
+
+/// 渲染到既有缓冲（供 ViewEngine 页面/布局/Partial 复用；`state` 承载页面上下文）。
+pub(crate) fn render_into(
+    tpl: &Template,
+    model: &Value,
+    options: &Options,
+    state: &rt::RenderState,
+    out: &mut String,
+) -> Result<(), Box<RenderError>> {
+    let mut renderer = Renderer {
+        options,
+        root: model,
+        out: std::mem::take(out),
+        scopes: Vec::with_capacity(8),
+        depth: 0,
+        state,
+    };
+    let result = renderer.render_nodes(&tpl.nodes);
+    *out = renderer.out;
+    result
 }
 
 // ————— 渲染器 —————
@@ -54,6 +69,8 @@ struct Renderer<'a> {
     scopes: Vec<(String, Value)>,
     /// 块嵌套深度（`render_nodes` 递归层数）
     depth: usize,
+    /// 页面/布局/Partial 上下文（F008/F009）
+    state: &'a rt::RenderState,
 }
 
 impl<'a> Renderer<'a> {
@@ -125,12 +142,35 @@ impl<'a> Renderer<'a> {
                 self.scopes.truncate(marker);
                 Ok(())
             }
+            Node::Section { name, body } => {
+                rt::ctx_begin_section(self.state, name)?;
+                // 隔离输出：分区体写入临时缓冲后收集（与 C# 侧 DefineSection 语义一致）
+                let saved = std::mem::take(&mut self.out);
+                let result = self.render_nodes(body);
+                let captured = std::mem::replace(&mut self.out, saved);
+                result?;
+                rt::ctx_end_section(self.state, name, captured)?;
+                Ok(())
+            }
+            Node::RenderBody => rt::ctx_render_body(self.state, &mut self.out),
+            Node::RenderSection { name, required } => {
+                rt::ctx_render_section(self.state, name, *required, &mut self.out)
+            }
+            Node::Partial { name, model } => {
+                let v = self.eval(model)?;
+                rt::ctx_partial(self.state, name, &v, &mut self.out)
+            }
             Node::Code(stmts) => {
                 for stmt in stmts {
                     match stmt {
                         Stmt::VarDecl { name, value } => {
                             let v = self.eval(value)?;
                             self.scopes.push((name.clone(), v));
+                        }
+                        Stmt::Assign { name, value } => {
+                            let v = self.eval(value)?;
+                            rt::ctx_set_layout_value(self.state, &v)?;
+                            let _ = name; // parser 已限定为 Layout
                         }
                     }
                 }

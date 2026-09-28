@@ -36,13 +36,6 @@ fn razor_cases_match_expected_output() {
         let expected = fs::read_to_string(dir.join("expected.html"))
             .unwrap_or_else(|e| panic!("[{name}] 读取 expected.html 失败：{e}"));
 
-        let template = match dhrust::razor::Template::parse(&template_src) {
-            Ok(t) => t,
-            Err(e) => {
-                failures.push(format!("[{name}] 解析失败：{e}"));
-                continue;
-            }
-        };
         let json: serde_json::Value = match serde_json::from_str(&data_src) {
             Ok(v) => v,
             Err(e) => {
@@ -51,7 +44,30 @@ fn razor_cases_match_expected_output() {
             }
         };
         let model = dhrust::razor::Value::from(json);
-        match template.render(&model) {
+
+        // 页面模式（F008/F009）：目录含 `_*.cshtml`（布局/Partial）→ 走视图引擎
+        let page_mode = fs::read_dir(dir)
+            .map(|entries| {
+                entries.flatten().any(|e| {
+                    let file_name = e.file_name().to_string_lossy().to_string();
+                    file_name.starts_with('_') && file_name.ends_with(".cshtml")
+                })
+            })
+            .unwrap_or(false);
+        let result = if page_mode {
+            let engine = dhrust::razor::view::ViewEngine::new(Box::new(
+                dhrust::razor::view::DirViewLoader::new(dir),
+            ));
+            engine
+                .render("template", &model)
+                .map_err(|e| format!("{e}"))
+        } else {
+            match dhrust::razor::Template::parse(&template_src) {
+                Ok(t) => t.render(&model).map_err(|e| format!("{e}")),
+                Err(e) => Err(format!("{e}")),
+            }
+        };
+        match result {
             Ok(actual) if actual == expected => passed += 1,
             Ok(actual) => failures.push(format!(
                 "[{name}] 输出不一致：\n---- 期望 ----\n{expected}\n---- 实际 ----\n{actual}\n----"

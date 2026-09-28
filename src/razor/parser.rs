@@ -56,11 +56,34 @@ pub enum Node {
         /// 循环体
         body: Vec<Node>,
     },
+    /// `@section 名称 { }`（F008；分区体在定义处立即渲染并收集）
+    Section {
+        /// 分区名
+        name: String,
+        /// 分区体
+        body: Vec<Node>,
+    },
+    /// `@RenderBody()`（F008；布局中输出页面体）
+    RenderBody,
+    /// `@await RenderSectionAsync("名称", required)`（F008；布局中输出分区）
+    RenderSection {
+        /// 分区名
+        name: String,
+        /// 缺失时是否报错
+        required: bool,
+    },
+    /// `@await Html.PartialAsync("名称", 模型表达式)`（F009）
+    Partial {
+        /// 部分视图名（受控目录内）
+        name: String,
+        /// 子模型表达式
+        model: Expr,
+    },
     /// `@{ ... }` 代码块
     Code(Vec<Stmt>),
 }
 
-/// 代码块语句（v0 仅 var 声明）。
+/// 代码块语句（var 声明 / Layout 赋值）。
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stmt {
     /// `var 名称 = 表达式;`
@@ -68,6 +91,13 @@ pub enum Stmt {
         /// 变量名
         name: String,
         /// 初始值表达式
+        value: Expr,
+    },
+    /// `Layout = 表达式;`（F008；仅限 Layout）
+    Assign {
+        /// 目标名（仅 Layout）
+        name: String,
+        /// 表达式
         value: Expr,
     },
 }
@@ -144,6 +174,22 @@ impl<'t> NodeParser<'t> {
                 TokenKind::ForEach(head) => {
                     let node = self.parse_foreach(tok, head)?;
                     nodes.push(node);
+                }
+                TokenKind::Section(name) => {
+                    let node = self.parse_section(name);
+                    nodes.push(node?);
+                }
+                TokenKind::RenderBody => {
+                    nodes.push(Node::RenderBody);
+                    self.pos += 1;
+                }
+                TokenKind::AwaitSection(inner) => {
+                    nodes.push(parse_await_section(inner, tok)?);
+                    self.pos += 1;
+                }
+                TokenKind::AwaitPartial(inner) => {
+                    nodes.push(parse_await_partial(inner, tok)?);
+                    self.pos += 1;
                 }
                 TokenKind::Code(s) => {
                     if let Some(node) = parse_code_block(s, tok)? {
@@ -230,6 +276,16 @@ impl<'t> NodeParser<'t> {
         self.pos += 1; // 消耗 ForEach
         let body = self.parse_block_body()?;
         Ok(Node::ForEach { var, iter, body })
+    }
+
+    /// 解析 `@section 名称 { }`（分区体在渲染期定义处立即求值并收集）。
+    fn parse_section(&mut self, name: &'t str) -> Result<Node, ParseError> {
+        self.pos += 1; // 消耗 Section
+        let body = self.parse_block_body()?;
+        Ok(Node::Section {
+            name: name.to_string(),
+            body,
+        })
     }
 
     /// 消耗 `{`、解析块体节点、消耗 `}`。
@@ -416,9 +472,29 @@ fn parse_statement(source: &str, line: usize, col: usize) -> Result<Option<Stmt>
         return Ok(None);
     }
     if !sc.try_consume_word("var") {
+        // 赋值语句：`Layout = 表达式;`（F008；仅限 Layout）
+        if matches!(sc.peek(), Some(c) if is_ident_start(c)) {
+            let name = sc.scan_identifier();
+            sc.skip_trivia()?;
+            if sc.peek() == Some('=') && sc.peek_at(1) != Some('=') {
+                sc.bump(); // '='
+                let rest = sc.rest();
+                let base = sc.here();
+                if rest.trim().is_empty() {
+                    return Err(sc.error("= 后缺少表达式"));
+                }
+                if name != "Layout" {
+                    return Err(sc
+                        .error(format!("不支持赋值：{name}（仅 Layout）"))
+                        .with_hint("子集规约：代码块支持 var 声明与 Layout = \"布局名\"; 赋值"));
+                }
+                let value = expr::parse(&rest, base.0, base.1)?;
+                return Ok(Some(Stmt::Assign { name, value }));
+            }
+        }
         return Err(sc
-            .error("代码块仅支持 var 名称 = 表达式; 声明（子集规约 v0.1）")
-            .with_hint("赋值等其它语句规划于迭代 3（如 Layout）；复杂逻辑请移入页面模型"));
+            .error("代码块仅支持 var 名称 = 表达式; 声明与 Layout = 表达式; 赋值（子集规约 v0.1）")
+            .with_hint("复杂逻辑请移入页面模型"));
     }
     sc.skip_trivia()?;
     if !matches!(sc.peek(), Some(c) if is_ident_start(c)) {
@@ -439,6 +515,89 @@ fn parse_statement(source: &str, line: usize, col: usize) -> Result<Option<Stmt>
     }
     let value = expr::parse(&rest, base.0, base.1)?;
     Ok(Some(Stmt::VarDecl { name, value }))
+}
+
+/// 解析 `@await RenderSectionAsync("名称", required)` 固定模式（F008）。
+fn parse_await_section(inner: &str, tok: &Token) -> Result<Node, ParseError> {
+    let hint = "固定模式：@await RenderSectionAsync(\"Side\", false)";
+    let Some((name_part, required_part)) = split_top_level_args(inner) else {
+        return Err(
+            ParseError::new(tok.line, tok.col, "RenderSectionAsync 需要两个参数").with_hint(hint),
+        );
+    };
+    let name = parse_string_arg(name_part.trim(), tok, "分区名")?;
+    let required = match required_part.trim() {
+        "true" => true,
+        "false" => false,
+        _ => {
+            return Err(ParseError::new(
+                tok.line,
+                tok.col,
+                "RenderSectionAsync 第二个参数需为 true/false",
+            )
+            .with_hint(hint));
+        }
+    };
+    Ok(Node::RenderSection { name, required })
+}
+
+/// 解析 `@await Html.PartialAsync("名称", 模型表达式)` 固定模式（F009）。
+fn parse_await_partial(inner: &str, tok: &Token) -> Result<Node, ParseError> {
+    let hint = "固定模式：@await Html.PartialAsync(\"Name\", model)";
+    let Some((name_part, model_part)) = split_top_level_args(inner) else {
+        return Err(
+            ParseError::new(tok.line, tok.col, "PartialAsync 需要两个参数").with_hint(hint),
+        );
+    };
+    let name = parse_string_arg(name_part.trim(), tok, "Partial 名称")?;
+    let model_src = model_part.trim();
+    if model_src.is_empty() {
+        return Err(
+            ParseError::new(tok.line, tok.col, "PartialAsync 缺少模型参数").with_hint(hint),
+        );
+    }
+    let model = expr::parse(model_src, tok.content_line, tok.content_col)?;
+    Ok(Node::Partial { name, model })
+}
+
+/// 解析字符串字面量参数（如 `"Side"`），返回其值。
+fn parse_string_arg(src: &str, tok: &Token, what: &str) -> Result<String, ParseError> {
+    match expr::parse(src, tok.content_line, tok.content_col)? {
+        Expr::Lit(expr::Literal::Str(s)) => Ok(s.to_string()),
+        _ => Err(ParseError::new(
+            tok.line,
+            tok.col,
+            format!("{what}需为字符串字面量（双引号）"),
+        )
+        .with_hint("例如：\"Side\"")),
+    }
+}
+
+/// 顶层逗号拆分（字符串/字符/括号内不拆分）；固定模式两个参数专用。
+fn split_top_level_args(s: &str) -> Option<(String, String)> {
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut esc = false;
+    for (i, c) in s.char_indices() {
+        if let Some(q) = quote {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => return Some((s[..i].to_string(), s[i + 1..].to_string())),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// 拆分 `@foreach` 头部：`var 名称 in 表达式`。
@@ -835,7 +994,7 @@ mod tests {
 
     #[test]
     fn code_block_statement_errors() {
-        assert!(err("@{ x = 1; }").message.contains("仅支持 var"));
+        assert!(err("@{ x = 1; }").message.contains("不支持赋值"));
         assert!(err("@{ var = 1; }").message.contains("缺少变量名"));
         assert!(err("@{ var x 1; }").message.contains("缺少 ="));
         assert!(err("@{ var x = 1 }").message.contains("缺少 ;"));

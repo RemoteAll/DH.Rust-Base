@@ -15,8 +15,13 @@ use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // 页面模式（F008/F009）：bench-view --view <目录> <data.json> [iters] [warmup] [nativeDir]
+    if args.first().map(String::as_str) == Some("--view") {
+        std::process::exit(bench_view_mode(&args[1..]));
+    }
     if args.len() < 2 {
         eprintln!("用法：bench-view <template.cshtml> <data.json> [iterations] [warmup] [native.dll]");
+        eprintln!("      bench-view --view <目录> <data.json> [iterations] [warmup] [nativeDir]");
         std::process::exit(2);
     }
     let iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20_000);
@@ -39,6 +44,55 @@ fn main() {
             native.render(&model).expect("渲染失败")
         });
     }
+}
+
+/// 页面模式基准（F008/F009）：视图引擎（可选原生产物），入口视图名约定 `template`。
+fn bench_view_mode(args: &[String]) -> i32 {
+    if args.len() < 2 {
+        eprintln!("用法：bench-view --view <目录> <data.json> [iterations] [warmup] [nativeDir]");
+        return 2;
+    }
+    let dir = &args[0];
+    let data_path = &args[1];
+    let iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20_000);
+    let warmup: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1_000);
+    let native_dir = args.get(4);
+
+    let engine = dhrust::razor::view::ViewEngine::new(Box::new(
+        dhrust::razor::view::DirViewLoader::new(dir),
+    ));
+    if let Some(nd) = native_dir {
+        if let Ok(entries) = std::fs::read_dir(nd) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("dll") {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                match dhrust::razor::native::NativeTemplate::load(&path) {
+                    Ok(native) => engine.register_native(stem, native),
+                    Err(e) => {
+                        eprintln!("加载原生视图 {stem} 失败：{e}");
+                        return 2;
+                    }
+                }
+            }
+        }
+    }
+    let label = if native_dir.is_some() {
+        "rust-view-native"
+    } else {
+        "rust-view"
+    };
+    let data_src = std::fs::read_to_string(data_path).expect("读取数据失败");
+    let json: serde_json::Value = serde_json::from_str(&data_src).expect("数据 JSON 无效");
+    let model = dhrust::razor::Value::from(json);
+    bench(label, iters, warmup, || {
+        engine.render("template", &model).expect("渲染失败")
+    });
+    0
 }
 
 /// 单引擎计时：warmup → 计时循环（逐次采样）→ 吞吐/分位输出。

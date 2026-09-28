@@ -19,7 +19,8 @@ use crate::razor::expr::{BinOp, Expr, Literal, Seg, UnOp};
 use crate::razor::parser::{Node, Stmt, Template};
 
 /// 生成代码预期的 ABI 版本（加载器校验；不兼容时拒绝加载）。
-pub const RAZOR_CODEGEN_ABI: u32 = 1;
+/// v2：`razor_render`/`__render` 增加渲染上下文参数（F008/F009）。
+pub const RAZOR_CODEGEN_ABI: u32 = 2;
 
 impl Template {
     /// 生成可直接作为 cdylib 编译的 `lib.rs` 源码（UTF-8，含完整渲染入口）。
@@ -91,15 +92,17 @@ impl Gen {
              \x20   model: *const Value,\n\
              \x20   out: *mut String,\n\
              \x20   escape: bool,\n\
+             \x20   state: *const rt::RenderState,\n\
              \x20   err_out: *mut *mut RenderError,\n\
              ) -> bool {{\n\
-             \x20   if model.is_null() || out.is_null() || err_out.is_null() {{\n\
+             \x20   if model.is_null() || out.is_null() || state.is_null() || err_out.is_null() {{\n\
              \x20       return false;\n\
              \x20   }}\n\
              \x20   let model = unsafe {{ &*model }};\n\
              \x20   let out = unsafe {{ &mut *out }};\n\
+             \x20   let state = unsafe {{ &*state }};\n\
              \x20   let mut __ic = [u32::MAX; {n}];\n\
-             \x20   match __render(model, out, escape, &mut __ic) {{\n\
+             \x20   match __render(model, out, escape, state, &mut __ic) {{\n\
              \x20       Ok(()) => true,\n\
              \x20       Err(e) => {{\n\
              \x20           unsafe {{ *err_out = Box::into_raw(e); }}\n\
@@ -110,7 +113,7 @@ impl Gen {
             n = self.ic_count
         );
         self.src.push_str(
-            "fn __render(model: &Value, out: &mut String, escape: bool, __ic: &mut [u32]) -> Result<(), Box<RenderError>> {\n",
+            "fn __render(model: &Value, out: &mut String, escape: bool, state: &rt::RenderState, __ic: &mut [u32]) -> Result<(), Box<RenderError>> {\n",
         );
         // 字面量池（预建 Rc<str>：热路径仅引用计数克隆，零分配）
         for (k, s) in self.lit_pool.iter().enumerate() {
@@ -268,6 +271,44 @@ impl Gen {
                 self.scopes.pop();
                 self.branch_close(false);
             }
+            Node::Section { name, body } => {
+                // 分区体：隔离缓冲渲染后收集（与解释器/C# DefineSection 同语义）
+                self.line(&format!(
+                    "rt::ctx_begin_section(state, {})?;",
+                    rust_str(name)
+                ));
+                let buf = self.next_tmp();
+                self.line(&format!("let mut {buf} = String::new();"));
+                self.line("{");
+                self.indent += 1;
+                self.line(&format!("let out = &mut {buf};"));
+                self.scopes.push(Vec::new());
+                self.emit_nodes(body);
+                self.scopes.pop();
+                self.indent -= 1;
+                self.line("}");
+                self.line(&format!(
+                    "rt::ctx_end_section(state, {}, {buf})?;",
+                    rust_str(name)
+                ));
+            }
+            Node::RenderBody => {
+                self.line("rt::ctx_render_body(state, out)?;");
+            }
+            Node::RenderSection { name, required } => {
+                self.line(&format!(
+                    "rt::ctx_render_section(state, {}, {}, out)?;",
+                    rust_str(name),
+                    required
+                ));
+            }
+            Node::Partial { name, model } => {
+                let v = self.emit_value(model);
+                self.line(&format!(
+                    "rt::ctx_partial(state, {}, &{v}, out)?;",
+                    rust_str(name)
+                ));
+            }
             Node::Code(stmts) => {
                 for stmt in stmts {
                     match stmt {
@@ -275,6 +316,10 @@ impl Gen {
                             let v = self.emit_value(value);
                             self.line(&format!("let {}: Value = {v};", Self::var_ident(name)));
                             self.register_var(name);
+                        }
+                        Stmt::Assign { value, .. } => {
+                            let v = self.emit_value(value);
+                            self.line(&format!("rt::ctx_set_layout_value(state, &{v})?;"));
                         }
                     }
                 }
@@ -575,7 +620,7 @@ mod tests {
             "缺少渲染入口"
         );
         assert!(s.contains(
-            "fn __render(model: &Value, out: &mut String, escape: bool, __ic: &mut [u32])"
+            "fn __render(model: &Value, out: &mut String, escape: bool, state: &rt::RenderState, __ic: &mut [u32])"
         ));
         assert!(s.contains("let mut __ic = [u32::MAX;"));
         assert!(s.contains("out.push_str(\"<p>hi</p>\");"));

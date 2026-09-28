@@ -42,6 +42,19 @@ function Get-Metric($lines, [string]$key) {
     return [double]($line.Substring($key.Length + 1))
 }
 
+function Assert-BytesEqual([string]$p1, [string]$p2, [string]$label) {
+    $a = [System.IO.File]::ReadAllBytes($p1)
+    $b = [System.IO.File]::ReadAllBytes($p2)
+    $same = $a.Length -eq $b.Length
+    if ($same) {
+        for ($i = 0; $i -lt $a.Length; $i++) {
+            if ($a[$i] -ne $b[$i]) { $same = $false; break }
+        }
+    }
+    if (-not $same) { throw "$label 不一致（$($a.Length)B vs $($b.Length)B）" }
+    Write-Host "  [OK] $label（$($a.Length)B）"
+}
+
 if (-not $SkipBuild) {
     Write-Step "构建 Rust（release：示例 + bench-view）"
     & cargo build --release --features razor --example razor_render --manifest-path (Join-Path $root "Cargo.toml") 2>&1 | Select-Object -Last 2 | ForEach-Object { Write-Host "  $_" }
@@ -116,6 +129,40 @@ $csExit = $LASTEXITCODE
 $csLines | ForEach-Object { Write-Host "  $_" }
 if ($csExit -ne 0) { throw "C# 基准失败（exit $csExit）" }
 
+Write-Step "页面模式基准（F008/F009：09_two_level_layout，三方 sanity）"
+$pageDir = Join-Path $root "tests\razor_cases\09_two_level_layout"
+$pageData = Join-Path $pageDir "data.json"
+$pageNativeDir = Join-Path $workDir "page-native"
+& $nativeTool render-page $pageDir $pageData -o (Join-Path $workDir "page.native.html") --native-dir $pageNativeDir 2>&1 | Select-Object -Last 1 | ForEach-Object { Write-Host "  $_" }
+if ($LASTEXITCODE -ne 0) { throw "页面原生编译/渲染失败" }
+& $rustExample --root $pageDir template $pageData -o (Join-Path $workDir "page.interp.html")
+if ($LASTEXITCODE -ne 0) { throw "页面解释器渲染失败" }
+& $csExe render-page $pageDir $pageData -o (Join-Path $workDir "page.cs.html")
+if ($LASTEXITCODE -ne 0) { throw "页面 C# 渲染失败" }
+Assert-BytesEqual (Join-Path $workDir "page.interp.html") (Join-Path $workDir "page.cs.html") "页面：解释器 vs C#"
+Assert-BytesEqual (Join-Path $workDir "page.native.html") (Join-Path $workDir "page.cs.html") "页面：原生 vs C#"
+
+$csPageLines = & $csExe bench-page $pageDir $pageData $Iterations $Warmup
+if ($LASTEXITCODE -ne 0) { throw "C# 页面基准失败" }
+$viewLines = & $rustBench --view $pageDir $pageData $Iterations $Warmup
+if ($LASTEXITCODE -ne 0) { throw "Rust 视图（解释器）基准失败" }
+$viewNativeLines = & $rustBench --view $pageDir $pageData $Iterations $Warmup $pageNativeDir
+if ($LASTEXITCODE -ne 0) { throw "Rust 视图（原生）基准失败" }
+$csPageLines | ForEach-Object { Write-Host "  $_" }
+$viewLines | ForEach-Object { Write-Host "  $_" }
+$viewNativeLines | ForEach-Object { Write-Host "  $_" }
+
+$pvOps = Get-Metric $viewLines "ops_per_sec"
+$pnOps = Get-Metric $viewNativeLines "ops_per_sec"
+$pcOps = Get-Metric $csPageLines "ops_per_sec"
+$pvP50 = Get-Metric $viewLines "p50_us"
+$pnP50 = Get-Metric $viewNativeLines "p50_us"
+$pcP50 = Get-Metric $csPageLines "p50_us"
+
+"{0,-12} {1,14} {2,14} {3,14}" -f "页面指标", "Rust(解释)", "Rust(原生)", "C#" | Write-Host
+"{0,-12} {1,14:N0} {2,14:N0} {3,14:N0}" -f "ops/sec", $pvOps, $pnOps, $pcOps | Write-Host
+"{0,-12} {1,14:N2} {2,14:N2} {3,14:N2}" -f "p50(us)", $pvP50, $pnP50, $pcP50 | Write-Host
+
 Write-Step "汇总"
 $rOps = Get-Metric $rLines "ops_per_sec"
 $nOps = Get-Metric $nLines "ops_per_sec"
@@ -137,11 +184,13 @@ $cP99 = Get-Metric $csLines "p99_us"
 "{0,-12} {1,14:N2} {2,14:N2} {3,14:N2}" -f "p99(us)", $rP99, $nP99, $cP99 | Write-Host
 
 $ratio = $nOps / $cOps
+$pageRatio = $pnOps / $pcOps
 Write-Host ""
-Write-Host ("原生/C# 吞吐比 = {0:N2}x；解释器/C# = {1:N2}x" -f $ratio, ($rOps / $cOps)) -ForegroundColor Cyan
-if ($nOps -ge $cOps) {
-    Write-Host "VIEW BENCH PASSED（Rust 原生吞吐 >= C# 同口径；p50 目标 <= C#）" -ForegroundColor Green
+Write-Host ("单模板：原生/C# = {0:N2}x；解释器/C# = {1:N2}x" -f $ratio, ($rOps / $cOps)) -ForegroundColor Cyan
+Write-Host ("页面：原生/C# = {0:N2}x；解释器视图/C# = {1:N2}x" -f $pageRatio, ($pvOps / $pcOps)) -ForegroundColor Cyan
+if ($nOps -ge $cOps -and $pnOps -ge $pcOps) {
+    Write-Host "VIEW BENCH PASSED（单模板与页面的原生吞吐均 >= C# 同口径）" -ForegroundColor Green
     exit 0
 }
-Write-Host "VIEW BENCH FAILED（原生吞吐低于 C#，需继续优化）" -ForegroundColor Red
+Write-Host "VIEW BENCH FAILED（存在低于 C# 的场景，需继续优化）" -ForegroundColor Red
 exit 1

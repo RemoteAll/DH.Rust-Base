@@ -1,0 +1,5 @@
+@{ Layout = "_base"; }
+<section class="main">
+@RenderBody()
+</section>
+<ul class="side">@await RenderSectionAsync("Side", false)</ul>

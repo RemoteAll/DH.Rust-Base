@@ -9,6 +9,8 @@
 //! 因此语义实现只在此处维护一份；两者都不允许各自复制逻辑。
 //! 所有函数均标注 `#[inline]`：生成代码所在的 dylib 以 MIR 内联方式复用同一实现。
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::rc::Rc;
 
@@ -579,4 +581,207 @@ pub fn push_i64(out: &mut String, v: i64) {
         out.push('-');
     }
     out.push_str(std::str::from_utf8(&buf[i..]).expect("十进制 ASCII"));
+}
+
+// ————— 页面上下文（F008 布局与分区 / F009 Partials） —————
+
+/// 渲染模式（与 C# 侧 `RenderMode` 一致）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderMode {
+    /// 独立渲染（无页面上下文：分区/布局/Partial 均不可用）
+    Standalone = 0,
+    /// 页面渲染（收集分区与 Layout）
+    Page = 1,
+    /// 布局渲染（提供 Body 与分区）
+    Layout = 2,
+    /// Partial 渲染（无权定义分区/设置 Layout）
+    Partial = 3,
+}
+
+/// Partial 渲染宿主回调（C 风格两段指针：避免 trait 对象胖指针构造；
+/// 宿主数据指针在单次渲染调用期间由引擎保证有效）。
+#[derive(Clone, Copy)]
+pub struct PartialHost {
+    /// 渲染回调（trampoline：`data` → 引擎引用 → 渲染命名 Partial）
+    pub render: fn(
+        data: *const (),
+        name: &str,
+        model: &Value,
+        out: &mut String,
+        depth: u32,
+    ) -> Result<(), Box<RenderError>>,
+    /// 宿主数据（引擎自身薄指针）
+    pub data: *const (),
+}
+
+/// 渲染上下文：页面 / 布局 / Partial 共享（解释器与生成代码同源语义）。
+pub struct RenderState {
+    /// 当前渲染模式
+    pub mode: RenderMode,
+    /// 页面体（仅布局模式）
+    pub body: Option<Rc<str>>,
+    /// 分区（页面收集 / 布局读取）
+    pub sections: RefCell<HashMap<String, Rc<str>>>,
+    /// 布局链名（`{ Layout = "..." }` 设置）
+    pub layout: RefCell<Option<Rc<str>>>,
+    /// 分区体渲染中（防嵌套定义）
+    pub in_section: Cell<bool>,
+    /// Partial 嵌套层级（页面/布局为 0）
+    pub depth: u32,
+    /// Partial 宿主（独立渲染为空）
+    host: Option<PartialHost>,
+}
+
+impl RenderState {
+    /// 独立渲染（无宿主：分区/Partial 不可用）。
+    pub fn standalone() -> Self {
+        Self {
+            mode: RenderMode::Standalone,
+            body: None,
+            sections: RefCell::new(HashMap::new()),
+            layout: RefCell::new(None),
+            in_section: Cell::new(false),
+            depth: 0,
+            host: None,
+        }
+    }
+
+    /// 页面渲染上下文（收集分区与 Layout）。
+    pub fn for_page(host: PartialHost) -> Self {
+        Self {
+            host: Some(host),
+            mode: RenderMode::Page,
+            ..Self::standalone()
+        }
+    }
+
+    /// 布局渲染上下文（提供页面体与分区）。
+    pub fn for_layout(host: PartialHost, body: String, sections: HashMap<String, Rc<str>>) -> Self {
+        Self {
+            mode: RenderMode::Layout,
+            body: Some(Rc::from(body)),
+            sections: RefCell::new(sections),
+            layout: RefCell::new(None),
+            in_section: Cell::new(false),
+            depth: 0,
+            host: Some(host),
+        }
+    }
+
+    /// Partial 渲染上下文（指定嵌套层级）。
+    pub fn for_partial(host: PartialHost, depth: u32) -> Self {
+        Self {
+            mode: RenderMode::Partial,
+            depth,
+            host: Some(host),
+            ..Self::standalone()
+        }
+    }
+
+    /// 取出页面渲染收集的分区（转交布局链，各级共享）。
+    pub fn take_sections(&self) -> HashMap<String, Rc<str>> {
+        std::mem::take(&mut *self.sections.borrow_mut())
+    }
+
+    /// 取出当前模板设置的布局名。
+    pub fn take_layout(&self) -> Option<Rc<str>> {
+        self.layout.borrow_mut().take()
+    }
+}
+
+/// `Layout = 表达式;`（F008）：仅接受字符串（与 C# 属性类型一致）。
+pub fn ctx_set_layout_value(state: &RenderState, v: &Value) -> Result<(), Box<RenderError>> {
+    match v {
+        Value::Str(s) => {
+            *state.layout.borrow_mut() = Some(s.clone());
+            Ok(())
+        }
+        other => Err(fail(
+            "Layout",
+            format!(
+                "Layout 需要字符串（实际为 {}），如 @{{ Layout = \"_layout\"; }}",
+                value_type_name(other)
+            ),
+        )),
+    }
+}
+
+/// `@section 名称` 开始（F008）：分区仅允许在页面中定义，不可嵌套、不可重名。
+pub fn ctx_begin_section(state: &RenderState, name: &str) -> Result<(), Box<RenderError>> {
+    if state.mode != RenderMode::Page {
+        return Err(fail(format!("section {name}"), "分区只能在页面模板中定义"));
+    }
+    if state.in_section.get() {
+        return Err(fail(format!("section {name}"), "分区不能嵌套定义"));
+    }
+    if state.sections.borrow().contains_key(name) {
+        return Err(fail(
+            format!("section {name}"),
+            format!("section 重复定义：{name}"),
+        ));
+    }
+    state.in_section.set(true);
+    Ok(())
+}
+
+/// `@section` 收集（F008）：分区体已渲染为字符串，存入上下文。
+pub fn ctx_end_section(
+    state: &RenderState,
+    name: &str,
+    content: String,
+) -> Result<(), Box<RenderError>> {
+    state.in_section.set(false);
+    state
+        .sections
+        .borrow_mut()
+        .insert(name.to_string(), Rc::from(content));
+    Ok(())
+}
+
+/// `@RenderBody()`（F008）：输出页面体（仅布局模式）。
+pub fn ctx_render_body(state: &RenderState, out: &mut String) -> Result<(), Box<RenderError>> {
+    if state.mode != RenderMode::Layout {
+        return Err(fail("RenderBody()", "RenderBody 仅在布局模板中可用"));
+    }
+    if let Some(body) = &state.body {
+        out.push_str(body);
+    }
+    Ok(())
+}
+
+/// `@await RenderSectionAsync("X", required)`（F008）：输出分区（仅布局模式）。
+pub fn ctx_render_section(
+    state: &RenderState,
+    name: &str,
+    required: bool,
+    out: &mut String,
+) -> Result<(), Box<RenderError>> {
+    let path = format!("RenderSectionAsync(\"{name}\")");
+    if state.mode != RenderMode::Layout {
+        return Err(fail(path, "RenderSection 仅在布局模板中可用"));
+    }
+    if let Some(html) = state.sections.borrow().get(name) {
+        out.push_str(html);
+        return Ok(());
+    }
+    if required {
+        return Err(fail(path, format!("缺少必需的分区：{name}")));
+    }
+    Ok(())
+}
+
+/// `@await Html.PartialAsync("Name", model)`（F009）：交给宿主渲染。
+pub fn ctx_partial(
+    state: &RenderState,
+    name: &str,
+    model: &Value,
+    out: &mut String,
+) -> Result<(), Box<RenderError>> {
+    let Some(host) = state.host else {
+        return Err(fail(
+            format!("PartialAsync(\"{name}\")"),
+            "Partial 需要页面渲染上下文（用 ViewEngine）",
+        ));
+    };
+    (host.render)(host.data, name, model, out, state.depth + 1)
 }

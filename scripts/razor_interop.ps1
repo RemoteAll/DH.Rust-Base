@@ -4,6 +4,9 @@
 # （tools/csharp/RazorInterop，RazorEngineCore 免宿主编译 + HtmlEncoder.Default）
 # 双端渲染，逐字节比对；全部一致时输出 RAZOR INTEROP PASSED。
 #
+# 用例模式：目录含 `_*.cshtml`（布局/Partial）时为「页面模式」（F008/F009），
+# Rust 用 `--root <目录> template`，C# 用 `render-page <目录>`；否则为单模板模式。
+#
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File scripts\razor_interop.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts\razor_interop.ps1 -SkipBuild
@@ -94,14 +97,24 @@ foreach ($case in $cases) {
     $data = Join-Path $case.FullName "data.json"
     $rustOut = Join-Path $workDir "$($case.Name).rust.html"
     $csOut = Join-Path $workDir "$($case.Name).cs.html"
+    $pageMode = @(Get-ChildItem $case.FullName -Filter "_*.cshtml").Count -gt 0
 
-    & $rustExe $tpl $data -o $rustOut
+    if ($pageMode) {
+        # 页面模式（F008/F009）：布局链/分区/Partial 由视图引擎编排
+        & $rustExe --root $case.FullName template $data -o $rustOut
+    } else {
+        & $rustExe $tpl $data -o $rustOut
+    }
     if ($LASTEXITCODE -ne 0) {
         Write-Fail $case.Name "Rust 渲染失败（exit $LASTEXITCODE）"
         continue
     }
 
-    & $csExe render $tpl $data -o $csOut
+    if ($pageMode) {
+        & $csExe render-page $case.FullName $data -o $csOut
+    } else {
+        & $csExe render $tpl $data -o $csOut
+    }
     if ($LASTEXITCODE -ne 0) {
         Write-Fail $case.Name "C# 渲染失败（exit $LASTEXITCODE）"
         continue

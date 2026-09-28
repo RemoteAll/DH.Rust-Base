@@ -18,12 +18,18 @@ use std::path::Path;
 
 use crate::razor::codegen::RAZOR_CODEGEN_ABI;
 use crate::razor::error::RenderError;
+use crate::razor::rt::RenderState;
 use crate::razor::value::Value;
 use crate::razor::Options;
 
-/// 生成代码的渲染入口签名（与 `codegen.rs` 生成物一致）。
-type RenderFn =
-    unsafe extern "C" fn(*const Value, *mut String, bool, *mut *mut RenderError) -> bool;
+/// 生成代码的渲染入口签名（与 `codegen.rs` 生成物一致；v2 含渲染上下文）。
+type RenderFn = unsafe extern "C" fn(
+    *const Value,
+    *mut String,
+    bool,
+    *const RenderState,
+    *mut *mut RenderError,
+) -> bool;
 
 /// 已加载的原生模板（渲染输出与解释器逐字节一致）。
 pub struct NativeTemplate {
@@ -77,26 +83,39 @@ impl NativeTemplate {
         Ok(Self { handle, render_fn })
     }
 
-    /// 渲染模板（默认选项：转义开启）。
+    /// 渲染模板（默认选项：转义开启；独立上下文——分区/布局/Partial 不可用）。
     pub fn render(&self, model: &Value) -> Result<String, RenderError> {
         self.render_with(model, &Options::default())
     }
 
-    /// 按指定选项渲染模板（仅 `escape` 生效；嵌套深度由生成代码结构决定、无需运行时保护）。
+    /// 按指定选项渲染模板（独立上下文；仅 `escape` 生效）。
     pub fn render_with(&self, model: &Value, options: &Options) -> Result<String, RenderError> {
-        // 小页面一次分配到位（与解释器一致）
+        let state = RenderState::standalone();
         let mut out = String::with_capacity(4096);
+        self.render_with_state(model, options, &state, &mut out)?;
+        Ok(out)
+    }
+
+    /// 在既有页面上下文中渲染到指定缓冲（ViewEngine 页面/布局/Partial 路径使用）。
+    pub fn render_with_state(
+        &self,
+        model: &Value,
+        options: &Options,
+        state: &RenderState,
+        out: &mut String,
+    ) -> Result<(), RenderError> {
         let mut err: *mut RenderError = std::ptr::null_mut();
         let ok = unsafe {
             (self.render_fn)(
                 model as *const Value,
-                &mut out as *mut String,
+                out as *mut String,
                 options.escape,
+                state as *const RenderState,
                 &mut err,
             )
         };
         if ok {
-            return Ok(out);
+            return Ok(());
         }
         if err.is_null() {
             return Err(RenderError::new("原生渲染", "未知错误（错误指针为空）"));
