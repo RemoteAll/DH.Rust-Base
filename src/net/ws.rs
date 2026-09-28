@@ -1,6 +1,6 @@
-//! net::ws —— WebSocket 会话层（fastwebsockets 帧层 + 自研会话语义，N002 客户端）。
+//! net::ws —— WebSocket 会话层（fastwebsockets 帧层 + 自研会话语义）。
 //!
-//! 语义对齐 C# `MyWebSocketClient`（DHDeploy.Agent）：
+//! 客户端（N002）语义对齐 C# `MyWebSocketClient`（DHDeploy.Agent）：
 //! - 连接超时 10s；无限重连 + 指数退避（1s 起、×2、上限 10 分钟；连续失败 20 次转长期模式 5 分钟）；
 //! - 心跳：客户端每 45s 发文本 Ping `{"Type":"ping","Timestamp":<Ticks>}`，服务端回
 //!   `{"Type":"pong",...}`（服务端 `WebSocketHelper.HandlePingPongMessageAsync`）；
@@ -14,7 +14,9 @@
 //!
 //! 握手：自管（HTTP/1.1 升级 + `Sec-WebSocket-Accept` 校验）；帧层自动行为全部关闭，
 //! 控制帧由会话层处理。wss/TLS 待 `net-tls`（rustls + ring）。
-//! 服务端（升级接管）为 N003，本文件先落客户端。
+//! 服务端（N003）：hyper 升级后交 [`run_server_session`]——ping json 自动回
+//! pong json（对齐 C# `WebSocketHelper.HandlePingPongMessageAsync`）、消息在
+//! blocking 池分发、发送经单一写通道串行化。
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -555,6 +557,320 @@ fn csharp_ticks_now() -> u64 {
         Ok(d) => EPOCH_DIFF_TICKS + d.as_nanos() as u64 / 100,
         Err(_) => EPOCH_DIFF_TICKS,
     }
+}
+
+// ————— 服务端会话（N003：hyper 升级后交此接管）—————
+
+/// 服务端配置。
+#[derive(Clone, Debug)]
+pub struct WsServerOptions {
+    /// 帧层单条消息上限（聚合后；超出即断开）
+    pub max_message_size: usize,
+    /// 连接空闲超时（`None` = 不超时；收到任何帧即刷新活动时间）
+    pub idle_timeout: Option<Duration>,
+    /// 发送队列容量（满时业务发送返回失败）
+    pub send_queue: usize,
+}
+
+impl Default for WsServerOptions {
+    fn default() -> Self {
+        Self {
+            max_message_size: 16 * 1024 * 1024,
+            idle_timeout: None,
+            send_queue: 1024,
+        }
+    }
+}
+
+/// 服务端会话钩子（回调均在会话/blocking 池中调用，实现方不得长时间阻塞）。
+#[derive(Clone, Default)]
+pub struct WsServerHooks {
+    /// 连接建立（可立即下发欢迎/注册响应）
+    pub on_open: Option<Arc<dyn Fn(WsServerConn) + Send + Sync>>,
+    /// 应用消息（在 blocking 池分发——读循环永不阻塞；ping/pong 已在会话层消化）
+    pub on_message: Option<Arc<dyn Fn(WsServerMessage) + Send + Sync>>,
+    /// 连接关闭（原因）
+    pub on_close: Option<Arc<dyn Fn(WsServerConn, String) + Send + Sync>>,
+}
+
+/// 服务端视角的应用消息（Pong 已在会话层消化，不会投递）。
+#[derive(Clone)]
+pub struct WsServerMessage {
+    /// 消息文本
+    pub text: String,
+    /// 连接句柄（可在后台任务中延迟发送响应）
+    pub conn: WsServerConn,
+}
+
+impl std::fmt::Debug for WsServerMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsServerMessage")
+            .field("text", &self.text)
+            .finish()
+    }
+}
+
+/// 服务端发送命令（单一写通道串行化）。
+enum ServerCmd {
+    Text {
+        text: String,
+        ack: Option<oneshot::Sender<bool>>,
+    },
+    Close,
+}
+
+/// 服务端连接句柄（可克隆；多任务并发发送经单一写通道天然串行）。
+#[derive(Clone)]
+pub struct WsServerConn {
+    cmd_tx: mpsc::Sender<ServerCmd>,
+    connected: Arc<AtomicBool>,
+}
+
+impl WsServerConn {
+    /// 当前是否已连接。
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    /// 发送文本（fire-and-forget；未连接或队列满返回 `false`）。
+    pub fn send_text(&self, text: impl Into<String>) -> bool {
+        if !self.is_connected() {
+            return false;
+        }
+        self.cmd_tx
+            .try_send(ServerCmd::Text {
+                text: text.into(),
+                ack: None,
+            })
+            .is_ok()
+    }
+
+    /// 发送文本并等待写入结果（真实送达判定）。
+    pub async fn send_text_wait(&self, text: impl Into<String>) -> Result<(), WsError> {
+        if !self.is_connected() {
+            return Err(WsError::Closed);
+        }
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(ServerCmd::Text {
+                text: text.into(),
+                ack: Some(tx),
+            })
+            .await
+            .is_err()
+        {
+            return Err(WsError::Closed);
+        }
+        match rx.await {
+            Ok(true) => Ok(()),
+            _ => Err(WsError::Closed),
+        }
+    }
+
+    /// 请求关闭连接（发送 Close 帧后结束会话）。
+    pub fn close(&self) {
+        let _ = self.cmd_tx.try_send(ServerCmd::Close);
+    }
+}
+
+/// 服务端 Pong 报文（对齐 C# `WebSocketHelper`：`Timestamp`=UtcNow.Ticks，
+/// `ServerTime`=本地时间 `yyyy-MM-dd HH:mm:ss.fff`）。
+fn pong_json() -> String {
+    let server_time = crate::times::format_datetime_ms(&chrono::Local::now().naive_local());
+    format!(
+        "{{\"Type\":\"pong\",\"Timestamp\":{},\"ServerTime\":\"{}\"}}",
+        csharp_ticks_now(),
+        server_time
+    )
+}
+
+/// 是否 Ping 文本（对齐 C# 服务端 `IsPingMessage`：序数包含检查）。
+#[inline]
+fn is_ping_text(text: &str) -> bool {
+    text.contains("\"Type\":\"ping\"")
+}
+
+/// 运行服务端会话（`stream` = 已升级的 IO；返回断开原因）。
+///
+/// 语义：ping json 自动回 pong json（不进入业务分发）；应用消息在 blocking 池
+/// 分发（handler 即使阻塞也不影响心跳/读循环）；业务发送与 Pong 回复共用单一
+/// 写通道（WebSocket 不允许并发发送）。
+pub async fn run_server_session<S>(
+    stream: S,
+    hooks: WsServerHooks,
+    options: WsServerOptions,
+) -> String
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let rt = tokio::runtime::Handle::current();
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<ServerCmd>(options.send_queue.max(1));
+    let connected = Arc::new(AtomicBool::new(true));
+    let conn = WsServerConn {
+        cmd_tx,
+        connected: connected.clone(),
+    };
+
+    // 帧层接管（Role::Server：读帧自动解掩码、出帧不加掩码）
+    let mut ws = WebSocket::after_handshake(stream, Role::Server);
+    ws.set_auto_close(false);
+    ws.set_auto_pong(false);
+    ws.set_max_message_size(options.max_message_size);
+    let (rx, mut tx) = ws.split(tokio::io::split);
+    let mut reader = FragmentCollectorRead::new(rx);
+
+    // 读任务：只分类与转发（永不阻塞；应用消息交给会话任务分发）
+    let (frame_tx, mut frame_rx) = mpsc::channel::<FrameEvent>(256);
+    let read_task = tokio::spawn(async move {
+        loop {
+            match reader.read_frame(&mut noop_send).await {
+                Ok(frame) => match frame.opcode {
+                    OpCode::Text => {
+                        let text = String::from_utf8_lossy(&frame.payload).into_owned();
+                        if frame_tx.send(FrameEvent::Text(text)).await.is_err() {
+                            break;
+                        }
+                    }
+                    OpCode::Ping => {
+                        let payload = frame.payload.to_vec();
+                        if frame_tx.send(FrameEvent::Ping(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    OpCode::Pong => {
+                        if frame_tx.send(FrameEvent::Pong).await.is_err() {
+                            break;
+                        }
+                    }
+                    OpCode::Close => {
+                        let _ = frame_tx.send(FrameEvent::Closed).await;
+                        break;
+                    }
+                    _ => {}
+                },
+                Err(e) => {
+                    let _ = frame_tx.send(FrameEvent::Ended(e.to_string())).await;
+                    break;
+                }
+            }
+        }
+    });
+
+    // 空闲看门狗（可选；任何帧到达即刷新）
+    let idle_every = options
+        .idle_timeout
+        .map(|d| std::cmp::max(d / 3, Duration::from_millis(100)))
+        .unwrap_or(Duration::from_secs(3600));
+    let mut idle_timer = tokio::time::interval(idle_every);
+    idle_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_activity = Instant::now();
+
+    if let Some(cb) = &hooks.on_open {
+        cb(conn.clone());
+    }
+
+    let reason = loop {
+        let step: Option<String> = tokio::select! {
+            cmd = cmd_rx.recv() => match cmd {
+                Some(ServerCmd::Text { text, ack }) => {
+                    let res = tx
+                        .write_frame(Frame::text(Payload::Owned(text.into_bytes())))
+                        .await;
+                    if let Some(ack) = ack {
+                        let _ = ack.send(res.is_ok());
+                    }
+                    match res {
+                        Ok(()) => None,
+                        Err(e) => Some(format!("发送失败: {e}")),
+                    }
+                }
+                Some(ServerCmd::Close) => {
+                    let _ = tx
+                        .write_frame(Frame::close(1000, "服务端关闭".as_bytes()))
+                        .await;
+                    Some("服务端关闭连接".to_string())
+                }
+                None => Some("命令通道关闭".to_string()),
+            },
+            ev = frame_rx.recv() => match ev {
+                Some(FrameEvent::Text(text)) => {
+                    last_activity = Instant::now();
+                    if is_ping_text(&text) {
+                        // 对齐 C# 服务端：ping json → pong json（不进入业务分发）
+                        let pong = pong_json();
+                        match tx
+                            .write_frame(Frame::text(Payload::Owned(pong.into_bytes())))
+                            .await
+                        {
+                            Ok(()) => None,
+                            Err(e) => Some(format!("Pong 回复失败: {e}")),
+                        }
+                    } else if is_pong_text(&text) {
+                        // 客户端主动 Pong：服务端无需处理
+                        None
+                    } else if let Some(handler) = &hooks.on_message {
+                        // 关键：handler 在 blocking 池执行——即使阻塞也不占用异步
+                        // 工作线程（读循环与发送不受影响）
+                        let handler = handler.clone();
+                        let msg = WsServerMessage {
+                            text,
+                            conn: conn.clone(),
+                        };
+                        let rt = rt.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _guard = rt.enter();
+                            handler(msg);
+                        });
+                        None
+                    } else {
+                        None
+                    }
+                }
+                Some(FrameEvent::Ping(payload)) => {
+                    last_activity = Instant::now();
+                    match tx.write_frame(Frame::pong(Payload::Owned(payload))).await {
+                        Ok(()) => None,
+                        Err(e) => Some(format!("Pong 回复失败: {e}")),
+                    }
+                }
+                Some(FrameEvent::Pong) => {
+                    last_activity = Instant::now();
+                    None
+                }
+                Some(FrameEvent::Closed) => {
+                    let _ = tx.write_frame(Frame::close(1000, b"")).await;
+                    Some("客户端关闭连接".to_string())
+                }
+                Some(FrameEvent::Ended(r)) => Some(format!("读取结束: {r}")),
+                None => Some("读任务已结束".to_string()),
+            },
+            _ = idle_timer.tick() => {
+                if let Some(d) = options.idle_timeout {
+                    if last_activity.elapsed() > d {
+                        Some(format!(
+                            "空闲超时（超过 {:.1} 秒无任何数据）",
+                            d.as_secs_f64()
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(r) = step {
+            break r;
+        }
+    };
+
+    read_task.abort();
+    connected.store(false, Ordering::Release);
+    if let Some(cb) = &hooks.on_close {
+        cb(conn, reason.clone());
+    }
+    reason
 }
 
 // ————— 握手（自管：TCP + HTTP/1.1 升级 + Accept 校验）—————
