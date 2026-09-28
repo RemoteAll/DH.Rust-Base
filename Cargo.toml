@@ -19,3 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 # XML 配置读取（与 C# XmlConfigProvider 生成的文件互通）
 quick-xml = "0.36"
+
+[features]
+# Razor 子集模板引擎（方案 C，零新依赖；规约见 Doc/Razor子集模板引擎架构.md）
+razor = []
