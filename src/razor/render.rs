@@ -31,11 +31,12 @@ impl Template {
         let mut renderer = Renderer {
             options,
             root: model,
-            out: String::new(),
-            scopes: Vec::new(),
+            // 预分配输出缓冲（小页面一次分配到位，避免热路径反复扩容）
+            out: String::with_capacity(4096),
+            scopes: Vec::with_capacity(8),
             depth: 0,
         };
-        renderer.render_nodes(&self.nodes)?;
+        renderer.render_nodes(&self.nodes).map_err(|e| *e)?;
         Ok(renderer.out)
     }
 }
@@ -58,10 +59,10 @@ impl<'a> Renderer<'a> {
     // ———— 节点渲染 ————
 
     /// 渲染节点序列（块作用域：出口回收本层新增的局部变量）。
-    fn render_nodes(&mut self, nodes: &[Node]) -> Result<(), RenderError> {
+    fn render_nodes(&mut self, nodes: &[Node]) -> Result<(), Box<RenderError>> {
         self.depth += 1;
         if self.depth > self.options.max_depth {
-            return Err(RenderError::new(
+            return Err(fail(
                 "模板",
                 format!(
                     "渲染嵌套过深（上限 {} 层，可调整 Options.max_depth）",
@@ -78,7 +79,7 @@ impl<'a> Renderer<'a> {
         Ok(())
     }
 
-    fn render_node(&mut self, node: &Node) -> Result<(), RenderError> {
+    fn render_node(&mut self, node: &Node) -> Result<(), Box<RenderError>> {
         match node {
             Node::Text(s) => {
                 self.out.push_str(s);
@@ -87,15 +88,15 @@ impl<'a> Renderer<'a> {
             Node::Write(e) => {
                 let v = self.eval(e)?;
                 if self.options.escape {
-                    escape_html_into(&v.to_text(), &mut self.out);
+                    write_escaped_value(&v, &mut self.out);
                 } else {
-                    self.out.push_str(&v.to_text());
+                    v.write_text_into(&mut self.out);
                 }
                 Ok(())
             }
             Node::Raw(e) => {
                 let v = self.eval(e)?;
-                self.out.push_str(&v.to_text());
+                v.write_text_into(&mut self.out);
                 Ok(())
             }
             Node::If { branches, else_ } => {
@@ -105,7 +106,7 @@ impl<'a> Renderer<'a> {
                         Value::Bool(true) => return self.render_nodes(body),
                         Value::Bool(false) => {}
                         other => {
-                            return Err(RenderError::new(
+                            return Err(fail(
                                 cond.to_string(),
                                 format!("@if 条件需要布尔值，实际为 {}", value_type_name(&other)),
                             ));
@@ -122,24 +123,26 @@ impl<'a> Renderer<'a> {
                 let items = match v {
                     Value::List(items) => items,
                     Value::Null => {
-                        return Err(RenderError::new(
+                        return Err(fail(
                             iter.to_string(),
                             "foreach 不能遍历 null（C# 为 NullReferenceException）",
                         ));
                     }
                     other => {
-                        return Err(RenderError::new(
+                        return Err(fail(
                             iter.to_string(),
                             format!("foreach 需要列表，实际为 {}", value_type_name(&other)),
                         ));
                     }
                 };
-                for item in &items {
-                    let marker = self.scopes.len();
-                    self.scopes.push((var.clone(), item.clone()));
+                // 循环变量一次性入栈，逐轮改写值（Rc 克隆廉价，避免每行重建变量名）
+                let marker = self.scopes.len();
+                self.scopes.push((var.clone(), Value::Null));
+                for item in items.iter() {
+                    self.scopes[marker].1 = item.clone();
                     self.render_nodes(body)?;
-                    self.scopes.truncate(marker);
                 }
+                self.scopes.truncate(marker);
                 Ok(())
             }
             Node::Code(stmts) => {
@@ -158,7 +161,7 @@ impl<'a> Renderer<'a> {
 
     // ———— 表达式求值 ————
 
-    fn eval(&self, e: &Expr) -> Result<Value, RenderError> {
+    fn eval(&self, e: &Expr) -> Result<Value, Box<RenderError>> {
         match e {
             Expr::Lit(l) => Ok(literal_to_value(l)),
             Expr::Path(segs) => self.eval_path(e, segs),
@@ -251,34 +254,62 @@ impl<'a> Renderer<'a> {
     }
 
     /// 路径求值：首段解析（局部变量 → 根对象属性 → `Model` 别名），随后逐段访问。
-    fn eval_path(&self, whole: &Expr, segs: &[Seg]) -> Result<Value, RenderError> {
+    #[inline(always)]
+    fn eval_path(&self, whole: &Expr, segs: &[Seg]) -> Result<Value, Box<RenderError>> {
         let Seg::Prop(first) = &segs[0] else {
             // parser 保证首段为属性名；防御
             return Err(expr_err(whole, "路径缺少起始属性"));
         };
-        let mut path = first.clone();
+        // 快路径：`变量.属性`（页面模板最常见形态，如 `row.Id`、`Model.Title`）。
+        // 局部变量优先且不克隆对象本身，直接在原值上取属性。
+        if let [Seg::Prop(name)] = &segs[1..] {
+            for (n, v) in self.scopes.iter().rev() {
+                if n == first {
+                    return match v.get(name).cloned() {
+                        Some(val) => Ok(val),
+                        None => Err(describe_prop_error(
+                            &format_path(segs, 1, Some(name)),
+                            name,
+                            v,
+                        )),
+                    };
+                }
+            }
+            let base = match self.root {
+                Value::Object(o) => match o.get(first) {
+                    Some(v) => v,
+                    None if first == "Model" => self.root,
+                    None => return Err(fail(first.clone(), "未找到变量或属性")),
+                },
+                _ if first == "Model" => self.root,
+                _ => return Err(fail(first.clone(), "未找到变量或属性")),
+            };
+            return match base.get(name).cloned() {
+                Some(val) => Ok(val),
+                None => Err(describe_prop_error(
+                    &format_path(segs, 1, Some(name)),
+                    name,
+                    base,
+                )),
+            };
+        }
         let mut cur = self
             .resolve_root(first)
-            .ok_or_else(|| RenderError::new(path.clone(), "未找到变量或属性"))?;
-        for seg in &segs[1..] {
+            .ok_or_else(|| fail(first.clone(), "未找到变量或属性"))?;
+        // 成功路径零分配；失败时才拼装诊断路径（format_path）
+        for (i, seg) in segs.iter().enumerate().skip(1) {
             match seg {
                 Seg::Prop(name) => match cur.get(name).cloned() {
-                    Some(v) => {
-                        cur = v;
-                        path.push('.');
-                        path.push_str(name);
+                    Some(v) => cur = v,
+                    None => {
+                        let path = format_path(segs, i, Some(name));
+                        return Err(describe_prop_error(&path, name, &cur));
                     }
-                    None => return Err(describe_prop_error(&path, name, &cur)),
                 },
                 Seg::Index(ix) => {
                     let iv = self.eval(ix)?;
-                    let iv_text = iv.to_text();
-                    let next = index_into(&cur, &iv)
-                        .map_err(|msg| RenderError::new(format!("{path}[{iv_text}]"), msg))?;
-                    cur = next;
-                    path.push('[');
-                    path.push_str(&iv_text);
-                    path.push(']');
+                    cur = index_into(&cur, &iv)
+                        .map_err(|msg| fail(format_path(segs, i, None), msg))?;
                 }
             }
         }
@@ -286,6 +317,7 @@ impl<'a> Renderer<'a> {
     }
 
     /// 首段解析：局部变量栈（后进先出）→ 根对象属性 → `Model` 别名（根对象本身）。
+    #[inline]
     fn resolve_root(&self, name: &str) -> Option<Value> {
         for (n, v) in self.scopes.iter().rev() {
             if n == name {
@@ -336,12 +368,16 @@ fn to_f64(n: Number) -> f64 {
     }
 }
 
-fn apply_bin_op(e: &Expr, op: BinOp, lv: Value, rv: Value) -> Result<Value, RenderError> {
+fn apply_bin_op(e: &Expr, op: BinOp, lv: Value, rv: Value) -> Result<Value, Box<RenderError>> {
     match op {
         BinOp::Add => {
             // 任一侧为字符串 → 拼接（C# 语义：null 参与拼接按空串）
             if matches!(lv, Value::Str(_)) || matches!(rv, Value::Str(_)) {
-                return Ok(Value::Str(format!("{}{}", lv.to_text(), rv.to_text())));
+                // C# 语义：null 参与拼接按空串；直接追加避免中间字符串
+                let mut s = String::new();
+                lv.write_text_into(&mut s);
+                rv.write_text_into(&mut s);
+                return Ok(Value::Str(s.into()));
             }
             let (Some(a), Some(b)) = (as_number(&lv), as_number(&rv)) else {
                 return Err(bin_type_err(
@@ -377,7 +413,7 @@ fn apply_bin_op(e: &Expr, op: BinOp, lv: Value, rv: Value) -> Result<Value, Rend
 }
 
 /// 整数/浮点算术（整数除零与溢出显式报错，对齐 C# 异常语义）。
-fn numeric_op(e: &Expr, op: BinOp, a: Number, b: Number) -> Result<Value, RenderError> {
+fn numeric_op(e: &Expr, op: BinOp, a: Number, b: Number) -> Result<Value, Box<RenderError>> {
     match (a, b) {
         (Number::I(x), Number::I(y)) => match op {
             BinOp::Sub => Ok(Value::Int(x.wrapping_sub(y))),
@@ -440,7 +476,7 @@ fn compare_numbers(op: BinOp, a: Number, b: Number) -> bool {
 }
 
 /// `==` / `!=`：null 先行、字符串值比较、数值提升；列表/对象引用比较不支持（显式报错）。
-fn values_equal(e: &Expr, l: &Value, r: &Value) -> Result<bool, RenderError> {
+fn values_equal(e: &Expr, l: &Value, r: &Value) -> Result<bool, Box<RenderError>> {
     match (l, r) {
         (Value::Null, Value::Null) => Ok(true),
         (Value::Null, _) | (_, Value::Null) => Ok(false),
@@ -491,6 +527,7 @@ fn index_into(target: &Value, index: &Value) -> Result<Value, String> {
     }
 }
 
+#[inline(always)]
 fn literal_to_value(l: &Literal) -> Value {
     match l {
         Literal::Str(s) => Value::Str(s.clone()),
@@ -501,22 +538,58 @@ fn literal_to_value(l: &Literal) -> Value {
     }
 }
 
-/// 属性访问失败的错误（含完整路径）。
-fn describe_prop_error(path: &str, name: &str, cur: &Value) -> RenderError {
-    let full = format!("{path}.{name}");
+/// 属性访问失败的错误（`path` 为含失败段的完整路径）。
+fn describe_prop_error(path: &str, name: &str, cur: &Value) -> Box<RenderError> {
     let msg = match cur {
         Value::Null => "在 null 上访问属性（C# 为 NullReferenceException）".to_string(),
         Value::Object(_) => format!("属性不存在：{name}"),
         other => format!("{} 不支持属性访问", value_type_name(other)),
     };
-    RenderError::new(full, msg)
+    fail(path, msg)
 }
 
-fn expr_err(e: &Expr, msg: impl Into<String>) -> RenderError {
-    RenderError::new(e.to_string(), msg)
+/// 拼装诊断路径（仅错误路径调用）：`segs[..upto]` 为已成功解析的前缀，
+/// `tail_prop` 为失败属性名（索引段失败传 `None`，取 `segs[upto]` 的源码形式）。
+fn format_path(segs: &[Seg], upto: usize, tail_prop: Option<&str>) -> String {
+    use std::fmt::Write as _;
+    let mut path = String::new();
+    for (i, seg) in segs[..upto].iter().enumerate() {
+        match seg {
+            Seg::Prop(name) => {
+                if i > 0 {
+                    path.push('.');
+                }
+                path.push_str(name);
+            }
+            Seg::Index(ix) => {
+                let _ = write!(path, "[{ix}]");
+            }
+        }
+    }
+    match tail_prop {
+        Some(name) => {
+            path.push('.');
+            path.push_str(name);
+        }
+        None => {
+            if let Some(Seg::Index(ix)) = segs.get(upto) {
+                let _ = write!(path, "[{ix}]");
+            }
+        }
+    }
+    path
 }
 
-fn bin_type_err(e: &Expr, l: &Value, r: &Value, advice: &str) -> RenderError {
+/// 构造错误（热路径内部统一装箱：`Result` 保持小体积，避免每次求值搬运 48 字节错误结构）。
+fn fail(path: impl Into<String>, msg: impl Into<String>) -> Box<RenderError> {
+    Box::new(RenderError::new(path, msg))
+}
+
+fn expr_err(e: &Expr, msg: impl Into<String>) -> Box<RenderError> {
+    fail(e.to_string(), msg)
+}
+
+fn bin_type_err(e: &Expr, l: &Value, r: &Value, advice: &str) -> Box<RenderError> {
     expr_err(
         e,
         format!(
@@ -547,22 +620,142 @@ fn value_type_name(v: &Value) -> &'static str {
 /// - `"`→`&quot;`、`&`→`&amp;`、`'`→`&#x27;`、`+`→`&#x2B;`、`<`→`&lt;`、`>`→`&gt;`；
 /// - 其余字符（含 `\r` `\n`、Tab、非 ASCII、控制符）→ `&#x` + 大写十六进制 + `;`
 ///   （非 BMP 按标量编码，如 `😀`→`&#x1F600;`）。
+///
+/// 实现按字节扫描：可打印 ASCII 连续段整段复制（`push_str`），仅在特殊/非 ASCII
+/// 字节处打断；块级快路径用 8 字节 SWAR 探测（无特殊字节整块跳过），避免长文本
+/// 逐字符处理的迭代开销。
+#[inline]
 fn escape_html_into(text: &str, out: &mut String) {
     use std::fmt::Write as _;
-    for c in text.chars() {
-        match c {
-            '"' => out.push_str("&quot;"),
-            '&' => out.push_str("&amp;"),
-            '\'' => out.push_str("&#x27;"),
-            '+' => out.push_str("&#x2B;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            c if c.is_ascii() && (' '..='~').contains(&c) => out.push(c),
+    out.reserve(text.len());
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        // 8 字节快路径：整块均为「无特殊字节的可打印 ASCII」时直接前进
+        while i + 8 <= bytes.len() && boring8(&bytes[i..i + 8]) {
+            i += 8;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let b = bytes[i];
+        // 单字节快路径：可打印 ASCII 且非特殊字符
+        if matches!(b, b' '..=b'~') && !matches!(b, b'"' | b'&' | b'\'' | b'+' | b'<' | b'>') {
+            i += 1;
+            continue;
+        }
+        // 先复制未处理的原样段
+        if start < i {
+            out.push_str(&text[start..i]);
+        }
+        match b {
+            b'"' => out.push_str("&quot;"),
+            b'&' => out.push_str("&amp;"),
+            b'\'' => out.push_str("&#x27;"),
+            b'+' => out.push_str("&#x2B;"),
+            b'<' => out.push_str("&lt;"),
+            b'>' => out.push_str("&gt;"),
             _ => {
+                // 控制符或非 ASCII：解码首字符（i 恒为字符边界）后整体实体化
+                let c = text[i..].chars().next().expect("i 恒为字符边界");
                 let _ = write!(out, "&#x{:X};", c as u32);
+                i += c.len_utf8();
+                start = i;
+                continue;
             }
         }
+        i += 1;
+        start = i;
     }
+    if start < bytes.len() {
+        out.push_str(&text[start..]);
+    }
+}
+
+/// 8 字节块是否「无特殊字节」（可做整段复制的充分条件）。
+///
+/// 特殊字节 = 需实体化的字符集：控制符（<0x20）、DEL 与非 ASCII（≥0x7F）、
+/// 以及 `"` `&` `'` `+` `<` `>` 六字符。SWAR 探测允许误报（判非平凡而实际平凡），
+/// 但不得漏报——漏报会破坏转义语义。
+#[inline(always)]
+fn boring8(chunk: &[u8]) -> bool {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    #[inline]
+    fn has_zero(x: u64) -> bool {
+        x.wrapping_sub(ONES) & !x & 0x8080_8080_8080_8080 != 0
+    }
+    #[inline]
+    fn has_byte(x: u64, b: u8) -> bool {
+        has_zero(x ^ (ONES * b as u64))
+    }
+    #[inline]
+    fn has_less(x: u64, n: u8) -> bool {
+        // 经典 hasless：n ∈ [1,128]
+        x.wrapping_sub(ONES * n as u64) & !x & 0x8080_8080_8080_8080 != 0
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(chunk);
+    let x = u64::from_le_bytes(buf);
+    if has_less(x, 0x20) || x & 0x8080_8080_8080_8080 != 0 || has_byte(x, 0x7F) {
+        return false;
+    }
+    !(has_byte(x, b'"')
+        || has_byte(x, b'&')
+        || has_byte(x, b'\'')
+        || has_byte(x, b'+')
+        || has_byte(x, b'<')
+        || has_byte(x, b'>'))
+}
+
+/// 转义写出值（热路径：不经中间 `String`；数值/布尔不含特殊字符，直接追加）。
+#[inline(always)]
+fn write_escaped_value(v: &Value, out: &mut String) {
+    use std::fmt::Write as _;
+    match v {
+        Value::Null => {}
+        Value::Bool(b) => out.push_str(if *b { "True" } else { "False" }),
+        Value::Int(i) => push_i64(out, *i),
+        Value::Float(f) => {
+            if f.is_nan() {
+                out.push_str("NaN");
+            } else if *f == f64::INFINITY {
+                out.push_str("&#x221E;");
+            } else if *f == f64::NEG_INFINITY {
+                out.push_str("-&#x221E;");
+            } else {
+                let _ = write!(out, "{f}");
+            }
+        }
+        Value::Str(s) => escape_html_into(s, out),
+        Value::List(_) | Value::Object(_) => {
+            // 列表/对象先文本化再转义（罕见路径，保持与 to_text 管道一致）
+            let mut tmp = String::new();
+            v.write_text_into(&mut tmp);
+            escape_html_into(&tmp, out);
+        }
+    }
+}
+
+/// 手写十进制整数写出（避开 `write!` 格式化机制开销，热路径使用）。
+#[inline(always)]
+fn push_i64(out: &mut String, v: i64) {
+    if v == 0 {
+        out.push('0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let mut u = v.unsigned_abs();
+    while u > 0 {
+        i -= 1;
+        buf[i] = b'0' + (u % 10) as u8;
+        u /= 10;
+    }
+    if v < 0 {
+        out.push('-');
+    }
+    out.push_str(std::str::from_utf8(&buf[i..]).expect("十进制 ASCII"));
 }
 
 #[cfg(test)]

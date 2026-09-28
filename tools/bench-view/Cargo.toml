@@ -1,0 +1,16 @@
+[package]
+name = "bench-view"
+version = "0.1.0"
+edition = "2021"
+
+# Razor 视图渲染基准（Rust 引擎侧）；与 tools/csharp/RazorInterop bench 成对使用。
+# 运行：cargo build --release && target/release/bench-view.exe <template.cshtml> <data.json> [iterations] [warmup]
+
+[dependencies]
+dhrust = { path = "../..", features = ["razor"] }
+serde_json = "1"
+
+[profile.release]
+# 与仓库根 release 配置对齐：LTO + 单代码元（跨 crate 内联模板引擎热路径）
+lto = true
+codegen-units = 1

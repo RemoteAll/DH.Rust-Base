@@ -14,6 +14,7 @@
 //! 错误带行列号；位置基准（首字符的 line/col）由调用方传入，多行表达式按换行推进。
 
 use std::fmt;
+use std::rc::Rc;
 
 use crate::razor::error::ParseError;
 
@@ -43,7 +44,7 @@ pub enum Expr {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Literal {
     /// 字符串（转义已解码）
-    Str(String),
+    Str(Rc<str>),
     /// 64 位整数
     Int(i64),
     /// 双精度浮点
@@ -470,7 +471,7 @@ impl ExprParser {
                 self.bump();
                 Ok(inner)
             }
-            '"' => Ok(Expr::Lit(Literal::Str(self.scan_string()?))),
+            '"' => Ok(Expr::Lit(Literal::Str(self.scan_string()?.into()))),
             '0'..='9' => Ok(Expr::Lit(self.scan_number()?)),
             '\'' => Err(self
                 .error("不支持字符字面量")

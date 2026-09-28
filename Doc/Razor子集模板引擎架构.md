@@ -187,4 +187,4 @@ Seg   = Prop(String) | Index(Box<Expr>)
 ## 8. 变更记录
 
 - 2026-09-28：初始版本（方案 C 立项；批次 1 启动）
-- 2026-09-28：T011 实测修订——块体标记语义/邮件规则/HtmlEncoder.Default 等价转义（依据 RazorEngineCore 代码生成与 HtmlEncoder 探测）；互操作用例 8/8 `RAZOR INTEROP PASSED`
+- 2026-09-28：T011 实测修订——块体标记语义/邮件规则/HtmlEncoder.Default 等价转义（依据 RazorEngineCore 代码生成与 HtmlEncoder 探测）；互操作用例 8/8 `RAZOR INTEROP PASSED`- 2026-09-28：T010 基准工程 `tools/bench-view`（探针分解 + RazorEngineCore 双端对照）——Rust 约 3.0 万次/秒（首测 1,896 → 优化约 16 倍：`Rc` 共享、零分配写出、SWAR 转义、LTO/单代码元）；同口径 p50 差 2 倍系解释器 vs JIT 的结构差距，均值/吞吐口径同档（0.83~1.24x，受 C# GC 波动主导），F014 触发评估（结论：建议批次 4+ 按需实施；详见 `tools/bench-view/README.md`）

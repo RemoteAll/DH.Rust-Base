@@ -16,6 +16,8 @@
 //! - T007 ✅ 渲染器 `render`：求值+转义+输出+作用域（单测覆盖）
 //! - T008 ✅ 用例集 `tests/razor_cases` + Rust 侧逐字节比对（集成测试）
 //! - T009 ✅ C# 互操作工具 `tools/csharp/RazorInterop` + `scripts/razor_interop.ps1`
+//! - T010 ✅ 基准工程 `tools/bench-view` + RazorEngineCore 对照
+//!   （约 3.0 万次/秒，p99≈64µs；同口径分析与 F014 结论见 `tools/bench-view/README.md`）
 //! - T011 ✅ 块体标记语义 / 邮件规则 / HtmlEncoder.Default 等价转义实测修订
 //!   （互操作用例 8/8 `RAZOR INTEROP PASSED`）
 

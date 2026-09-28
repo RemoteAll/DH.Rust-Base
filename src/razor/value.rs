@@ -4,6 +4,7 @@
 //! 与 C# 端模型字段按属性名对应；文本化规则对齐 C# 语义（见架构文档 2.1）。
 
 use std::fmt;
+use std::rc::Rc;
 
 /// 对象节点。键值对按插入序保存（与 serde_json `preserve_order` 行为一致），
 /// 查找为线性扫描——页面模型字段量小，v0 不引入额外索引依赖。
@@ -32,7 +33,13 @@ impl Object {
 
     /// 按键取值。
     pub fn get(&self, key: &str) -> Option<&Value> {
-        self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+        // 手写循环（热路径，避免迭代器/闭包层开销；字段量小，线性扫描足够）
+        for (k, v) in &self.entries {
+            if k == key {
+                return Some(v);
+            }
+        }
+        None
     }
 
     /// 是否包含键。
@@ -67,12 +74,12 @@ pub enum Value {
     Int(i64),
     /// 双精度浮点，文本化为最短往返形式
     Float(f64),
-    /// 字符串
-    Str(String),
-    /// 列表（`@foreach` 的迭代对象）
-    List(Vec<Value>),
-    /// 对象（按属性名访问）
-    Object(Object),
+    /// 字符串（`Rc<str>` 共享，克隆为引用计数递增）
+    Str(Rc<str>),
+    /// 列表（`@foreach` 的迭代对象；`Rc` 共享，克隆为引用计数递增）
+    List(Rc<Vec<Value>>),
+    /// 对象（按属性名访问；`Rc` 共享，克隆为引用计数递增）
+    Object(Rc<Object>),
 }
 
 impl Value {
@@ -83,7 +90,7 @@ impl Value {
 
     /// 创建列表值。
     pub fn list<T: Into<Value>>(items: impl IntoIterator<Item = T>) -> Self {
-        Value::List(items.into_iter().map(Into::into).collect())
+        Value::List(Rc::new(items.into_iter().map(Into::into).collect()))
     }
 
     /// 是否为空值。
@@ -109,29 +116,36 @@ impl Value {
 
     /// 按 C# 语义做文本化：`null`→空串、`Bool`→`True/False`、`Int`→十进制、`Float`→最短往返。
     pub fn to_text(&self) -> String {
+        let mut s = String::new();
+        self.write_text_into(&mut s);
+        s
+    }
+
+    /// 按 C# 语义把文本追加到 `out`（避免中间 `String` 分配，渲染器热路径使用）。
+    #[inline(always)]
+    pub fn write_text_into(&self, out: &mut String) {
+        use std::fmt::Write as _;
         match self {
-            Value::Null => String::new(),
-            Value::Bool(b) => {
-                if *b {
-                    "True".into()
-                } else {
-                    "False".into()
-                }
+            Value::Null => {}
+            Value::Bool(b) => out.push_str(if *b { "True" } else { "False" }),
+            Value::Int(i) => {
+                let _ = write!(out, "{i}");
             }
-            Value::Int(i) => i.to_string(),
             Value::Float(f) => {
                 if f.is_nan() {
-                    "NaN".into()
+                    out.push_str("NaN");
                 } else if *f == f64::INFINITY {
-                    "∞".into()
+                    out.push('∞');
                 } else if *f == f64::NEG_INFINITY {
-                    "-∞".into()
+                    out.push_str("-∞");
                 } else {
-                    f.to_string()
+                    let _ = write!(out, "{f}");
                 }
             }
-            Value::Str(s) => s.clone(),
-            Value::List(_) | Value::Object(_) => self.to_string(),
+            Value::Str(s) => out.push_str(s),
+            Value::List(_) | Value::Object(_) => {
+                let _ = write!(out, "{self}");
+            }
         }
     }
 }
@@ -178,14 +192,16 @@ impl From<serde_json::Value> for Value {
                 Some(i) => Value::Int(i),
                 None => Value::Float(n.as_f64().unwrap_or(0.0)),
             },
-            serde_json::Value::String(s) => Value::Str(s),
-            serde_json::Value::Array(a) => Value::List(a.into_iter().map(Value::from).collect()),
+            serde_json::Value::String(s) => Value::Str(s.into()),
+            serde_json::Value::Array(a) => {
+                Value::List(Rc::new(a.into_iter().map(Value::from).collect()))
+            }
             serde_json::Value::Object(m) => {
                 let mut o = Object::new();
                 for (k, val) in m {
                     o.set(k, Value::from(val));
                 }
-                Value::Object(o)
+                Value::Object(Rc::new(o))
             }
         }
     }
@@ -193,13 +209,13 @@ impl From<serde_json::Value> for Value {
 
 impl From<&str> for Value {
     fn from(s: &str) -> Self {
-        Value::Str(s.to_string())
+        Value::Str(Rc::from(s))
     }
 }
 
 impl From<String> for Value {
     fn from(s: String) -> Self {
-        Value::Str(s)
+        Value::Str(s.into())
     }
 }
 
@@ -241,7 +257,7 @@ impl From<f32> for Value {
 
 impl<T: Into<Value>> From<Vec<T>> for Value {
     fn from(items: Vec<T>) -> Self {
-        Value::List(items.into_iter().map(Into::into).collect())
+        Value::List(Rc::new(items.into_iter().map(Into::into).collect()))
     }
 }
 
@@ -256,7 +272,7 @@ impl<T: Into<Value>> From<Option<T>> for Value {
 
 impl From<Object> for Value {
     fn from(o: Object) -> Self {
-        Value::Object(o)
+        Value::Object(Rc::new(o))
     }
 }
 
@@ -288,7 +304,7 @@ mod tests {
     fn object_builder_keeps_insertion_order() {
         let mut o = Value::object();
         o.set("b", 1).set("a", "x");
-        let v = Value::Object(o);
+        let v = Value::from(o);
         let keys: Vec<&str> = match &v {
             Value::Object(o) => o.iter().map(|(k, _)| k).collect(),
             _ => Vec::new(),

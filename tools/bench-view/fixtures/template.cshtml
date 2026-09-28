@@ -1,0 +1,5 @@
+<div class="list">
+@foreach (var row in Model.Rows) {
+<tr class="@(row.Enable ? "on" : "off")"><td>@row.Id</td><td>@row.Name</td><td>@row.Age</td>@if (row.Age >= 18) {<td>adult</td>} else {<td>minor</td>}</tr>
+}
+</div>

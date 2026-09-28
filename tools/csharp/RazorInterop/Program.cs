@@ -68,6 +68,53 @@ switch (cmd)
             WriteOutput(code ?? "（未取到生成源码）", null);
             break;
         }
+    case "bench":
+        {
+            // bench <template.cshtml> <data.json> [iterations] [warmup]
+            if (args.Length < 3)
+            {
+                Console.Error.WriteLine("用法：bench <template.cshtml> <data.json> [iterations] [warmup]");
+                Environment.Exit(2);
+            }
+            var templateText = File.ReadAllText(args[1]);
+            var model = LoadModel(File.ReadAllText(args[2]));
+            var iters = args.Length > 3 ? int.Parse(args[3]) : 20000;
+            var warmup = args.Length > 4 ? int.Parse(args[4]) : 1000;
+
+            var engine = new RazorEngine();
+            var compiled = engine.Compile<InteropTemplate>(templateText);
+
+            ulong checksum = 0;
+            for (var i = 0; i < warmup; i++)
+            {
+                checksum ^= (ulong)compiled.Run(instance => instance.Model = model).Length;
+            }
+
+            var samples = new double[iters];
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            for (var i = 0; i < iters; i++)
+            {
+                var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                var html = compiled.Run(instance => instance.Model = model);
+                var dt = System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+                samples[i] = dt * 1_000_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
+                checksum += (ulong)html.Length;
+            }
+            watch.Stop();
+
+            Array.Sort(samples);
+            double Pct(double p) => samples[(int)((samples.Length - 1) * p)] / 1000.0;
+            Console.WriteLine("engine=csharp");
+            Console.WriteLine($"iterations={iters}");
+            Console.WriteLine($"total_ms={watch.Elapsed.TotalMilliseconds:F1}");
+            Console.WriteLine($"ops_per_sec={iters / watch.Elapsed.TotalSeconds:F0}");
+            Console.WriteLine($"mean_us={samples.Average() / 1000.0:F2}");
+            Console.WriteLine($"p50_us={Pct(0.50):F2}");
+            Console.WriteLine($"p90_us={Pct(0.90):F2}");
+            Console.WriteLine($"p99_us={Pct(0.99):F2}");
+            Console.WriteLine($"checksum={checksum}");
+            break;
+        }
     default:
         Console.Error.WriteLine("用法：render <template.cshtml> <data.json> [-o out.html] | probe-encode <文本|@文件>");
         Environment.Exit(2);
