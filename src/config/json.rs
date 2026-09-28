@@ -11,10 +11,13 @@ pub(crate) fn to_json(setting: &Setting) -> Result<String, ConfigError> {
     serde_json::to_string_pretty(setting).map_err(|e| ConfigError::Parse(e.to_string()))
 }
 
-/// 从 JSON 文本读取配置（自动清理注释）。
+/// 从 JSON 文本读取配置（自动清理注释，并按字段类型做归一化转换）。
 pub(crate) fn from_json(text: &str) -> Result<Setting, ConfigError> {
     let cleaned = trim_comment(text);
-    serde_json::from_str(&cleaned).map_err(|e| ConfigError::Parse(e.to_string()))
+    let value: serde_json::Value =
+        serde_json::from_str(&cleaned).map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let value = super::setting::normalize_setting_value(value);
+    serde_json::from_value(value).map_err(|e| ConfigError::Parse(e.to_string()))
 }
 
 /// 清理 JSON 字符串中的注释。对应 C# `JsonConfigProvider.TrimComment`。
@@ -79,5 +82,15 @@ mod tests {
         let json = to_json(&setting).unwrap();
         let again = from_json(&json).unwrap();
         assert_eq!(setting, again);
+    }
+
+    #[test]
+    fn json_tolerates_wrong_types() {
+        // 类型不符的值：能转换则转换，不能转换则回落字段默认值，不影响其它字段
+        let text = r#"{ "Debug": "not-bool", "LogFileMaxBytes": "abc", "LogPath": 123 }"#;
+        let setting = from_json(text).unwrap();
+        assert!(setting.debug); // 默认 true
+        assert_eq!(setting.log_file_max_bytes, 10); // 默认 10
+        assert_eq!(setting.log_path, "123"); // 数字转为字符串
     }
 }

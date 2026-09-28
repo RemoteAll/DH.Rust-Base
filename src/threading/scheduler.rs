@@ -336,6 +336,17 @@ impl TimerScheduler {
         }
     }
 
+    /// 调度线程是否仍在运行（测试与自省用）。
+    #[cfg(test)]
+    fn worker_running(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .expect("scheduler state")
+            .thread
+            .is_some()
+    }
+
     fn upgrade(inner: &Weak<SchedulerInner>) -> Option<TimerScheduler> {
         inner.upgrade().map(|inner| TimerScheduler { inner })
     }
@@ -353,6 +364,9 @@ fn process(inner: Arc<SchedulerInner>) {
         inner: Arc::clone(&inner),
     };
 
+    // 是否因空闲而销毁线程（该路径已在空列表检查的同一临界区内更新过 thread/finished）
+    let mut idle_exited = false;
+
     loop {
         if inner.disposing.load(Ordering::SeqCst) {
             break;
@@ -364,11 +378,17 @@ fn process(inner: Arc<SchedulerInner>) {
             (state.timers.clone(), state.generation)
         };
 
-        // 没有任务时，等待一个完整周期后销毁线程（对应 C# 空任务销毁逻辑）
+        // 没有任务时，等待一个完整周期后销毁线程（对应 C# 空任务销毁逻辑）。
+        // 注意：thread/finished 必须与“空列表”检查在同一临界区内更新；
+        // 否则并发 Add 可能落在“检查通过、线程置空之前”的窗口里，
+        // 看到旧线程句柄而不启动新线程，最终定时器无人调度（悬挂）
         if timers.is_empty() && inner.wait_ms.load(Ordering::SeqCst) >= DEFAULT_WAIT_MS {
-            let state = inner.state.lock().expect("scheduler state");
+            let mut state = inner.state.lock().expect("scheduler state");
             if state.timers.is_empty() && inner.wait_ms.load(Ordering::SeqCst) >= DEFAULT_WAIT_MS {
+                state.thread = None;
+                state.finished = true;
                 inner.signal.notify_all();
+                idle_exited = true;
                 break;
             }
         }
@@ -433,13 +453,14 @@ fn process(inner: Arc<SchedulerInner>) {
         }
     }
 
-    // 统一退出路径：标记线程已退出并唤醒等待者
-    {
+    // 统一退出路径：非空闲退出（dispose）时标记线程退出并唤醒等待者。
+    // 空闲销毁路径已在空列表检查的同一临界区内更新过状态，不能再写：
+    // 两次写之间可能有新的 Add 启动了新线程，重复置空会让后续 Add 误判并重复拉起调度线程
+    if !idle_exited {
         let mut state = inner.state.lock().expect("scheduler state");
         state.thread = None;
         state.finished = true;
         inner.signal.notify_all();
-        drop(state);
     }
 }
 
@@ -1245,5 +1266,76 @@ mod tests {
         assert!(result.is_err());
 
         timer.cancel();
+    }
+
+    #[test]
+    fn idle_thread_exits_and_restarts_on_next_add() {
+        let scheduler = TimerScheduler::create("test-idle-restart");
+
+        // 加入一个远期定时器再取消：列表清空且等待周期为默认值，工作线程会立即退出
+        let long = Timer::with_scheduler(scheduler.clone(), 60_000, 0, |_| {});
+        assert!(wait_until(|| scheduler.worker_running(), 1000));
+        long.cancel();
+        assert!(
+            wait_until(|| !scheduler.worker_running(), 2000),
+            "空任务时调度线程应退出"
+        );
+
+        // 线程退出后再次加入定时器：必须自动重启线程并按时触发
+        let count = Arc::new(AtomicI32::new(0));
+        let c = count.clone();
+        let timer = Timer::with_scheduler(scheduler.clone(), 10, 200, move |_| {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+
+        assert!(
+            wait_until(|| count.load(Ordering::SeqCst) >= 2, 3000),
+            "线程重启后定时器未触发，count={}",
+            count.load(Ordering::SeqCst)
+        );
+
+        timer.cancel();
+        scheduler.dispose();
+    }
+
+    #[test]
+    fn concurrent_add_cancel_stress() {
+        let scheduler = TimerScheduler::create("test-stress");
+        let fired = Arc::new(AtomicI32::new(0));
+
+        let mut handles = Vec::new();
+        for worker in 0..4i64 {
+            let scheduler = scheduler.clone();
+            let fired = fired.clone();
+            handles.push(thread::spawn(move || {
+                for seq in 0..25i64 {
+                    let c = fired.clone();
+                    let timer = Timer::with_scheduler(
+                        scheduler.clone(),
+                        (worker + seq) % 20,
+                        0,
+                        move |_| {
+                            c.fetch_add(1, Ordering::SeqCst);
+                        },
+                    );
+                    // 一半立即取消；取消与触发并发发生也不允许挂起或崩溃
+                    if seq % 2 == 0 {
+                        timer.cancel();
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // 未取消的一次性定时器共 4×12=48 个，都应在数秒内完成触发（取消的即使多触发一次也无妨）
+        assert!(
+            wait_until(|| fired.load(Ordering::SeqCst) >= 48, 5000),
+            "并发压力下定时器未全部触发，fired={}",
+            fired.load(Ordering::SeqCst)
+        );
+
+        scheduler.dispose();
     }
 }

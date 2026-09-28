@@ -69,17 +69,14 @@ const FIELD_COMMENTS: &[(&str, &str)] = &[
 #[serde(rename_all = "PascalCase", default)]
 pub struct Setting {
     /// 是否启用全局调试。默认启用
-    #[serde(deserialize_with = "de_bool_flexible")]
     pub debug: bool,
     /// 日志等级，只输出大于等于该级别的日志，All/Debug/Info/Warn/Error/Fatal，默认 Info
     pub log_level: String,
     /// 文件日志目录。默认 Log 子目录
     pub log_path: String,
     /// 日志文件上限。超过上限后拆分新日志文件，默认 10MB，0 表示不限制大小
-    #[serde(deserialize_with = "de_i32_flexible")]
     pub log_file_max_bytes: i32,
     /// 日志文件备份。超过备份数后，最旧的文件将被删除，默认 200，0 表示不限制个数
-    #[serde(deserialize_with = "de_i32_flexible")]
     pub log_file_backups: i32,
     /// 日志文件格式。默认 `{0:yyyy_MM_dd}.log`
     pub log_file_format: String,
@@ -310,41 +307,67 @@ impl fmt::Display for Setting {
     }
 }
 
-/// 弹性解析布尔值：兼容 JSON 原生布尔与字符串（C# `JsonConfigProvider` 落盘均为字符串）。
-fn de_bool_flexible<'de, D>(deserializer: D) -> Result<bool, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error as _;
+/// 归一化配置对象：按字段目标类型转换值。
+///
+/// - 布尔与整数同时接受原生类型与字符串（C# `JsonConfigProvider` 落盘均为字符串）；
+/// - 字符串字段即使内容形如数字也保持字符串，不做启发式猜测；
+/// - 无法转换的值直接丢弃，对应字段回落到结构体默认值，与 C# 绑定
+///   “单个字段损坏不影响其余字段”的容错一致。
+pub(crate) fn normalize_setting_value(value: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(mut map) = value else {
+        return value;
+    };
 
-    match serde_json::Value::deserialize(deserializer)? {
-        serde_json::Value::Bool(b) => Ok(b),
+    let mut remove = Vec::new();
+    for (key, item) in map.iter_mut() {
+        let coerced = match key.as_str() {
+            "Debug" => coerce_bool(item),
+            "LogFileMaxBytes" | "LogFileBackups" => coerce_i32(item),
+            // 其余均为字符串字段
+            _ => coerce_string(item),
+        };
+
+        match coerced {
+            Some(v) => *item = v,
+            None => remove.push(key.clone()),
+        }
+    }
+    for key in remove {
+        map.remove(&key);
+    }
+
+    serde_json::Value::Object(map)
+}
+
+fn coerce_bool(value: &serde_json::Value) -> Option<serde_json::Value> {
+    match value {
+        serde_json::Value::Bool(b) => Some(serde_json::Value::Bool(*b)),
         serde_json::Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
-            "true" => Ok(true),
-            "false" => Ok(false),
-            other => Err(D::Error::custom(format!("无法解析布尔值: {other}"))),
+            "true" => Some(serde_json::Value::Bool(true)),
+            "false" => Some(serde_json::Value::Bool(false)),
+            _ => None,
         },
-        other => Err(D::Error::custom(format!("无法解析布尔值: {other}"))),
+        _ => None,
     }
 }
 
-/// 弹性解析 32 位整数：兼容 JSON 原生数字与字符串。
-fn de_i32_flexible<'de, D>(deserializer: D) -> Result<i32, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error as _;
+fn coerce_i32(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let n = match value {
+        serde_json::Value::Number(n) => n.as_i64()?,
+        serde_json::Value::String(s) => s.trim().parse::<i64>().ok()?,
+        _ => return None,
+    };
+    i32::try_from(n)
+        .ok()
+        .map(|v| serde_json::Value::Number(v.into()))
+}
 
-    match serde_json::Value::deserialize(deserializer)? {
-        serde_json::Value::Number(n) => n
-            .as_i64()
-            .and_then(|v| i32::try_from(v).ok())
-            .ok_or_else(|| D::Error::custom(format!("超出范围的整数: {n}"))),
-        serde_json::Value::String(s) => s
-            .trim()
-            .parse::<i32>()
-            .map_err(|_| D::Error::custom(format!("无法解析整数: {s}"))),
-        other => Err(D::Error::custom(format!("无法解析整数: {other}"))),
+fn coerce_string(value: &serde_json::Value) -> Option<serde_json::Value> {
+    match value {
+        serde_json::Value::String(s) => Some(serde_json::Value::String(s.clone())),
+        serde_json::Value::Bool(b) => Some(serde_json::Value::String(b.to_string())),
+        serde_json::Value::Number(n) => Some(serde_json::Value::String(n.to_string())),
+        _ => None,
     }
 }
 
@@ -352,6 +375,7 @@ where
 fn setting_from_xml(text: &str) -> Result<Setting, ConfigError> {
     let fields = xml::read_fields(text)?;
 
+    // XML 为纯文本格式：先按字符串收集，再统一做按字段类型的归一化转换
     let mut map = serde_json::Map::new();
     for (name, value) in fields {
         // 名称按不区分大小写匹配已知字段并规范为 PascalCase，与 C# 绑定行为一致
@@ -360,26 +384,11 @@ fn setting_from_xml(text: &str) -> Result<Setting, ConfigError> {
             .find(|(n, _)| n.eq_ignore_ascii_case(&name))
             .map(|(n, _)| n.to_string())
             .unwrap_or(name);
-        map.insert(canonical, infer_value(&value));
+        map.insert(canonical, serde_json::Value::String(value));
     }
 
-    serde_json::from_value(serde_json::Value::Object(map))
-        .map_err(|e| ConfigError::Parse(e.to_string()))
-}
-
-/// 按文本内容推测类型，供 XML（纯文本格式）反序列化到强类型字段。
-fn infer_value(text: &str) -> serde_json::Value {
-    let t = text.trim();
-    if t.eq_ignore_ascii_case("true") {
-        return serde_json::Value::Bool(true);
-    }
-    if t.eq_ignore_ascii_case("false") {
-        return serde_json::Value::Bool(false);
-    }
-    if let Ok(n) = t.parse::<i64>() {
-        return serde_json::Value::Number(n.into());
-    }
-    serde_json::Value::String(text.to_string())
+    let value = normalize_setting_value(serde_json::Value::Object(map));
+    serde_json::from_value(value).map_err(|e| ConfigError::Parse(e.to_string()))
 }
 
 /// 原子写入：先写临时文件，再重命名替换。对应 C# `FileConfigProvider.OnWrite`。
@@ -653,6 +662,7 @@ mod tests {
         let setting = Setting::load_from("Z:/not-exist/definitely-not-there.config");
         assert!(setting.is_err());
     }
+
     #[test]
     fn case_insensitive_field_names() {
         let text = "<Core><debug>true</debug><logfilemaxbytes>15</logfilemaxbytes><logpath>X</logpath></Core>";
@@ -660,6 +670,25 @@ mod tests {
         assert!(setting.debug);
         assert_eq!(setting.log_file_max_bytes, 15);
         assert_eq!(setting.log_path, "X");
+    }
+
+    #[test]
+    fn numeric_like_string_fields_stay_strings() {
+        // 字符串字段内容形如数字时不能被强转为数字，否则反序列化会失败
+        let text = "<Core><LogPath>123</LogPath><ServiceAddress>456789</ServiceAddress></Core>";
+        let setting = setting_from_xml(text).unwrap();
+        assert_eq!(setting.log_path, "123");
+        assert_eq!(setting.service_address, "456789");
+    }
+
+    #[test]
+    fn invalid_values_fall_back_to_defaults() {
+        // 单个字段损坏时保持默认值（对应 C# 绑定容错），不影响其它字段
+        let text = "<Core><Debug>not-a-bool</Debug><LogFileMaxBytes>abc</LogFileMaxBytes><LogPath>Logs</LogPath></Core>";
+        let setting = setting_from_xml(text).unwrap();
+        assert!(setting.debug); // 默认 true
+        assert_eq!(setting.log_file_max_bytes, 10); // 默认 10
+        assert_eq!(setting.log_path, "Logs");
     }
 
     #[test]
@@ -673,7 +702,7 @@ mod tests {
   "LogPath": "Logs",
   "Unknown": "ignored"
 }"#;
-        let setting = serde_json::from_str::<Setting>(text).unwrap();
+        let setting = crate::config::json::from_json(text).unwrap();
         assert!(!setting.debug);
         assert_eq!(setting.log_level, "Warn");
         assert_eq!(setting.log_file_max_bytes, 20);
