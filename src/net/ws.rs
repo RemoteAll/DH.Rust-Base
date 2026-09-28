@@ -197,6 +197,59 @@ enum FrameEvent {
     Ended(String),
 }
 
+// ————— 处理器执行器（专用线程池：阻塞隔离 + 低入队成本）—————
+
+/// 消息处理器执行器：专用 std 线程池。
+///
+/// 语义（对齐 C# `Task.Run`）：handler 在工作线程执行——既不阻塞异步运行时
+/// 工作线程（慢/阻塞 handler 不影响心跳与读循环），也不走 tokio blocking 池
+/// （后者每消息一次全局队列调度，高吞吐场景实测差 ~15%——基准见 tools/bench-net）。
+struct HandlerExecutor {
+    tx: std::sync::mpsc::Sender<HandlerJob>,
+}
+
+type HandlerJob = Box<dyn FnOnce() + Send + 'static>;
+
+impl HandlerExecutor {
+    /// 进程级全局执行器（惰性初始化；线程数 = CPU 核数，界于 4~64）。
+    fn global() -> &'static HandlerExecutor {
+        static EXECUTOR: std::sync::OnceLock<HandlerExecutor> = std::sync::OnceLock::new();
+        EXECUTOR.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<HandlerJob>();
+            let rx = Arc::new(Mutex::new(rx));
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8)
+                .clamp(4, 64);
+            for i in 0..threads {
+                let rx = rx.clone();
+                let _ = std::thread::Builder::new()
+                    .name(format!("dhrust-handler-{i}"))
+                    .spawn(move || loop {
+                        // 持锁 recv：同一时刻仅一个线程在队首等待；取到任务后立即释放锁再执行
+                        let job = {
+                            let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.recv()
+                        };
+                        match job {
+                            Ok(job) => {
+                                // 隔绝 panic：单个 handler 崩溃不得杀死池线程
+                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                            }
+                            Err(_) => break, // 发送端销毁（进程退出）——线程退出
+                        }
+                    });
+            }
+            HandlerExecutor { tx }
+        })
+    }
+
+    /// 提交任务（fire-and-forget；std mpsc 入队，无异步调度开销）。
+    fn spawn(&self, job: HandlerJob) {
+        let _ = self.tx.send(job);
+    }
+}
+
 impl WsClient {
     /// 建立客户端并后台托管会话（立即返回；连接与重连由后台任务驱动）。
     pub fn connect(url: impl Into<String>, hooks: WsHooks, options: WsClientOptions) -> WsClient {
@@ -458,9 +511,9 @@ async fn run_session(
                         *client.shared.last_pong.lock().unwrap() = Instant::now();
                         let _ = client.events_tx.send(WsEvent::PongReceived);
                     } else if let Some(handler) = &client.shared.hooks.on_message {
-                        // 关键：handler 在 blocking 池执行（对齐 C# Task.Run 语义）——
+                        // 关键：handler 在专用执行器线程执行（对齐 C# Task.Run 语义）——
                         // 即使 handler 内部阻塞（同步 IO/长耗时），也不会占用异步
-                        // 工作线程，心跳与读循环永不受影响（C# 教训固化）。
+                        // 工作线程，心跳与读循环永不受影响（C# 教训固化）；
                         // enter() 让 handler 内可直接 tokio::spawn / 使用异步定时器。
                         let handler = handler.clone();
                         let msg = WsMessage {
@@ -468,10 +521,10 @@ async fn run_session(
                             client: client.clone(),
                         };
                         let rt = rt.clone();
-                        tokio::task::spawn_blocking(move || {
+                        HandlerExecutor::global().spawn(Box::new(move || {
                             let _guard = rt.enter();
                             handler(msg);
-                        });
+                        }));
                     }
                     None
                 }
@@ -570,6 +623,10 @@ pub struct WsServerOptions {
     pub idle_timeout: Option<Duration>,
     /// 发送队列容量（满时业务发送返回失败）
     pub send_queue: usize,
+    /// 消息处理器内联执行（会话循环内就地处理——对齐 C#/NewLife 处理模型：
+    /// 读→处理→写同一任务完成，最低时延；仅适合纯内存快速处理。阻塞型
+    /// 业务保持默认 `false`，走专用处理器线程池——对齐 C# `Task.Run` 隔离语义）
+    pub inline_handlers: bool,
 }
 
 impl Default for WsServerOptions {
@@ -578,6 +635,7 @@ impl Default for WsServerOptions {
             max_message_size: 16 * 1024 * 1024,
             idle_timeout: None,
             send_queue: 1024,
+            inline_handlers: false,
         }
     }
 }
@@ -720,43 +778,6 @@ where
     let (rx, mut tx) = ws.split(tokio::io::split);
     let mut reader = FragmentCollectorRead::new(rx);
 
-    // 读任务：只分类与转发（永不阻塞；应用消息交给会话任务分发）
-    let (frame_tx, mut frame_rx) = mpsc::channel::<FrameEvent>(256);
-    let read_task = tokio::spawn(async move {
-        loop {
-            match reader.read_frame(&mut noop_send).await {
-                Ok(frame) => match frame.opcode {
-                    OpCode::Text => {
-                        let text = String::from_utf8_lossy(&frame.payload).into_owned();
-                        if frame_tx.send(FrameEvent::Text(text)).await.is_err() {
-                            break;
-                        }
-                    }
-                    OpCode::Ping => {
-                        let payload = frame.payload.to_vec();
-                        if frame_tx.send(FrameEvent::Ping(payload)).await.is_err() {
-                            break;
-                        }
-                    }
-                    OpCode::Pong => {
-                        if frame_tx.send(FrameEvent::Pong).await.is_err() {
-                            break;
-                        }
-                    }
-                    OpCode::Close => {
-                        let _ = frame_tx.send(FrameEvent::Closed).await;
-                        break;
-                    }
-                    _ => {}
-                },
-                Err(e) => {
-                    let _ = frame_tx.send(FrameEvent::Ended(e.to_string())).await;
-                    break;
-                }
-            }
-        }
-    });
-
     // 空闲看门狗（可选；任何帧到达即刷新）
     let idle_every = options
         .idle_timeout
@@ -765,6 +786,7 @@ where
     let mut idle_timer = tokio::time::interval(idle_every);
     idle_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_activity = Instant::now();
+    let mut send_fn = noop_send;
 
     if let Some(cb) = &hooks.on_open {
         cb(conn.clone());
@@ -793,57 +815,67 @@ where
                 }
                 None => Some("命令通道关闭".to_string()),
             },
-            ev = frame_rx.recv() => match ev {
-                Some(FrameEvent::Text(text)) => {
+            frame = reader.read_frame(&mut send_fn) => match frame {
+                Ok(frame) => {
                     last_activity = Instant::now();
-                    if is_ping_text(&text) {
-                        // 对齐 C# 服务端：ping json → pong json（不进入业务分发）
-                        let pong = pong_json();
-                        match tx
-                            .write_frame(Frame::text(Payload::Owned(pong.into_bytes())))
-                            .await
-                        {
-                            Ok(()) => None,
-                            Err(e) => Some(format!("Pong 回复失败: {e}")),
+                    match frame.opcode {
+                        OpCode::Text => {
+                            let text = String::from_utf8_lossy(&frame.payload).into_owned();
+                            if is_ping_text(&text) {
+                                // 对齐 C# 服务端：ping json → pong json（不进入业务分发）
+                                let pong = pong_json();
+                                match tx
+                                    .write_frame(Frame::text(Payload::Owned(pong.into_bytes())))
+                                    .await
+                                {
+                                    Ok(()) => None,
+                                    Err(e) => Some(format!("Pong 回复失败: {e}")),
+                                }
+                            } else if is_pong_text(&text) {
+                                // 客户端主动 Pong：服务端无需处理
+                                None
+                            } else if let Some(handler) = &hooks.on_message {
+                                let handler = handler.clone();
+                                let msg = WsServerMessage {
+                                    text,
+                                    conn: conn.clone(),
+                                };
+                                if options.inline_handlers {
+                                    // 内联模式：会话循环内就地处理（对齐 C#/NewLife 模型）——
+                                    // 读→处理→写同一任务完成；处理后立即就地冲刷排队发送，
+                                    // 省掉一次任务唤醒（高吞吐场景关键路径，基准见 tools/bench-net）
+                                    handler(msg);
+                                    flush_pending(&mut cmd_rx, &mut tx).await
+                                } else {
+                                    // 隔离模式：handler 在专用执行器线程执行（对齐 C# Task.Run 语义）——
+                                    // 即使阻塞也不占用异步工作线程（读循环与发送不受影响）
+                                    let rt = rt.clone();
+                                    HandlerExecutor::global().spawn(Box::new(move || {
+                                        let _guard = rt.enter();
+                                        handler(msg);
+                                    }));
+                                    None
+                                }
+                            } else {
+                                None
+                            }
                         }
-                    } else if is_pong_text(&text) {
-                        // 客户端主动 Pong：服务端无需处理
-                        None
-                    } else if let Some(handler) = &hooks.on_message {
-                        // 关键：handler 在 blocking 池执行——即使阻塞也不占用异步
-                        // 工作线程（读循环与发送不受影响）
-                        let handler = handler.clone();
-                        let msg = WsServerMessage {
-                            text,
-                            conn: conn.clone(),
-                        };
-                        let rt = rt.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let _guard = rt.enter();
-                            handler(msg);
-                        });
-                        None
-                    } else {
-                        None
+                        OpCode::Ping => {
+                            let payload = frame.payload.to_vec();
+                            match tx.write_frame(Frame::pong(Payload::Owned(payload))).await {
+                                Ok(()) => None,
+                                Err(e) => Some(format!("Pong 回复失败: {e}")),
+                            }
+                        }
+                        OpCode::Pong => None,
+                        OpCode::Close => {
+                            let _ = tx.write_frame(Frame::close(1000, b"")).await;
+                            Some("客户端关闭连接".to_string())
+                        }
+                        _ => None,
                     }
                 }
-                Some(FrameEvent::Ping(payload)) => {
-                    last_activity = Instant::now();
-                    match tx.write_frame(Frame::pong(Payload::Owned(payload))).await {
-                        Ok(()) => None,
-                        Err(e) => Some(format!("Pong 回复失败: {e}")),
-                    }
-                }
-                Some(FrameEvent::Pong) => {
-                    last_activity = Instant::now();
-                    None
-                }
-                Some(FrameEvent::Closed) => {
-                    let _ = tx.write_frame(Frame::close(1000, b"")).await;
-                    Some("客户端关闭连接".to_string())
-                }
-                Some(FrameEvent::Ended(r)) => Some(format!("读取结束: {r}")),
-                None => Some("读任务已结束".to_string()),
+                Err(e) => Some(format!("读取结束: {e}")),
             },
             _ = idle_timer.tick() => {
                 if let Some(d) = options.idle_timeout {
@@ -865,12 +897,43 @@ where
         }
     };
 
-    read_task.abort();
     connected.store(false, Ordering::Release);
     if let Some(cb) = &hooks.on_close {
         cb(conn, reason.clone());
     }
     reason
+}
+
+/// 就地冲刷已排队的发送命令（内联模式：同任务内完成读→处理→写；返回 `Some` 即应结束会话）。
+async fn flush_pending<W>(
+    cmd_rx: &mut mpsc::Receiver<ServerCmd>,
+    tx: &mut fastwebsockets::WebSocketWrite<W>,
+) -> Option<String>
+where
+    W: AsyncWrite + Unpin,
+{
+    while let Ok(cmd) = cmd_rx.try_recv() {
+        match cmd {
+            ServerCmd::Text { text, ack } => {
+                let res = tx
+                    .write_frame(Frame::text(Payload::Owned(text.into_bytes())))
+                    .await;
+                if let Some(ack) = ack {
+                    let _ = ack.send(res.is_ok());
+                }
+                if let Err(e) = res {
+                    return Some(format!("发送失败: {e}"));
+                }
+            }
+            ServerCmd::Close => {
+                let _ = tx
+                    .write_frame(Frame::close(1000, "服务端关闭".as_bytes()))
+                    .await;
+                return Some("服务端关闭连接".to_string());
+            }
+        }
+    }
+    None
 }
 
 // ————— 握手（自管：TCP + HTTP/1.1 升级 + Accept 校验）—————

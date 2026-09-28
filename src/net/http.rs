@@ -11,7 +11,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
@@ -39,8 +39,8 @@ pub struct HttpRequest {
     pub query: String,
     /// 请求头（保序；名称保持原样）
     pub headers: Vec<(String, String)>,
-    /// 请求体（已按上限收全）
-    pub body: Vec<u8>,
+    /// 请求体（已按上限收全；单帧请求为引用计数共享的零拷贝字节，带引用计数下为共享分片）
+    pub body: Bytes,
 }
 
 impl HttpRequest {
@@ -74,7 +74,7 @@ pub struct HttpResponse {
     /// 响应头
     pub headers: Vec<(String, String)>,
     /// 响应体
-    pub body: Vec<u8>,
+    pub body: Bytes,
 }
 
 impl HttpResponse {
@@ -86,7 +86,7 @@ impl HttpResponse {
                 "Content-Type".to_string(),
                 "text/plain; charset=utf-8".to_string(),
             )],
-            body: text.into().into_bytes(),
+            body: Bytes::from(text.into().into_bytes()),
         }
     }
 
@@ -98,16 +98,16 @@ impl HttpResponse {
                 "Content-Type".to_string(),
                 "application/json; charset=utf-8".to_string(),
             )],
-            body: json.into().into_bytes(),
+            body: Bytes::from(json.into().into_bytes()),
         }
     }
 
-    /// 二进制响应（自定 Content-Type）。
-    pub fn bytes(status: u16, content_type: &str, data: Vec<u8>) -> Self {
+    /// 二进制响应（自定 Content-Type；`Bytes` 直通为零拷贝）。
+    pub fn bytes(status: u16, content_type: &str, data: impl Into<Bytes>) -> Self {
         Self {
             status,
             headers: vec![("Content-Type".to_string(), content_type.to_string())],
-            body: data,
+            body: data.into(),
         }
     }
 
@@ -116,7 +116,7 @@ impl HttpResponse {
         Self {
             status,
             headers: Vec::new(),
-            body: Vec::new(),
+            body: Bytes::new(),
         }
     }
 
@@ -133,7 +133,7 @@ impl HttpResponse {
             builder = builder.header(k.as_str(), v.as_str());
         }
         builder
-            .body(Full::new(Bytes::from(self.body)))
+            .body(Full::new(self.body))
             .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
     }
 }
@@ -169,6 +169,13 @@ pub struct HttpServerOptions {
     pub max_body_size: usize,
     /// WebSocket 会话配置（升级后使用）
     pub ws: WsServerOptions,
+    /// 每连接独立线程（current_thread 运行时）——对齐 NewLife/IOCP 的
+    /// “完成线程直处理”模型：数据到达直接唤醒该连接自己的线程处理，
+    /// 省去多线程运行时的跨线程序列化，消息往返时延更低
+    /// （基准实测回环乒乓吞吐 +~15%，见 tools/bench-net）；
+    /// 代价是每连接一线程（默认每线程保留 2MB 虚拟栈），适合连接数在
+    /// 数百以内的场景（Agent 服务端典型规模）；大规模连接保持默认 `false`
+    pub thread_per_connection: bool,
 }
 
 impl Default for HttpServerOptions {
@@ -176,6 +183,7 @@ impl Default for HttpServerOptions {
         Self {
             max_body_size: DEFAULT_MAX_BODY_SIZE,
             ws: WsServerOptions::default(),
+            thread_per_connection: false,
         }
     }
 }
@@ -225,23 +233,79 @@ impl HttpServer {
             let _ = tcp.set_nodelay(true);
             let handler = handler.clone();
             let options = options.clone();
-            tokio::spawn(serve_connection(tcp, handler, options));
+            if options.thread_per_connection {
+                // 每连接独立线程（current_thread 运行时）：数据到达直接唤醒本线程
+                // 处理（对齐 NewLife/IOCP 完成线程直处理模型）；基准实测回环乒乓
+                // 吞吐 +~20%（见 tools/bench-net README）
+                //
+                // 关键：tokio TcpStream 绑定在主运行时的 reactor 上，禁止跨运行时
+                // 使用——必须先 `into_std` 脱钩，进入连接线程后再 `from_std` 注册
+                // 到该线程自己的 current_thread 运行时（曾直接跨线程使用导致负载
+                // 下连接被中断：WSAECONNABORTED/WSAECONNRESET）
+                let std_tcp = match tcp.into_std() {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let _ = std_tcp.set_nonblocking(true);
+                let _ = std::thread::Builder::new()
+                    .name("dhrust-conn".to_string())
+                    .spawn(move || {
+                        let rt = match tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        {
+                            Ok(rt) => rt,
+                            Err(_) => return,
+                        };
+                        rt.block_on(async move {
+                            let tcp = match TcpStream::from_std(std_tcp) {
+                                Ok(t) => t,
+                                Err(_) => return,
+                            };
+                            serve_connection(tcp, handler, options).await;
+                        });
+                    });
+            } else {
+                tokio::spawn(serve_connection(tcp, handler, options));
+            }
         }
     }
 }
 
 /// 单连接服务（hyper HTTP/1.1 + 升级支持）。
+///
+/// 升级后的 WS 会话由**本任务就地继续驱动**（不 spawn 独立任务）：在
+/// “每连接独立线程”模式下 `block_on` 返回即销毁运行时，会让被 spawn 的会话
+/// 任务被连带取消（曾表现为 101 后连接被 RST）；就地续跑同时少一次任务跳转。
 async fn serve_connection(tcp: TcpStream, handler: HttpHandler, options: HttpServerOptions) {
+    let upgrade_slot: Arc<Mutex<Option<(hyper::upgrade::OnUpgrade, WsServerHooks)>>> =
+        Arc::new(Mutex::new(None));
+    // 会话配置先取出（options 会被闭包 move）
+    let ws_options = options.ws.clone();
+    let slot = upgrade_slot.clone();
     let service = service_fn(move |req: Request<Incoming>| {
         let handler = handler.clone();
         let options = options.clone();
-        async move { Ok::<_, Infallible>(handle_http(req, handler, options).await) }
+        let slot = slot.clone();
+        async move { Ok::<_, Infallible>(handle_http(req, handler, options, slot).await) }
     });
     // 连接错误（含正常关闭）静默；升级路径由 with_upgrades 支撑
     let _ = http1::Builder::new()
         .serve_connection(TokioIo::new(tcp), service)
         .with_upgrades()
         .await;
+
+    // 若本次连接请求过升级：等待 hyper 完成 IO 移交并就地驱动会话
+    let pending = {
+        let mut guard = upgrade_slot.lock().unwrap_or_else(|e| e.into_inner());
+        guard.take()
+    };
+    if let Some((on_upgrade, hooks)) = pending {
+        if let Ok(upgraded) = on_upgrade.await {
+            let io = TokioIo::new(upgraded);
+            ws::run_server_session(io, hooks, ws_options).await;
+        }
+    }
 }
 
 /// 处理单个请求：收集请求 → 处理器 → 普通响应或 WS 升级。
@@ -249,6 +313,7 @@ async fn handle_http(
     mut req: Request<Incoming>,
     handler: HttpHandler,
     options: HttpServerOptions,
+    upgrade_slot: Arc<Mutex<Option<(hyper::upgrade::OnUpgrade, WsServerHooks)>>>,
 ) -> Response<Full<Bytes>> {
     // 升级意图必须先登记（handler 返回 WebSocket 时由 hyper 完成移交）
     let ws_candidate = is_ws_candidate(req.headers());
@@ -301,18 +366,9 @@ async fn handle_http(
             }
 
             let accept = ws::ws_accept(key);
-            tokio::spawn(async move {
-                match on_upgrade.await {
-                    Ok(upgraded) => {
-                        // TokioIo<Upgraded>：hyper 升级流 → tokio 读写（保留 hyper 读缓冲）
-                        let io = TokioIo::new(upgraded);
-                        ws::run_server_session(io, hooks, options.ws).await;
-                    }
-                    Err(_e) => {
-                        // 升级失败（对端断开/协议错误）：连接已不可用，静默收场
-                    }
-                }
-            });
+            // 升级点交给 serve_connection 在连接任务上继续驱动（不可 spawn 独立任务，
+            // 理由见 serve_connection 注释）
+            *upgrade_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((on_upgrade, hooks));
 
             HttpResponse::empty(101)
                 .with_header("Upgrade", "websocket")
@@ -338,20 +394,38 @@ fn is_ws_candidate(headers: &hyper::HeaderMap) -> bool {
     upgrade_ok && conn_ok
 }
 
-/// 收集请求体（带上限；超限即中断返回 `Err`）。
-async fn collect_body(body: Incoming, limit: usize) -> Result<Vec<u8>, ()> {
-    let mut collected: Vec<u8> = Vec::new();
+/// 收集请求体（带上限；超出即中断返回 `Err`）。单帧请求零拷贝直通（引用计数共享）。
+async fn collect_body(body: Incoming, limit: usize) -> Result<Bytes, ()> {
     let mut body = body;
+    let mut first: Option<Bytes> = None;
+    let mut extra: Vec<Bytes> = Vec::new();
+    let mut total: usize = 0;
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|_| ())?;
         if let Ok(data) = frame.into_data() {
-            if collected.len() + data.len() > limit {
+            total += data.len();
+            if total > limit {
                 return Err(());
             }
-            collected.extend_from_slice(&data);
+            if first.is_none() {
+                first = Some(data);
+            } else {
+                extra.push(data);
+            }
         }
     }
-    Ok(collected)
+    match first {
+        None => Ok(Bytes::new()),
+        Some(first) if extra.is_empty() => Ok(first),
+        Some(first) => {
+            let mut v: Vec<u8> = Vec::with_capacity(total);
+            v.extend_from_slice(&first);
+            for chunk in &extra {
+                v.extend_from_slice(chunk);
+            }
+            Ok(Bytes::from(v))
+        }
+    }
 }
 
 // ————— 状态码与统一返回（对齐 C# `Pek.Helpers.StateCode` / `Pek.Models.DGResult`）—————
