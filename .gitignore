@@ -1,2 +1,6 @@
 /target
 /Cargo.lock
+
+# C# 互操作工具的构建产物
+tools/**/bin/
+tools/**/obj/

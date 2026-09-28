@@ -1,6 +1,6 @@
 [package]
 name = "dhrust"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
 authors = ["Berin <100538511@qq.com>", "湖北登灏科技有限公司 <dingchuan@deng-hao.com>"]
 
@@ -13,3 +13,9 @@ chrono = "0.4"
 md-5 = "0.10"
 rand = "0.8.5"
 sha1 = "0.10.5"
+# 配置序列化（JSON 配置读写，与 C# JsonConfigProvider 对应）
+serde = { version = "1", features = ["derive"] }
+# preserve_order：保持字段声明顺序，生成与 C# 一致的配置文件
+serde_json = { version = "1", features = ["preserve_order"] }
+# XML 配置读取（与 C# XmlConfigProvider 生成的文件互通）
+quick-xml = "0.36"
