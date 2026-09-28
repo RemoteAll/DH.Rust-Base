@@ -20,12 +20,17 @@
 //!   （约 3.0 万次/秒，p99≈64µs；同口径分析与 F014 结论见 `tools/bench-view/README.md`）
 //! - T011 ✅ 块体标记语义 / 邮件规则 / HtmlEncoder.Default 等价转义实测修订
 //!   （互操作用例 8/8 `RAZOR INTEROP PASSED`）
+//! - F014 ✅ 原生编译 v1：模板 → Rust 源码（`codegen`）→ cdylib（`native` 加载，`rt` 共享内核）；
+//!   实测 p50 13.7µs / 吞吐 2.07x C#；解释器保留为回退（`tools/razor-native`）
 
+pub mod codegen;
 pub mod error;
 pub mod expr;
 pub mod lexer;
+pub mod native;
 pub mod parser;
 mod render;
+pub mod rt;
 pub mod value;
 
 pub use error::{ParseError, RenderError};

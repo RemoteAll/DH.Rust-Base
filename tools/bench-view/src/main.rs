@@ -1,18 +1,22 @@
 //! Razor 子集引擎渲染基准（Rust 侧）。
 //!
-//! 同模板、同数据、warm 状态（解析一次）下重复渲染，输出吞吐与分位延迟；
+//! 同模板、同数据、warm 状态（解析/编译一次）下重复渲染，输出吞吐与分位延迟；
 //! 与 `tools/csharp/RazorInterop bench`（C# 原生 Razor 编译缓存同口径）对照，
 //! 由 `scripts/bench_view.ps1` 驱动。
 //!
+//! 引擎：
+//! - `rust`：解释器（`Template::render`）；
+//! - `rust-native`：F014 生成代码（传 dll 路径时启用，`NativeTemplate::render`）。
+//!
 //! 用法：
-//!   bench-view <template.cshtml> <data.json> [iterations] [warmup]
+//!   bench-view <template.cshtml> <data.json> [iterations] [warmup] [native.dll]
 
 use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
-        eprintln!("用法：bench-view <template.cshtml> <data.json> [iterations] [warmup]");
+        eprintln!("用法：bench-view <template.cshtml> <data.json> [iterations] [warmup] [native.dll]");
         std::process::exit(2);
     }
     let iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20_000);
@@ -20,21 +24,35 @@ fn main() {
 
     let template_src = std::fs::read_to_string(&args[0]).expect("读取模板失败");
     let data_src = std::fs::read_to_string(&args[1]).expect("读取数据失败");
-    let template = dhrust::razor::Template::parse(&template_src).expect("模板解析失败");
     let json: serde_json::Value = serde_json::from_str(&data_src).expect("数据 JSON 无效");
     let model = dhrust::razor::Value::from(json);
 
-    // warm
+    // 引擎一：解释器（解析一次）
+    let template = dhrust::razor::Template::parse(&template_src).expect("模板解析失败");
+    bench("rust", iters, warmup, || template.render(&model).expect("渲染失败"));
+
+    // 引擎二：F014 生成代码（可选，传第 5 个参数为 dll 路径）
+    if let Some(dll) = args.get(4) {
+        let native =
+            dhrust::razor::native::NativeTemplate::load(dll).expect("加载原生模板失败（dll 路径/ABI）");
+        bench("rust-native", iters, warmup, || {
+            native.render(&model).expect("渲染失败")
+        });
+    }
+}
+
+/// 单引擎计时：warmup → 计时循环（逐次采样）→ 吞吐/分位输出。
+fn bench(engine: &str, iters: usize, warmup: usize, mut render: impl FnMut() -> String) {
     let mut checksum: u64 = 0;
     for _ in 0..warmup {
-        checksum ^= template.render(&model).expect("渲染失败").len() as u64;
+        checksum ^= render().len() as u64;
     }
 
     let mut samples: Vec<u64> = Vec::with_capacity(iters);
     let total = Instant::now();
     for _ in 0..iters {
         let t0 = Instant::now();
-        let out = template.render(&model).expect("渲染失败");
+        let out = render();
         samples.push(t0.elapsed().as_nanos() as u64);
         checksum = checksum.wrapping_add(out.len() as u64);
     }
@@ -44,7 +62,7 @@ fn main() {
     let pct = |p: f64| samples[((samples.len() - 1) as f64 * p) as usize] as f64 / 1000.0;
     let mean = samples.iter().sum::<u64>() as f64 / samples.len() as f64 / 1000.0;
 
-    println!("engine=rust");
+    println!("engine={engine}");
     println!("iterations={iters}");
     println!("total_ms={:.1}", total.as_secs_f64() * 1000.0);
     println!("ops_per_sec={:.0}", iters as f64 / total.as_secs_f64());

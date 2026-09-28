@@ -15,8 +15,9 @@
 //! 别名（对齐 C# 中 Page 的 `Model` 属性语义）。
 
 use crate::razor::error::RenderError;
-use crate::razor::expr::{BinOp, Expr, Literal, Seg, UnOp};
+use crate::razor::expr::{BinOp, Expr, Literal, Seg};
 use crate::razor::parser::{Node, Stmt, Template};
+use crate::razor::rt;
 use crate::razor::value::Value;
 use crate::razor::Options;
 
@@ -62,7 +63,7 @@ impl<'a> Renderer<'a> {
     fn render_nodes(&mut self, nodes: &[Node]) -> Result<(), Box<RenderError>> {
         self.depth += 1;
         if self.depth > self.options.max_depth {
-            return Err(fail(
+            return Err(rt::fail(
                 "模板",
                 format!(
                     "渲染嵌套过深（上限 {} 层，可调整 Options.max_depth）",
@@ -88,7 +89,7 @@ impl<'a> Renderer<'a> {
             Node::Write(e) => {
                 let v = self.eval(e)?;
                 if self.options.escape {
-                    write_escaped_value(&v, &mut self.out);
+                    rt::write_escaped_value(&v, &mut self.out);
                 } else {
                     v.write_text_into(&mut self.out);
                 }
@@ -102,15 +103,8 @@ impl<'a> Renderer<'a> {
             Node::If { branches, else_ } => {
                 for (cond, body) in branches {
                     let v = self.eval(cond)?;
-                    match v {
-                        Value::Bool(true) => return self.render_nodes(body),
-                        Value::Bool(false) => {}
-                        other => {
-                            return Err(fail(
-                                cond.to_string(),
-                                format!("@if 条件需要布尔值，实际为 {}", value_type_name(&other)),
-                            ));
-                        }
+                    if rt::cond_bool(&v, || cond.to_string())? {
+                        return self.render_nodes(body);
                     }
                 }
                 if let Some(body) = else_ {
@@ -120,21 +114,7 @@ impl<'a> Renderer<'a> {
             }
             Node::ForEach { var, iter, body } => {
                 let v = self.eval(iter)?;
-                let items = match v {
-                    Value::List(items) => items,
-                    Value::Null => {
-                        return Err(fail(
-                            iter.to_string(),
-                            "foreach 不能遍历 null（C# 为 NullReferenceException）",
-                        ));
-                    }
-                    other => {
-                        return Err(fail(
-                            iter.to_string(),
-                            format!("foreach 需要列表，实际为 {}", value_type_name(&other)),
-                        ));
-                    }
-                };
+                let items = rt::foreach_items(v, || iter.to_string())?;
                 // 循环变量一次性入栈，逐轮改写值（Rc 克隆廉价，避免每行重建变量名）
                 let marker = self.scopes.len();
                 self.scopes.push((var.clone(), Value::Null));
@@ -167,79 +147,36 @@ impl<'a> Renderer<'a> {
             Expr::Path(segs) => self.eval_path(e, segs),
             Expr::Unary(op, x) => {
                 let v = self.eval(x)?;
-                match op {
-                    UnOp::Not => match v {
-                        Value::Bool(b) => Ok(Value::Bool(!b)),
-                        other => Err(expr_err(
-                            e,
-                            format!("! 需要布尔操作数，实际为 {}", value_type_name(&other)),
-                        )),
-                    },
-                    UnOp::Neg => match v {
-                        Value::Int(i) => Ok(Value::Int(i.wrapping_neg())),
-                        Value::Float(f) => Ok(Value::Float(-f)),
-                        other => Err(expr_err(
-                            e,
-                            format!("- 需要数值操作数，实际为 {}", value_type_name(&other)),
-                        )),
-                    },
-                }
+                rt::apply_unary(*op, v, || e.to_string())
             }
             // 短路运算（C# && / || 语义）
             Expr::Bin(BinOp::And, l, r) => {
                 let lv = self.eval(l)?;
-                match lv {
-                    Value::Bool(false) => Ok(Value::Bool(false)),
-                    Value::Bool(true) => {
-                        let rv = self.eval(r)?;
-                        match rv {
-                            Value::Bool(b) => Ok(Value::Bool(b)),
-                            other => Err(expr_err(
-                                e,
-                                format!("&& 需要布尔操作数，实际为 {}", value_type_name(&other)),
-                            )),
-                        }
-                    }
-                    other => Err(expr_err(
-                        e,
-                        format!("&& 需要布尔操作数，实际为 {}", value_type_name(&other)),
-                    )),
+                if !rt::as_bool(&lv, "&&", || e.to_string())? {
+                    return Ok(Value::Bool(false));
                 }
+                let rv = self.eval(r)?;
+                Ok(Value::Bool(rt::as_bool(&rv, "&&", || e.to_string())?))
             }
             Expr::Bin(BinOp::Or, l, r) => {
                 let lv = self.eval(l)?;
-                match lv {
-                    Value::Bool(true) => Ok(Value::Bool(true)),
-                    Value::Bool(false) => {
-                        let rv = self.eval(r)?;
-                        match rv {
-                            Value::Bool(b) => Ok(Value::Bool(b)),
-                            other => Err(expr_err(
-                                e,
-                                format!("|| 需要布尔操作数，实际为 {}", value_type_name(&other)),
-                            )),
-                        }
-                    }
-                    other => Err(expr_err(
-                        e,
-                        format!("|| 需要布尔操作数，实际为 {}", value_type_name(&other)),
-                    )),
+                if rt::as_bool(&lv, "||", || e.to_string())? {
+                    return Ok(Value::Bool(true));
                 }
+                let rv = self.eval(r)?;
+                Ok(Value::Bool(rt::as_bool(&rv, "||", || e.to_string())?))
             }
             Expr::Bin(op, l, r) => {
                 let lv = self.eval(l)?;
                 let rv = self.eval(r)?;
-                apply_bin_op(e, *op, lv, rv)
+                rt::apply_bin(*op, lv, rv, || e.to_string())
             }
             Expr::Ternary(c, t, f) => {
                 let cv = self.eval(c)?;
-                match cv {
-                    Value::Bool(true) => self.eval(t),
-                    Value::Bool(false) => self.eval(f),
-                    other => Err(expr_err(
-                        e,
-                        format!("三目条件需要布尔值，实际为 {}", value_type_name(&other)),
-                    )),
+                if rt::ternary_cond(&cv, || e.to_string())? {
+                    self.eval(t)
+                } else {
+                    self.eval(f)
                 }
             }
             Expr::Coalesce(l, r) => {
@@ -267,7 +204,7 @@ impl<'a> Renderer<'a> {
                 if n == first {
                     return match v.get(name).cloned() {
                         Some(val) => Ok(val),
-                        None => Err(describe_prop_error(
+                        None => Err(rt::describe_prop_error(
                             &format_path(segs, 1, Some(name)),
                             name,
                             v,
@@ -279,14 +216,14 @@ impl<'a> Renderer<'a> {
                 Value::Object(o) => match o.get(first) {
                     Some(v) => v,
                     None if first == "Model" => self.root,
-                    None => return Err(fail(first.clone(), "未找到变量或属性")),
+                    None => return Err(rt::fail(first.clone(), "未找到变量或属性")),
                 },
                 _ if first == "Model" => self.root,
-                _ => return Err(fail(first.clone(), "未找到变量或属性")),
+                _ => return Err(rt::fail(first.clone(), "未找到变量或属性")),
             };
             return match base.get(name).cloned() {
                 Some(val) => Ok(val),
-                None => Err(describe_prop_error(
+                None => Err(rt::describe_prop_error(
                     &format_path(segs, 1, Some(name)),
                     name,
                     base,
@@ -295,7 +232,7 @@ impl<'a> Renderer<'a> {
         }
         let mut cur = self
             .resolve_root(first)
-            .ok_or_else(|| fail(first.clone(), "未找到变量或属性"))?;
+            .ok_or_else(|| rt::fail(first.clone(), "未找到变量或属性"))?;
         // 成功路径零分配；失败时才拼装诊断路径（format_path）
         for (i, seg) in segs.iter().enumerate().skip(1) {
             match seg {
@@ -303,13 +240,13 @@ impl<'a> Renderer<'a> {
                     Some(v) => cur = v,
                     None => {
                         let path = format_path(segs, i, Some(name));
-                        return Err(describe_prop_error(&path, name, &cur));
+                        return Err(rt::describe_prop_error(&path, name, &cur));
                     }
                 },
                 Seg::Index(ix) => {
                     let iv = self.eval(ix)?;
-                    cur = index_into(&cur, &iv)
-                        .map_err(|msg| fail(format_path(segs, i, None), msg))?;
+                    cur = rt::index_into(&cur, &iv)
+                        .map_err(|msg| rt::fail(format_path(segs, i, None), msg))?;
                 }
             }
         }
@@ -345,188 +282,7 @@ impl<'a> Renderer<'a> {
     }
 }
 
-// ————— 运算符与语义 ————
-
-/// 数值（对齐 C# 的 int/double 提升）。
-enum Number {
-    I(i64),
-    F(f64),
-}
-
-fn as_number(v: &Value) -> Option<Number> {
-    match v {
-        Value::Int(i) => Some(Number::I(*i)),
-        Value::Float(f) => Some(Number::F(*f)),
-        _ => None,
-    }
-}
-
-fn to_f64(n: Number) -> f64 {
-    match n {
-        Number::I(i) => i as f64,
-        Number::F(f) => f,
-    }
-}
-
-fn apply_bin_op(e: &Expr, op: BinOp, lv: Value, rv: Value) -> Result<Value, Box<RenderError>> {
-    match op {
-        BinOp::Add => {
-            // 任一侧为字符串 → 拼接（C# 语义：null 参与拼接按空串）
-            if matches!(lv, Value::Str(_)) || matches!(rv, Value::Str(_)) {
-                // C# 语义：null 参与拼接按空串；直接追加避免中间字符串
-                let mut s = String::new();
-                lv.write_text_into(&mut s);
-                rv.write_text_into(&mut s);
-                return Ok(Value::Str(s.into()));
-            }
-            let (Some(a), Some(b)) = (as_number(&lv), as_number(&rv)) else {
-                return Err(bin_type_err(
-                    e,
-                    &lv,
-                    &rv,
-                    "+ 需要数值，或任一侧为字符串用于拼接",
-                ));
-            };
-            match (a, b) {
-                (Number::I(x), Number::I(y)) => Ok(Value::Int(x.wrapping_add(y))),
-                (x, y) => Ok(Value::Float(to_f64(x) + to_f64(y))),
-            }
-        }
-        BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
-            let (Some(a), Some(b)) = (as_number(&lv), as_number(&rv)) else {
-                return Err(bin_type_err(e, &lv, &rv, "算术运算需要数值"));
-            };
-            numeric_op(e, op, a, b)
-        }
-        BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
-            let (Some(a), Some(b)) = (as_number(&lv), as_number(&rv)) else {
-                return Err(bin_type_err(e, &lv, &rv, "比较运算需要数值"));
-            };
-            Ok(Value::Bool(compare_numbers(op, a, b)))
-        }
-        BinOp::Eq | BinOp::Ne => {
-            let eq = values_equal(e, &lv, &rv)?;
-            Ok(Value::Bool(if op == BinOp::Eq { eq } else { !eq }))
-        }
-        BinOp::And | BinOp::Or => unreachable!("短路运算在 eval 前处理"),
-    }
-}
-
-/// 整数/浮点算术（整数除零与溢出显式报错，对齐 C# 异常语义）。
-fn numeric_op(e: &Expr, op: BinOp, a: Number, b: Number) -> Result<Value, Box<RenderError>> {
-    match (a, b) {
-        (Number::I(x), Number::I(y)) => match op {
-            BinOp::Sub => Ok(Value::Int(x.wrapping_sub(y))),
-            BinOp::Mul => Ok(Value::Int(x.wrapping_mul(y))),
-            BinOp::Div => {
-                if y == 0 {
-                    return Err(expr_err(e, "整数除数为零（C# 为 DivideByZeroException）"));
-                }
-                match x.checked_div(y) {
-                    Some(v) => Ok(Value::Int(v)),
-                    None => Err(expr_err(e, "整数除法溢出（C# 为 OverflowException）")),
-                }
-            }
-            BinOp::Mod => {
-                if y == 0 {
-                    return Err(expr_err(
-                        e,
-                        "整数取模除数为零（C# 为 DivideByZeroException）",
-                    ));
-                }
-                // i64::MIN % -1 除法部分溢出，但其余数按 C# 语义为 0
-                Ok(Value::Int(x.checked_rem(y).unwrap_or(0)))
-            }
-            _ => unreachable!("仅算术运算符"),
-        },
-        (x, y) => {
-            let (x, y) = (to_f64(x), to_f64(y));
-            let v = match op {
-                BinOp::Sub => x - y,
-                BinOp::Mul => x * y,
-                BinOp::Div => x / y,
-                BinOp::Mod => x % y,
-                _ => unreachable!("仅算术运算符"),
-            };
-            Ok(Value::Float(v))
-        }
-    }
-}
-
-fn compare_numbers(op: BinOp, a: Number, b: Number) -> bool {
-    match (a, b) {
-        (Number::I(x), Number::I(y)) => match op {
-            BinOp::Lt => x < y,
-            BinOp::Gt => x > y,
-            BinOp::Le => x <= y,
-            BinOp::Ge => x >= y,
-            _ => unreachable!("仅比较运算符"),
-        },
-        (x, y) => {
-            let (x, y) = (to_f64(x), to_f64(y));
-            match op {
-                BinOp::Lt => x < y,
-                BinOp::Gt => x > y,
-                BinOp::Le => x <= y,
-                BinOp::Ge => x >= y,
-                _ => unreachable!("仅比较运算符"),
-            }
-        }
-    }
-}
-
-/// `==` / `!=`：null 先行、字符串值比较、数值提升；列表/对象引用比较不支持（显式报错）。
-fn values_equal(e: &Expr, l: &Value, r: &Value) -> Result<bool, Box<RenderError>> {
-    match (l, r) {
-        (Value::Null, Value::Null) => Ok(true),
-        (Value::Null, _) | (_, Value::Null) => Ok(false),
-        (Value::Str(a), Value::Str(b)) => Ok(a == b),
-        (Value::Bool(a), Value::Bool(b)) => Ok(a == b),
-        (Value::Int(a), Value::Int(b)) => Ok(a == b),
-        (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => {
-            let (a, b) = (as_number(l).unwrap(), as_number(r).unwrap());
-            Ok(to_f64(a) == to_f64(b))
-        }
-        (Value::List(_) | Value::Object(_), _) | (_, Value::List(_) | Value::Object(_)) => Err(
-            expr_err(e, "== 不支持列表/对象（C# 为引用比较，语义不保证一致）"),
-        ),
-        (a, b) => Err(expr_err(
-            e,
-            format!(
-                "== 两侧类型不同（{} 与 {}）",
-                value_type_name(a),
-                value_type_name(b)
-            ),
-        )),
-    }
-}
-
-/// 索引访问（列表 + 整数、对象 + 字符串键）。
-fn index_into(target: &Value, index: &Value) -> Result<Value, String> {
-    match (target, index) {
-        (Value::List(items), Value::Int(i)) => {
-            if *i < 0 || *i as usize >= items.len() {
-                Err(format!("索引越界（列表长度 {}，下标 {i}）", items.len()))
-            } else {
-                Ok(items[*i as usize].clone())
-            }
-        }
-        (Value::List(_), other) => Err(format!(
-            "列表索引需要整数，实际为 {}",
-            value_type_name(other)
-        )),
-        (Value::Object(o), Value::Str(k)) => {
-            o.get(k).cloned().ok_or_else(|| format!("键不存在：{k}"))
-        }
-        (Value::Object(_), other) => Err(format!(
-            "对象索引需要字符串键，实际为 {}",
-            value_type_name(other)
-        )),
-        (Value::Null, _) => Err("在 null 上取索引（C# 为 NullReferenceException）".into()),
-        (other, _) => Err(format!("{} 不支持索引访问", value_type_name(other))),
-    }
-}
-
+/// 字面量取值（解释器）。
 #[inline(always)]
 fn literal_to_value(l: &Literal) -> Value {
     match l {
@@ -536,16 +292,6 @@ fn literal_to_value(l: &Literal) -> Value {
         Literal::Bool(b) => Value::Bool(*b),
         Literal::Null => Value::Null,
     }
-}
-
-/// 属性访问失败的错误（`path` 为含失败段的完整路径）。
-fn describe_prop_error(path: &str, name: &str, cur: &Value) -> Box<RenderError> {
-    let msg = match cur {
-        Value::Null => "在 null 上访问属性（C# 为 NullReferenceException）".to_string(),
-        Value::Object(_) => format!("属性不存在：{name}"),
-        other => format!("{} 不支持属性访问", value_type_name(other)),
-    };
-    fail(path, msg)
 }
 
 /// 拼装诊断路径（仅错误路径调用）：`segs[..upto]` 为已成功解析的前缀，
@@ -580,182 +326,9 @@ fn format_path(segs: &[Seg], upto: usize, tail_prop: Option<&str>) -> String {
     path
 }
 
-/// 构造错误（热路径内部统一装箱：`Result` 保持小体积，避免每次求值搬运 48 字节错误结构）。
-fn fail(path: impl Into<String>, msg: impl Into<String>) -> Box<RenderError> {
-    Box::new(RenderError::new(path, msg))
-}
-
+/// 构造错误（解释器侧辅助：以表达式源码文本为诊断路径）。
 fn expr_err(e: &Expr, msg: impl Into<String>) -> Box<RenderError> {
-    fail(e.to_string(), msg)
-}
-
-fn bin_type_err(e: &Expr, l: &Value, r: &Value, advice: &str) -> Box<RenderError> {
-    expr_err(
-        e,
-        format!(
-            "操作数类型不支持（{} 与 {}）：{advice}",
-            value_type_name(l),
-            value_type_name(r)
-        ),
-    )
-}
-
-fn value_type_name(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "null",
-        Value::Bool(_) => "布尔",
-        Value::Int(_) => "整数",
-        Value::Float(_) => "浮点",
-        Value::Str(_) => "字符串",
-        Value::List(_) => "列表",
-        Value::Object(_) => "对象",
-    }
-}
-
-// ————— HTML 转义 —————
-
-/// v0.1 转义：等价于 .NET 10 `HtmlEncoder.Default`（由互操作工具 `probe-encode` 全字符实测对齐）。
-///
-/// - 原样输出：空格与可打印 ASCII（0x20–0x7E，排除下表中的六个特殊字符）；
-/// - `"`→`&quot;`、`&`→`&amp;`、`'`→`&#x27;`、`+`→`&#x2B;`、`<`→`&lt;`、`>`→`&gt;`；
-/// - 其余字符（含 `\r` `\n`、Tab、非 ASCII、控制符）→ `&#x` + 大写十六进制 + `;`
-///   （非 BMP 按标量编码，如 `😀`→`&#x1F600;`）。
-///
-/// 实现按字节扫描：可打印 ASCII 连续段整段复制（`push_str`），仅在特殊/非 ASCII
-/// 字节处打断；块级快路径用 8 字节 SWAR 探测（无特殊字节整块跳过），避免长文本
-/// 逐字符处理的迭代开销。
-#[inline]
-fn escape_html_into(text: &str, out: &mut String) {
-    use std::fmt::Write as _;
-    out.reserve(text.len());
-    let bytes = text.as_bytes();
-    let mut start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        // 8 字节快路径：整块均为「无特殊字节的可打印 ASCII」时直接前进
-        while i + 8 <= bytes.len() && boring8(&bytes[i..i + 8]) {
-            i += 8;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        let b = bytes[i];
-        // 单字节快路径：可打印 ASCII 且非特殊字符
-        if matches!(b, b' '..=b'~') && !matches!(b, b'"' | b'&' | b'\'' | b'+' | b'<' | b'>') {
-            i += 1;
-            continue;
-        }
-        // 先复制未处理的原样段
-        if start < i {
-            out.push_str(&text[start..i]);
-        }
-        match b {
-            b'"' => out.push_str("&quot;"),
-            b'&' => out.push_str("&amp;"),
-            b'\'' => out.push_str("&#x27;"),
-            b'+' => out.push_str("&#x2B;"),
-            b'<' => out.push_str("&lt;"),
-            b'>' => out.push_str("&gt;"),
-            _ => {
-                // 控制符或非 ASCII：解码首字符（i 恒为字符边界）后整体实体化
-                let c = text[i..].chars().next().expect("i 恒为字符边界");
-                let _ = write!(out, "&#x{:X};", c as u32);
-                i += c.len_utf8();
-                start = i;
-                continue;
-            }
-        }
-        i += 1;
-        start = i;
-    }
-    if start < bytes.len() {
-        out.push_str(&text[start..]);
-    }
-}
-
-/// 8 字节块是否「无特殊字节」（可做整段复制的充分条件）。
-///
-/// 特殊字节 = 需实体化的字符集：控制符（<0x20）、DEL 与非 ASCII（≥0x7F）、
-/// 以及 `"` `&` `'` `+` `<` `>` 六字符。SWAR 探测允许误报（判非平凡而实际平凡），
-/// 但不得漏报——漏报会破坏转义语义。
-#[inline(always)]
-fn boring8(chunk: &[u8]) -> bool {
-    const ONES: u64 = 0x0101_0101_0101_0101;
-    #[inline]
-    fn has_zero(x: u64) -> bool {
-        x.wrapping_sub(ONES) & !x & 0x8080_8080_8080_8080 != 0
-    }
-    #[inline]
-    fn has_byte(x: u64, b: u8) -> bool {
-        has_zero(x ^ (ONES * b as u64))
-    }
-    #[inline]
-    fn has_less(x: u64, n: u8) -> bool {
-        // 经典 hasless：n ∈ [1,128]
-        x.wrapping_sub(ONES * n as u64) & !x & 0x8080_8080_8080_8080 != 0
-    }
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(chunk);
-    let x = u64::from_le_bytes(buf);
-    if has_less(x, 0x20) || x & 0x8080_8080_8080_8080 != 0 || has_byte(x, 0x7F) {
-        return false;
-    }
-    !(has_byte(x, b'"')
-        || has_byte(x, b'&')
-        || has_byte(x, b'\'')
-        || has_byte(x, b'+')
-        || has_byte(x, b'<')
-        || has_byte(x, b'>'))
-}
-
-/// 转义写出值（热路径：不经中间 `String`；数值/布尔不含特殊字符，直接追加）。
-#[inline(always)]
-fn write_escaped_value(v: &Value, out: &mut String) {
-    use std::fmt::Write as _;
-    match v {
-        Value::Null => {}
-        Value::Bool(b) => out.push_str(if *b { "True" } else { "False" }),
-        Value::Int(i) => push_i64(out, *i),
-        Value::Float(f) => {
-            if f.is_nan() {
-                out.push_str("NaN");
-            } else if *f == f64::INFINITY {
-                out.push_str("&#x221E;");
-            } else if *f == f64::NEG_INFINITY {
-                out.push_str("-&#x221E;");
-            } else {
-                let _ = write!(out, "{f}");
-            }
-        }
-        Value::Str(s) => escape_html_into(s, out),
-        Value::List(_) | Value::Object(_) => {
-            // 列表/对象先文本化再转义（罕见路径，保持与 to_text 管道一致）
-            let mut tmp = String::new();
-            v.write_text_into(&mut tmp);
-            escape_html_into(&tmp, out);
-        }
-    }
-}
-
-/// 手写十进制整数写出（避开 `write!` 格式化机制开销，热路径使用）。
-#[inline(always)]
-fn push_i64(out: &mut String, v: i64) {
-    if v == 0 {
-        out.push('0');
-        return;
-    }
-    let mut buf = [0u8; 20];
-    let mut i = buf.len();
-    let mut u = v.unsigned_abs();
-    while u > 0 {
-        i -= 1;
-        buf[i] = b'0' + (u % 10) as u8;
-        u /= 10;
-    }
-    if v < 0 {
-        out.push('-');
-    }
-    out.push_str(std::str::from_utf8(&buf[i..]).expect("十进制 ASCII"));
+    rt::fail(e.to_string(), msg)
 }
 
 #[cfg(test)]

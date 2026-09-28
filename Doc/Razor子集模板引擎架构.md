@@ -184,7 +184,28 @@ Seg   = Prop(String) | Index(Box<Expr>)
 | 自研维护成本 | 长期负担 | 模块独立、接口窄；失败可整体回退方案 A（Liquid/Handlebars） |
 | 会话上下文漂移 | 批处理中断 | 文档三件套 + 检查点报告 + 新会话续接模板 |
 
-## 8. 变更记录
+## 8. 原生编译（F014，v1 已落地）
+
+为消除解释器与 JIT 的结构性差距（F012 结论），模板可编译为本机 cdylib 渲染：
+
+- **生成**：`Template::to_rust_lib_source()`（`src/razor/codegen.rs`）把 AST 展开为 Rust 源码——
+  字面量 `push_str`、局部变量直接绑定（`__u_*`）、属性访问 `rt::prop_get_ic`（每站点内联缓存槽）、
+  字符串字面量池（`Rc<str>` 预建，热路径零分配）、诊断路径静态拼装；
+- **语义保证**：生成代码逐操作调用 `rt` 共享内核（与解释器同一实现），
+  输出字节与错误消息一致（8 用例 + 基准夹具逐字节验证）；
+- **编译**：`tools/razor-native compile <tpl> -o <dll>`（生成独立 crate → `cargo build --release`
+  → 拷贝产物；共享 `target/native/target`，dhrust 只编译一次）；
+- **加载**：`razor::native::NativeTemplate::load`（手工 FFI：Windows `LoadLibraryW` / Unix `dlopen`；
+  零新依赖；校验 `razor_abi_version`）；无 dll 时回退解释器；
+- **实测（2026-09-28）**：p50 13.7µs / 吞吐 69k（同口径 C# 33k，2.07x）、p99 31µs；
+  解释器保持 30.5µs 作为回退路径。
+
+部署形态：构建/发布流水线编译模板（同 ASP.NET Razor 预编译模型），运行期仅加载 dll；
+开发机无工具链或模板热改场景回退解释器。
+
+## 9. 变更记录
 
 - 2026-09-28：初始版本（方案 C 立项；批次 1 启动）
-- 2026-09-28：T011 实测修订——块体标记语义/邮件规则/HtmlEncoder.Default 等价转义（依据 RazorEngineCore 代码生成与 HtmlEncoder 探测）；互操作用例 8/8 `RAZOR INTEROP PASSED`- 2026-09-28：T010 基准工程 `tools/bench-view`（探针分解 + RazorEngineCore 双端对照）——Rust 约 3.0 万次/秒（首测 1,896 → 优化约 16 倍：`Rc` 共享、零分配写出、SWAR 转义、LTO/单代码元）；同口径 p50 差 2 倍系解释器 vs JIT 的结构差距，均值/吞吐口径同档（0.83~1.24x，受 C# GC 波动主导），F014 触发评估（结论：建议批次 4+ 按需实施；详见 `tools/bench-view/README.md`）
+- 2026-09-28：T011 实测修订——块体标记语义/邮件规则/HtmlEncoder.Default 等价转义（依据 RazorEngineCore 代码生成与 HtmlEncoder 探测）；互操作用例 8/8 `RAZOR INTEROP PASSED`
+- 2026-09-28：T010 基准工程 `tools/bench-view`（探针分解 + RazorEngineCore 双端对照）——Rust 约 3.0 万次/秒（首测 1,896 → 优化约 16 倍：`Rc` 共享、零分配写出、SWAR 转义、LTO/单代码元）；同口径 p50 差 2 倍系解释器 vs JIT 的结构差距，均值/吞吐口径同档（0.83~1.24x，受 C# GC 波动主导），F014 触发评估（结论：建议批次 4+ 按需实施；详见 `tools/bench-view/README.md`）
+- 2026-09-28：F014 v1 落地——模板→Rust 源码→cdylib 原生编译管线（`codegen`/`native`/`rt` 共享内核 + `tools/razor-native`）；实测 p50 13.7µs、吞吐 69k（2.07x C#），8 用例 `RAZOR NATIVE PASSED`；解释器保留为回退

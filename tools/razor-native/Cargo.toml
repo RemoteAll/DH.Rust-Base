@@ -1,0 +1,13 @@
+[package]
+name = "razor-native"
+version = "0.1.0"
+edition = "2021"
+
+# Razor 子集模板引擎 F014 工具：模板 → Rust 源码 → cdylib 编译 / 渲染验证。
+# 用法：
+#   razor-native compile <template.cshtml> [-o out.dll] [--name id] [--workdir dir] [--dep spec]
+#   razor-native render  <template.dll> <data.json> [-o out.html]
+
+[dependencies]
+dhrust = { path = "../..", features = ["razor"] }
+serde_json = { version = "1", features = ["preserve_order"] }

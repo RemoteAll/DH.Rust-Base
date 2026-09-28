@@ -42,6 +42,12 @@ impl Object {
         None
     }
 
+    /// 按下标取键值对（F014 生成代码的「每站点内联缓存」专用）。
+    #[inline]
+    pub(crate) fn entry_at(&self, i: usize) -> Option<(&str, &Value)> {
+        self.entries.get(i).map(|(k, v)| (k.as_str(), v))
+    }
+
     /// 是否包含键。
     pub fn contains_key(&self, key: &str) -> bool {
         self.entries.iter().any(|(k, _)| k == key)
