@@ -322,9 +322,17 @@ impl TimerScheduler {
     }
 
     /// 执行完成后的下一次等待周期收缩（对应 C# `OnFinish` 中的 `_period` 更新）。
+    ///
+    /// 异步任务在调度线程已经开始等待后才完成收缩时，必须唤醒调度线程，
+    /// 否则会按收缩前的更长周期休眠（最坏可达一整轮空闲周期）。
     fn shrink_wait(&self, period_ms: i64) {
-        if period_ms > 0 {
-            self.inner.wait_ms.fetch_min(period_ms, Ordering::SeqCst);
+        if period_ms <= 0 {
+            return;
+        }
+
+        let prev = self.inner.wait_ms.fetch_min(period_ms, Ordering::SeqCst);
+        if period_ms < prev {
+            self.inner.signal.notify_all();
         }
     }
 
@@ -398,21 +406,29 @@ fn process(inner: Arc<SchedulerInner>) {
             break;
         }
 
-        // 等待唤醒或超时；代数变化说明有新增/移除/唤醒，需立即重新扫描
-        let wait = inner.wait_ms.load(Ordering::SeqCst);
-        if wait > 0 {
-            let mut state = inner.state.lock().expect("scheduler state");
-            let deadline = Instant::now() + Duration::from_millis(wait as u64);
-            while state.generation == generation {
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                let (next, _) = inner
-                    .signal
-                    .wait_timeout(state, deadline - now)
-                    .expect("scheduler state");
-                state = next;
+        // 等待唤醒或超时。
+        // - 代数变化（新增/移除/唤醒）→ 立即重新扫描；
+        // - 周期被收缩（异步任务完成）→ 按最新周期继续等待；
+        // - 本轮周期耗尽 → 重新扫描。
+        let mut state = inner.state.lock().expect("scheduler state");
+        loop {
+            if state.generation != generation {
+                break;
+            }
+
+            let wait = inner.wait_ms.load(Ordering::SeqCst);
+            if wait <= 0 {
+                break;
+            }
+
+            let (next, timeout) = inner
+                .signal
+                .wait_timeout(state, Duration::from_millis(wait as u64))
+                .expect("scheduler state");
+            state = next;
+
+            if timeout.timed_out() {
+                break;
             }
         }
     }
@@ -1064,6 +1080,29 @@ mod tests {
 
         timer.cancel();
         timer2.cancel();
+        scheduler.dispose();
+    }
+
+    #[test]
+    fn async_timer_zero_due_fires_repeatedly() {
+        // 回归：单定时器（没有其它定时器为异步完成争取时间窗口）时，
+        // 异步任务完成后的周期收缩必须能唤醒调度线程，
+        // 否则调度线程会按收缩前的空闲周期（60s）休眠
+        let scheduler = TimerScheduler::create("test-async-zero-due");
+        let count = Arc::new(AtomicI32::new(0));
+        let c = count.clone();
+        let timer = Timer::with_scheduler(scheduler.clone(), 0, 200, move |_| {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+        timer.set_async(true);
+
+        assert!(
+            wait_until(|| count.load(Ordering::SeqCst) >= 3, 3000),
+            "异步定时器未按期重复触发，count={}",
+            count.load(Ordering::SeqCst)
+        );
+
+        timer.cancel();
         scheduler.dispose();
     }
 
