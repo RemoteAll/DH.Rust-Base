@@ -11,9 +11,10 @@
 //! 当前进度（批次 1）：
 //! - T003 ✅ 骨架：`value`（模型值）、`error`（错误模型）、[`Options`]
 //! - T004 ✅ 扫描器 `lexer`：HTML/代码混合切分、注释/转义、块边界（单测覆盖）
-//! - T005 表达式解析 `expr.rs`（待实现）
+//! - T005 ✅ 表达式子集 `expr`：字面量/路径/优先级/三目/`??`（单测覆盖）
 
 pub mod error;
+pub mod expr;
 pub mod lexer;
 pub mod value;
 
