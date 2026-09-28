@@ -13,6 +13,8 @@
 //! 解析入口为 [`parse`]；产物 [`Expr`] 树由 `parser` 组装进模板 AST、由 `render` 求值。
 //! 错误带行列号；位置基准（首字符的 line/col）由调用方传入，多行表达式按换行推进。
 
+use std::fmt;
+
 use crate::razor::error::ParseError;
 
 /// 表达式嵌套深度上限（防极端输入的栈溢出）。
@@ -99,6 +101,68 @@ pub enum BinOp {
     And,
     /// `||`
     Or,
+}
+
+impl fmt::Display for Expr {
+    /// 诊断用表达式文本：近似源形式（复合子表达式补括号保证无歧义），不保证可回读。
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Expr::Lit(Literal::Str(s)) => write!(f, "\"{s}\""),
+            Expr::Lit(Literal::Int(i)) => write!(f, "{i}"),
+            Expr::Lit(Literal::Float(x)) => write!(f, "{x}"),
+            Expr::Lit(Literal::Bool(b)) => write!(f, "{b}"),
+            Expr::Lit(Literal::Null) => write!(f, "null"),
+            Expr::Path(segs) => {
+                for (i, seg) in segs.iter().enumerate() {
+                    match seg {
+                        Seg::Prop(name) => {
+                            if i > 0 {
+                                write!(f, ".")?;
+                            }
+                            write!(f, "{name}")?;
+                        }
+                        Seg::Index(ix) => write!(f, "[{ix}]")?,
+                    }
+                }
+                Ok(())
+            }
+            Expr::Unary(op, x) => {
+                let sym = match op {
+                    UnOp::Not => "!",
+                    UnOp::Neg => "-",
+                };
+                write!(f, "{sym}{}", wrap(x))
+            }
+            Expr::Bin(op, l, r) => {
+                let sym = match op {
+                    BinOp::Mul => "*",
+                    BinOp::Div => "/",
+                    BinOp::Mod => "%",
+                    BinOp::Add => "+",
+                    BinOp::Sub => "-",
+                    BinOp::Lt => "<",
+                    BinOp::Gt => ">",
+                    BinOp::Le => "<=",
+                    BinOp::Ge => ">=",
+                    BinOp::Eq => "==",
+                    BinOp::Ne => "!=",
+                    BinOp::And => "&&",
+                    BinOp::Or => "||",
+                };
+                write!(f, "{} {sym} {}", wrap(l), wrap(r))
+            }
+            Expr::Ternary(c, t, e) => write!(f, "{} ? {} : {}", wrap(c), wrap(t), wrap(e)),
+            Expr::Coalesce(l, r) => write!(f, "{} ?? {}", wrap(l), wrap(r)),
+        }
+    }
+}
+
+/// 诊断文本的括号包装（复合子表达式加括号，保证无歧义）。
+fn wrap(e: &Expr) -> String {
+    match e {
+        Expr::Bin(..) | Expr::Ternary(..) | Expr::Coalesce(..) => format!("({e})"),
+        _ => e.to_string(),
+    }
 }
 
 // ————— 解析入口 —————
@@ -861,5 +925,15 @@ mod tests {
         // 未闭合注释：兜底为「意外结束」
         let e = err("a + /* 未闭合");
         assert!(e.message.contains("意外结束"));
+    }
+
+    #[test]
+    fn display_is_diagnostic_friendly() {
+        assert_eq!(ok("Model.Sites[0].Name").to_string(), "Model.Sites[0].Name");
+        assert_eq!(ok("a + b * c").to_string(), "a + (b * c)");
+        assert_eq!(ok("(a + b) * c").to_string(), "(a + b) * c");
+        assert_eq!(ok("!a && b").to_string(), "!a && b");
+        assert_eq!(ok("a ?? b ? c : d").to_string(), "(a ?? b) ? c : d");
+        assert_eq!(ok("-(1 + 2)").to_string(), "-(1 + 2)");
     }
 }

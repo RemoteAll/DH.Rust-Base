@@ -13,12 +13,13 @@
 //! - T004 ✅ 扫描器 `lexer`：HTML/代码混合切分、注释/转义、块边界（单测覆盖）
 //! - T005 ✅ 表达式子集 `expr`：字面量/路径/优先级/三目/`??`（单测覆盖）
 //! - T006 ✅ 节点解析 `parser`：`@if`/`@foreach`/`@{ }` 与嵌套（单测覆盖）
-//! - T007 渲染器 `render`（待实现）
+//! - T007 ✅ 渲染器 `render`：求值+转义+输出+作用域（单测覆盖）
 
 pub mod error;
 pub mod expr;
 pub mod lexer;
 pub mod parser;
+mod render;
 pub mod value;
 
 pub use error::{ParseError, RenderError};

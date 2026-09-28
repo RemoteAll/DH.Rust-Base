@@ -119,7 +119,17 @@ impl Value {
                 }
             }
             Value::Int(i) => i.to_string(),
-            Value::Float(f) => f.to_string(),
+            Value::Float(f) => {
+                if f.is_nan() {
+                    "NaN".into()
+                } else if *f == f64::INFINITY {
+                    "∞".into()
+                } else if *f == f64::NEG_INFINITY {
+                    "-∞".into()
+                } else {
+                    f.to_string()
+                }
+            }
             Value::Str(s) => s.clone(),
             Value::List(_) | Value::Object(_) => self.to_string(),
         }
@@ -286,5 +296,14 @@ mod tests {
         assert_eq!(keys, vec!["b", "a"]);
         assert!(v.get("a").is_some());
         assert!(v.get("missing").is_none());
+    }
+
+    #[test]
+    fn float_special_values_match_csharp() {
+        assert_eq!(Value::Float(f64::INFINITY).to_text(), "∞");
+        assert_eq!(Value::Float(f64::NEG_INFINITY).to_text(), "-∞");
+        assert_eq!(Value::Float(f64::NAN).to_text(), "NaN");
+        assert_eq!(Value::Float(3.0).to_text(), "3");
+        assert_eq!(Value::Float(0.5).to_text(), "0.5");
     }
 }
