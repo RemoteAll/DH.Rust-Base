@@ -8,6 +8,7 @@
 //! - 运算符与优先级（对齐 C#，从高到低）：
 //!   `! -`（单目） > `* / %` > `+ -` > `< > <= >=` > `== !=` > `&&` > `||` > `??` >
 //!   `?:`（右结合）。
+//! - 表达式内允许 C# 注释（`//`、`/* */`）作为空白跳过（未闭合由「意外结束」兜底）。
 //!
 //! 解析入口为 [`parse`]；产物 [`Expr`] 树由 `parser` 组装进模板 AST、由 `render` 求值。
 //! 错误带行列号；位置基准（首字符的 line/col）由调用方传入，多行表达式按换行推进。
@@ -168,9 +169,31 @@ impl ExprParser {
         Some(c)
     }
 
+    /// 跳过空白与 C# 注释（`//`、`/* */`；子集允许表达式内注释）。
+    ///
+    /// 注释未闭合时不在此报错，交由后续的「意外结束」错误统一兜底。
     fn skip_whitespace(&mut self) {
-        while matches!(self.peek(), Some(c) if c.is_whitespace()) {
-            self.bump();
+        loop {
+            while matches!(self.peek(), Some(c) if c.is_whitespace()) {
+                self.bump();
+            }
+            if self.peek() == Some('/') && self.peek_at(1) == Some('/') {
+                while matches!(self.peek(), Some(c) if c != '\n') {
+                    self.bump();
+                }
+            } else if self.peek() == Some('/') && self.peek_at(1) == Some('*') {
+                self.bump();
+                self.bump();
+                while let Some(c) = self.peek() {
+                    self.bump();
+                    if c == '*' && self.peek() == Some('/') {
+                        self.bump();
+                        break;
+                    }
+                }
+            } else {
+                break;
+            }
         }
     }
 
@@ -829,5 +852,14 @@ mod tests {
         let e = parse("a + )", 3, 10).unwrap_err();
         assert_eq!((e.line, e.col), (3, 14));
         assert!(e.message.contains("意外的字符 ')'"));
+    }
+
+    #[test]
+    fn comments_are_skipped_as_whitespace() {
+        assert_eq!(ok("a + /* c */ b"), bin(BinOp::Add, p("a"), p("b")));
+        assert_eq!(ok("1 // c\n + 2"), bin(BinOp::Add, i(1), i(2)));
+        // 未闭合注释：兜底为「意外结束」
+        let e = err("a + /* 未闭合");
+        assert!(e.message.contains("意外结束"));
     }
 }

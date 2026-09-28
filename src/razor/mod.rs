@@ -8,17 +8,21 @@
 //! - 动态 [`Value`] 模型 + 解释执行（F014 视基准再评估代码生成）；
 //! - 子集外语法显式报错（[`ParseError`] 含行列号与建议）。
 //!
-//! 当前进度（批次 1）：
+//! 当前进度（批次 2）：
 //! - T003 ✅ 骨架：`value`（模型值）、`error`（错误模型）、[`Options`]
 //! - T004 ✅ 扫描器 `lexer`：HTML/代码混合切分、注释/转义、块边界（单测覆盖）
 //! - T005 ✅ 表达式子集 `expr`：字面量/路径/优先级/三目/`??`（单测覆盖）
+//! - T006 ✅ 节点解析 `parser`：`@if`/`@foreach`/`@{ }` 与嵌套（单测覆盖）
+//! - T007 渲染器 `render`（待实现）
 
 pub mod error;
 pub mod expr;
 pub mod lexer;
+pub mod parser;
 pub mod value;
 
 pub use error::{ParseError, RenderError};
+pub use parser::{Node, Stmt, Template};
 pub use value::{Object, Value};
 
 /// 渲染选项。

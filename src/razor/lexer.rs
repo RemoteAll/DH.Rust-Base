@@ -35,11 +35,28 @@ pub struct Token {
     pub line: usize,
     /// 列号（1 基，按字符计）
     pub col: usize,
+    /// 正文起始行（表达式 / 条件 / 代码块正文首字符；无正文概念时与 `line` 相同）
+    pub content_line: usize,
+    /// 正文起始列（1 基，按字符计）
+    pub content_col: usize,
 }
 
 impl Token {
     fn new(kind: TokenKind, line: usize, col: usize) -> Self {
-        Self { kind, line, col }
+        Self {
+            kind,
+            line,
+            col,
+            content_line: line,
+            content_col: col,
+        }
+    }
+
+    /// 附加正文起始位置（供 parser 对条件/表达式精确定位）。
+    fn with_content(mut self, line: usize, col: usize) -> Self {
+        self.content_line = line;
+        self.content_col = col;
+        self
     }
 }
 
@@ -216,6 +233,7 @@ impl Lexer {
         let line = self.line;
         let col = self.col;
         self.bump(); // 消耗 '@'
+        let content = (self.line, self.col); // 正文起点（隐式表达式的首字符）
         let Some(c) = self.peek() else {
             return Err(
                 ParseError::new(line, col, "@ 后缺少内容").with_hint("若要输出字面 @ 请使用 @@")
@@ -223,18 +241,23 @@ impl Lexer {
         };
         match c {
             '(' => {
-                let inner = self.scan_balanced('(', ')', "表达式", line, col)?;
-                tokens.push(Token::new(TokenKind::ExplicitExpr(inner), line, col));
+                let (inner, cpos) = self.scan_balanced('(', ')', "表达式", line, col)?;
+                tokens.push(
+                    Token::new(TokenKind::ExplicitExpr(inner), line, col)
+                        .with_content(cpos.0, cpos.1),
+                );
                 Ok(())
             }
             '{' => {
-                let inner = self.scan_balanced('{', '}', "代码块", line, col)?;
-                tokens.push(Token::new(TokenKind::Code(inner), line, col));
+                let (inner, cpos) = self.scan_balanced('{', '}', "代码块", line, col)?;
+                tokens.push(
+                    Token::new(TokenKind::Code(inner), line, col).with_content(cpos.0, cpos.1),
+                );
                 Ok(())
             }
             c if is_ident_start(c) => {
                 let word = self.scan_identifier();
-                self.scan_directive(tokens, &word, line, col)
+                self.scan_directive(tokens, &word, line, col, content)
             }
             _ => Err(ParseError::new(line, col, format!("不支持的 @ 用法：@{c}"))
                 .with_hint("若为字面 @ 请使用 @@；若为表达式请使用 @(表达式)")),
@@ -248,20 +271,25 @@ impl Lexer {
         word: &str,
         line: usize,
         col: usize,
+        content: (usize, usize),
     ) -> Result<(), ParseError> {
         match word {
             "if" => {
-                let cond = self.expect_parenthesized("if", line, col)?;
-                tokens.push(Token::new(TokenKind::If(cond), line, col));
+                let (cond, cpos) = self.expect_parenthesized("if", line, col)?;
+                tokens
+                    .push(Token::new(TokenKind::If(cond), line, col).with_content(cpos.0, cpos.1));
                 self.scan_block_body("if", line, col, tokens)?;
                 self.try_scan_else(tokens)
             }
             "foreach" => {
-                let head = self.expect_parenthesized("foreach", line, col)?;
-                tokens.push(Token::new(TokenKind::ForEach(head), line, col));
+                let (head, cpos) = self.expect_parenthesized("foreach", line, col)?;
+                tokens.push(
+                    Token::new(TokenKind::ForEach(head), line, col).with_content(cpos.0, cpos.1),
+                );
                 self.scan_block_body("foreach", line, col, tokens)
             }
             "model" => {
+                let cpos = (self.line, self.col);
                 let mut buf = String::new();
                 while !matches!(self.peek(), None | Some('\n') | Some('\r')) {
                     buf.push(self.bump().unwrap());
@@ -271,7 +299,10 @@ impl Lexer {
                     return Err(ParseError::new(line, col, "@model 后缺少类型名")
                         .with_hint("例如：@model MyApp.SiteModel"));
                 }
-                tokens.push(Token::new(TokenKind::Model(ty.to_string()), line, col));
+                tokens.push(
+                    Token::new(TokenKind::Model(ty.to_string()), line, col)
+                        .with_content(cpos.0, cpos.1),
+                );
                 Ok(())
             }
             "else" => Err(ParseError::new(line, col, "@else 必须紧跟在 @if 的 } 之后")
@@ -299,7 +330,10 @@ impl Lexer {
                 .with_hint("布局与分区（F008）规划于迭代 3")),
             _ => {
                 let expr = self.scan_implicit_expr(word.to_string())?;
-                tokens.push(Token::new(TokenKind::ImplicitExpr(expr), line, col));
+                tokens.push(
+                    Token::new(TokenKind::ImplicitExpr(expr), line, col)
+                        .with_content(content.0, content.1),
+                );
                 Ok(())
             }
         }
@@ -311,7 +345,7 @@ impl Lexer {
         what: &str,
         line: usize,
         col: usize,
-    ) -> Result<String, ParseError> {
+    ) -> Result<(String, (usize, usize)), ParseError> {
         self.skip_whitespace();
         if self.peek() == Some('(') {
             self.scan_balanced('(', ')', &format!("@{what} 的条件括号"), line, col)
@@ -364,8 +398,8 @@ impl Lexer {
         self.skip_whitespace();
         if self.starts_with_word("if") {
             self.consume_word("if");
-            let cond = self.expect_parenthesized("else if", el, ec)?;
-            tokens.push(Token::new(TokenKind::ElseIf(cond), el, ec));
+            let (cond, cpos) = self.expect_parenthesized("else if", el, ec)?;
+            tokens.push(Token::new(TokenKind::ElseIf(cond), el, ec).with_content(cpos.0, cpos.1));
             self.scan_block_body("else if", el, ec, tokens)?;
             // 允许链式 else if ... else
             self.try_scan_else(tokens)
@@ -403,14 +437,15 @@ impl Lexer {
                     }
                 }
                 Some('[') => {
-                    let inner = self.scan_balanced('[', ']', "索引器", self.line, self.col)?;
+                    let (inner, _) = self.scan_balanced('[', ']', "索引器", self.line, self.col)?;
                     expr.push('[');
                     expr.push_str(&inner);
                     expr.push(']');
                 }
                 Some('(') => {
                     // 方法调用形态（Raw / Html.Raw 由 parser 识别为固定模式；其余由 parser 报错）
-                    let inner = self.scan_balanced('(', ')', "方法调用", self.line, self.col)?;
+                    let (inner, _) =
+                        self.scan_balanced('(', ')', "方法调用", self.line, self.col)?;
                     expr.push('(');
                     expr.push_str(&inner);
                     expr.push(')');
@@ -441,7 +476,7 @@ impl Lexer {
 
     // ———— 代码区（保护字符串 / 字符 / 注释） ————
 
-    /// 从 `open` 处扫描到与之匹配的 `close`，返回括号内的原文（不含两个边界）。
+    /// 从 `open` 处扫描到与之匹配的 `close`，返回（括号内原文, 正文起始位置）。
     ///
     /// 代码区规则：字符串 `"..."`（含 `\"` 转义）、字符 `'...'`（含 `\'` 转义）、
     /// 行注释 `//`、块注释 `/* */` 内部的 `open` / `close` 不参与平衡。
@@ -452,9 +487,10 @@ impl Lexer {
         ctx: &str,
         start_line: usize,
         start_col: usize,
-    ) -> Result<String, ParseError> {
+    ) -> Result<(String, (usize, usize)), ParseError> {
         debug_assert_eq!(self.peek(), Some(open));
         self.bump(); // 消耗开括号
+        let content = (self.line, self.col); // 正文起点（开括号之后）
         let mut depth = 1usize;
         let mut buf = String::new();
         while let Some(c) = self.peek() {
@@ -501,7 +537,7 @@ impl Lexer {
                 depth -= 1;
                 if depth == 0 {
                     self.bump();
-                    return Ok(buf);
+                    return Ok((buf, content));
                 }
                 buf.push(c);
                 self.bump();
@@ -973,5 +1009,20 @@ mod tests {
         assert!(err_of("@{ var s = \"a\nb\"; }")
             .message
             .contains("不能跨行"));
+    }
+
+    #[test]
+    fn content_positions_are_recorded() {
+        // "@if (a + b) { @(c * d) }"：条件正文自 'a'（列 6）开始
+        let toks = tokenize("@if (a + b) { @(c * d) }").unwrap();
+        assert_eq!((toks[0].content_line, toks[0].content_col), (1, 6));
+        let explicit = toks
+            .iter()
+            .find(|t| matches!(t.kind, TokenKind::ExplicitExpr(_)))
+            .unwrap();
+        assert_eq!((explicit.content_line, explicit.content_col), (1, 17));
+        // 隐式表达式正文自 '@' 后一列开始
+        let toks = tokenize("@Model.Name").unwrap();
+        assert_eq!((toks[0].content_line, toks[0].content_col), (1, 2));
     }
 }
