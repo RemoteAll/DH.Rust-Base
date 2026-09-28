@@ -20,9 +20,29 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # XML 配置读取（与 C# XmlConfigProvider 生成的文件互通）
 quick-xml = "0.36"
 
+# ———— feature `net`（DHDeploy.Agent Rust 迁移网络内核；版本与 bench-net 已验证一致）————
+# 运行时（多线程调度/网络/定时/同步）
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"], optional = true }
+# HTTP 服务端/客户端（连接层；语义层（路由/上下文）在 dhrust::net::http 自研）
+hyper = { version = "1", features = ["http1", "server"], optional = true }
+# Tokio IO 适配
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+# 响应体工具
+http-body-util = { version = "0.1", optional = true }
+# WebSocket 帧层（Apache-2.0，小体量可 fork；会话/心跳/重连语义在 dhrust::net::ws 自研）
+fastwebsockets = { version = "0.8", optional = true }
+
 [features]
 # Razor 子集模板引擎（方案 C，零新依赖；规约见 Doc/Razor子集模板引擎架构.md）
 razor = []
+# 网络内核（DHDeploy.Agent Rust 迁移；选型与红线见 Doc/网络层选型复核.md）
+net = [
+    "dep:tokio",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:fastwebsockets",
+]
 
 [profile.release]
 # 发布构建启用全量 LTO 与单代码元：模板引擎等热路径可跨模块内联（基准见 tools/bench-view）

@@ -8,6 +8,9 @@ pub mod times;
 #[cfg(feature = "razor")]
 pub mod razor; // Razor 子集模板引擎（方案 C）：同一份 .cshtml 双端渲染
 
+#[cfg(feature = "net")]
+pub mod net; // 网络内核（hyper + fastwebsockets + 自研语义层；DHDeploy.Agent Rust 迁移）
+
 pub fn bar() {
     io::foo();
     logs::baz();
