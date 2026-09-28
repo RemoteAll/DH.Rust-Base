@@ -22,3 +22,5 @@ rand = "0.8"
 futures-util = "0.3"
 tokio-tungstenite = "0.26"
 fastwebsockets = "0.8"
+# wave-3：dhrust 完整实现（N002-N004 语义层；验证叠加开销）
+dhrust = { path = "../..", features = ["net"] }

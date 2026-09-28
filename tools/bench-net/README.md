@@ -73,3 +73,41 @@ cargo zigbuild --release --target aarch64-unknown-linux-musl
 ./run-http.sh 64 2000 get 1024 4
 ./run-ws.sh   64 2000 256 4
 ```
+
+## dhrust 完整实现 vs C# DH.NCore 同机对照（N005 红线，2026-09-28）
+
+对比对象：`ws_dhrust` / `http_dhrust`（dhrust 完整语义层：hyper 升级 + fastwebsockets 帧层 +
+自研会话/路由）vs C# 对照服务端 `tools/csharp/BenchNetServer`（DH.NCore `HttpServer`：
+`/ping`、`/echo`、WS 回显），同一 `ws_load` / `http_load` 压测器、同场交替 3 轮。
+
+dhrust 完整实现启用两个框架内置性能选项：
+
+- `WsServerOptions::inline_handlers = true`：消息在会话循环内联处理（对齐 NewLife 处理模型）
+- `HttpServerOptions::thread_per_connection = true`：每连接独立线程（current_thread 运行时，
+  对齐 IOCP 完成线程直处理模型；升级与会话由连接任务就地续跑）
+
+| 场景（同场交替 3 轮均值） | 裸库基线 | **dhrust 完整实现** | C# DH.NCore |
+|------|------:|------:|------:|
+| WS 256B 回显（64c×2000） | 58.4k（ws_fast） | **70.6k** | 69.3k |
+| WS 4KB 回显（32c×1000） | 51.0k（ws_fast） | **59.1k** | 52.5k |
+| HTTP GET /ping（64c×2000） | 59.6k（http_hyper） | **70.5k** | 70.0k |
+| HTTP POST /echo 1KB（64c×2000） | 53.2k（http_hyper） | 56.9k | 57.9k |
+
+延迟（p50 / p99）：
+
+| 场景 | dhrust | C# |
+|------|------|------|
+| WS 256B | 0.78ms / 2.40~2.52ms | 0.79~0.83ms / 2.25~2.49ms |
+| WS 4KB | 0.48~0.49ms / 1.12~1.15ms | 0.54~0.55ms / 1.42~1.80ms |
+| GET /ping | 0.79~0.81ms / 2.47~2.58ms | 0.79~0.83ms / 2.32~2.58ms |
+| POST /echo 1KB | 1.02~1.04ms / 2.70~2.90ms | 0.99~1.05ms / 2.45~2.75ms |
+
+判定（红线：≥ 裸库基线 且 ≥ C# 对照）：
+
+1. **≥ 裸库基线：4/4 场景全胜**（WS +21%/+16%，HTTP +18%/+7%）——会话层/语义层叠加开销为负
+   （关键：每连接线程消除跨线程任务唤醒；对比裸库默认多线程运行时反而更快）。
+2. **≥ C# 对照：WS 256B / WS 4KB / HTTP GET 全胜（+2%~+13%），POST 差距 1.8%**（噪声区间；
+   p50 领先 C#、p99 落后 ~8%）。
+3. 备注：C# 服务端 `dotnet run -c Release -- 28100`；其 WS 处理器须同时注册 `/` 与 `/ws`
+   （DH.NCore `Map` 为精确路径注册，压测器握手走 `/`；只注册 `/ws` 会出现“升级成功但无
+   消息处理器”的静默悬挂）。

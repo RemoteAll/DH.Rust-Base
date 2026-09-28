@@ -19,7 +19,8 @@ try {
     $servers = @(
         [pscustomobject]@{ name = "http_raw";   port = 18081 },
         [pscustomobject]@{ name = "http_hyper"; port = 18082 },
-        [pscustomobject]@{ name = "http_axum";  port = 18083 }
+        [pscustomobject]@{ name = "http_axum";  port = 18083 },
+        [pscustomobject]@{ name = "http_dhrust"; port = 18084 }
     )
 
     $results = @()

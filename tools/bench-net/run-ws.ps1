@@ -18,7 +18,8 @@ try {
     $servers = @(
         [pscustomobject]@{ name = "ws_raw";         port = 18091 },
         [pscustomobject]@{ name = "ws_tungstenite"; port = 18092 },
-        [pscustomobject]@{ name = "ws_fast";        port = 18093 }
+        [pscustomobject]@{ name = "ws_fast";        port = 18093 },
+        [pscustomobject]@{ name = "ws_dhrust";      port = 18094 }
     )
 
     $results = @()
