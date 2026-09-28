@@ -13,7 +13,8 @@
 //!   随时 `send_text` 补发响应（对齐 C#「Dispatcher 返回 null 时延迟发送」机制）。
 //!
 //! 握手：自管（HTTP/1.1 升级 + `Sec-WebSocket-Accept` 校验）；帧层自动行为全部关闭，
-//! 控制帧由会话层处理。wss/TLS 待 `net-tls`（rustls + ring）。
+//! 控制帧由会话层处理。wss/TLS：启用 `net-tls` 特性（rustls + ring；根证书优先系统
+//! 存储、为空时回退 webpki-roots；生产环境 `wss://d.hlktech.com` 路径由此支持）。
 //! 服务端（N003）：hyper 升级后交 [`run_server_session`]——ping json 自动回
 //! pong json（对齐 C# `WebSocketHelper.HandlePingPongMessageAsync`）、消息在
 //! blocking 池分发、发送经单一写通道串行化。
@@ -413,7 +414,7 @@ fn drain_pending(cmd_rx: &mut mpsc::Receiver<Cmd>) {
 async fn run_session(
     client: &WsClient,
     rt: &tokio::runtime::Handle,
-    stream: PrefixedStream<TcpStream>,
+    stream: PrefixedStream<ConnStream>,
     cmd_rx: &mut mpsc::Receiver<Cmd>,
 ) -> String {
     let opts = client.shared.options.clone();
@@ -948,13 +949,18 @@ pub fn ws_accept(key: &str) -> String {
 }
 
 /// 连接并完成升级握手（超时由调用方施加；返回值可能携带预读的首帧字节）。
-async fn connect_handshake(url: &str) -> Result<PrefixedStream<TcpStream>, WsError> {
+async fn connect_handshake(url: &str) -> Result<PrefixedStream<ConnStream>, WsError> {
     let target = parse_ws_url(url)?;
-    let stream = TcpStream::connect((target.host.as_str(), target.port))
+    let tcp = TcpStream::connect((target.host.as_str(), target.port))
         .await
         .map_err(WsError::Io)?;
-    let _ = stream.set_nodelay(true);
-    let mut stream = stream;
+    let _ = tcp.set_nodelay(true);
+    // wss：先完成 TLS 握手（net-tls 特性），再走同一升级流程
+    let mut stream = if target.tls {
+        tls_wrap(&target.host, tcp).await?
+    } else {
+        ConnStream::Plain(tcp)
+    };
 
     // Sec-WebSocket-Key：16 随机字节 → base64
     let mut key_bytes = [0u8; 16];
@@ -1086,33 +1092,42 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
     }
 }
 
-/// 已解析的 ws URL。
+/// 已解析的 ws/wss URL。
 struct WsTarget {
     host: String,
     port: u16,
     path: String,
+    /// 是否 TLS（wss；需启用 `net-tls` 特性）
+    tls: bool,
 }
 
-/// 解析 `ws://host[:port][/path][?query]`（wss 待 net-tls）。
+/// 解析 `ws://` / `wss://host[:port][/path][?query]`（wss 需 `net-tls`）。
 fn parse_ws_url(url: &str) -> Result<WsTarget, WsError> {
-    let rest = url.strip_prefix("ws://").ok_or_else(|| {
-        if url.starts_with("wss://") {
-            WsError::Handshake("wss 暂未支持（待 net-tls）".into())
-        } else {
-            WsError::Handshake(format!("URL 必须以 ws:// 开头: {url}"))
-        }
-    })?;
+    let (rest, tls) = if let Some(r) = url.strip_prefix("ws://") {
+        (r, false)
+    } else if let Some(r) = url.strip_prefix("wss://") {
+        (r, true)
+    } else {
+        return Err(WsError::Handshake(format!(
+            "URL 必须以 ws:// 或 wss:// 开头: {url}"
+        )));
+    };
+    #[cfg(not(feature = "net-tls"))]
+    if tls {
+        return Err(WsError::Handshake("wss 需要启用 net-tls 特性".into()));
+    }
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
+    let default_port = if tls { 443 } else { 80 };
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (
             h.to_string(),
             p.parse()
                 .map_err(|_| WsError::Handshake(format!("端口非法: {p}")))?,
         ),
-        None => (authority.to_string(), 80),
+        None => (authority.to_string(), default_port),
     };
     if host.is_empty() {
         return Err(WsError::Handshake("缺少主机名".into()));
@@ -1121,7 +1136,119 @@ fn parse_ws_url(url: &str) -> Result<WsTarget, WsError> {
         host,
         port,
         path: path.to_string(),
+        tls,
     })
+}
+
+// ————— 连接流（明文 / TLS）—————
+
+/// 连接流：明文 TCP 或 TLS 包装（wss）。
+enum ConnStream {
+    /// 明文（ws）
+    Plain(TcpStream),
+    /// TLS（wss；net-tls）
+    #[cfg(feature = "net-tls")]
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for ConnStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ConnStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "net-tls")]
+            ConnStream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ConnStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            ConnStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "net-tls")]
+            ConnStream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ConnStream::Plain(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "net-tls")]
+            ConnStream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ConnStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "net-tls")]
+            ConnStream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            ConnStream::Plain(s) => s.is_write_vectored(),
+            #[cfg(feature = "net-tls")]
+            ConnStream::Tls(s) => s.is_write_vectored(),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            ConnStream::Plain(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+            #[cfg(feature = "net-tls")]
+            ConnStream::Tls(s) => Pin::new(s.as_mut()).poll_write_vectored(cx, bufs),
+        }
+    }
+}
+
+/// TLS 包装（wss）：根证书优先系统存储（Windows 证书库 / Linux ca-certificates），
+/// 为空时回退 webpki-roots（内置公共根）。
+#[cfg(feature = "net-tls")]
+async fn tls_wrap(host: &str, tcp: TcpStream) -> Result<ConnStream, WsError> {
+    use std::sync::Arc;
+
+    use tokio_rustls::rustls::pki_types::ServerName;
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+
+    let mut roots = RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        let _ = roots.add(cert);
+    }
+    if roots.is_empty() {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let server_name = ServerName::try_from(host.to_string())
+        .map_err(|e| WsError::Handshake(format!("TLS 服务器名非法: {e}")))?;
+    let stream = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| WsError::Handshake(format!("TLS 握手失败: {e}")))?;
+    Ok(ConnStream::Tls(Box::new(stream)))
+}
+
+/// 无 net-tls 特性时的占位（wss 已在解析阶段拒绝，不会到达）。
+#[cfg(not(feature = "net-tls"))]
+async fn tls_wrap(_host: &str, tcp: TcpStream) -> Result<ConnStream, WsError> {
+    Ok(ConnStream::Plain(tcp))
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1195,8 +1322,20 @@ mod tests {
             (t2.host.as_str(), t2.port, t2.path.as_str()),
             ("example.com", 80, "/")
         );
-        assert!(parse_ws_url("wss://example.com").is_err());
         assert!(parse_ws_url("http://example.com").is_err());
+        // wss：net-tls 启用时可解析（默认端口 443），未启用时报错
+        #[cfg(feature = "net-tls")]
+        {
+            let t3 = parse_ws_url("wss://d.example.com/ws?x=1").unwrap();
+            assert_eq!(
+                (t3.host.as_str(), t3.port, t3.path.as_str(), t3.tls),
+                ("d.example.com", 443, "/ws?x=1", true)
+            );
+            let t4 = parse_ws_url("wss://d.example.com:8443").unwrap();
+            assert_eq!(t4.port, 8443);
+        }
+        #[cfg(not(feature = "net-tls"))]
+        assert!(parse_ws_url("wss://example.com").is_err());
     }
 
     #[test]

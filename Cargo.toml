@@ -32,6 +32,11 @@ http-body-util = { version = "0.1", optional = true }
 # WebSocket 帧层（Apache-2.0，小体量可 fork；会话/心跳/重连语义在 dhrust::net::ws 自研）
 # unstable-split：读写半部分离（客户端读任务/写任务结构，见 src/net/ws.rs）
 fastwebsockets = { version = "0.8", optional = true, features = ["unstable-split"] }
+# TLS（wss；rustls + ring——迁移文档选型：性能优、可 zig 交叉编 musl）
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = { version = "0.8", optional = true }
+webpki-roots = { version = "0.26", optional = true }
 
 [features]
 # Razor 子集模板引擎（方案 C，零新依赖；规约见 Doc/Razor子集模板引擎架构.md）
@@ -43,6 +48,14 @@ net = [
     "dep:hyper-util",
     "dep:http-body-util",
     "dep:fastwebsockets",
+]
+# wss/TLS（在 net 之上追加；根证书优先系统存储，为空时回退 webpki-roots）
+net-tls = [
+    "net",
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:webpki-roots",
 ]
 
 [profile.release]
