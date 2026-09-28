@@ -12,9 +12,10 @@
   </PropertyGroup>
 
   <!-- C# 对照基准：DH.NCore 自研网络栈（HttpServer + WebSocket）
-       供 Rust 侧 http_load / ws_load 同 harness 施加相同负载 -->
+       供 Rust 侧 http_load / ws_load 同 harness 施加相同负载。
+       引用 NuGet 发布包（与 DHDeploy 产品同版本），任何机器均可还原，不依赖本地源码目录 -->
   <ItemGroup>
-    <ProjectReference Include="F:\Code\Pek.FrameWork\DH.NCore\DH.NCore\DH.NCore.csproj" />
+    <PackageReference Include="DH.NCore" Version="4.25.2026.911-beta0202" />
   </ItemGroup>
 
 </Project>

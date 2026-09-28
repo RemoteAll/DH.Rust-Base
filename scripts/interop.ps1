@@ -86,7 +86,7 @@ if (-not $SkipBuild) {
     }
     finally { Pop-Location }
 
-    Write-Step "构建 C# 工具（引用 DH.NCore 源码工程）"
+    Write-Step "构建 C# 工具（引用 DH.NCore NuGet 包）"
     & dotnet build $csDir -v quiet -nologo
     if ($LASTEXITCODE -ne 0) { throw "dotnet build 失败" }
 }

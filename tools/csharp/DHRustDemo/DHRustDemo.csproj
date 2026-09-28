@@ -10,9 +10,9 @@
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
-  <!-- 引用本地 DH.NCore 源码工程：配置（Setting/Config/IConfigProvider）与定时（TimerX/Cron） -->
+  <!-- 引用 DH.NCore NuGet 发布包（与 DHDeploy 产品同版本）：配置（Setting/Config/IConfigProvider）与定时（TimerX/Cron） -->
   <ItemGroup>
-    <ProjectReference Include="..\..\..\..\..\Pek.FrameWork\DH.NCore\DH.NCore\DH.NCore.csproj" />
+    <PackageReference Include="DH.NCore" Version="4.25.2026.911-beta0202" />
   </ItemGroup>
 
 </Project>

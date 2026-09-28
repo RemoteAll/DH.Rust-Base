@@ -77,7 +77,7 @@ setting.save().unwrap();
 
 ## 互操作校验
 
-`scripts/interop.ps1` 会成对调用 Rust 示例与 C# 工具（引用本地 DH.NCore 源码工程），验证：
+`scripts/interop.ps1` 会成对调用 Rust 示例与 C# 工具（引用 DH.NCore NuGet 包），验证：
 
 1. **配置互通**：C# 写 → Rust 读、Rust 写 → C# 读（XML 与 JSON 各一轮，13 个字段全量比对）；
 2. **Cron 求值一致**：同一表达式与起点，双方 `next/previous` 输出逐字符相同；
