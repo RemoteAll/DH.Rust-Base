@@ -78,10 +78,7 @@ impl Ctx {
             || req.method.eq_ignore_ascii_case("PATCH");
         let ct_ok = req
             .header("content-type")
-            .map(|v| {
-                v.to_ascii_lowercase()
-                    .starts_with("application/x-www-form-urlencoded")
-            })
+            .map(|v| starts_with_ignore_ascii_case(v, "application/x-www-form-urlencoded"))
             .unwrap_or(false);
         let form = if method_ok && ct_ok {
             parse_kv(&String::from_utf8_lossy(&req.body))
@@ -238,6 +235,9 @@ struct RouteEntry {
 pub struct Router {
     middlewares: Vec<Middleware>,
     routes: Vec<RouteEntry>,
+    /// 静态路由加速表（模式不含 `{param}`）：lower(path) → (method 或 "*", handler)。
+    /// 注册时预建；请求时一次哈希命中，免逐路由分段匹配/临时分配（高频接口关键路径）
+    static_routes: HashMap<String, Vec<(String, RouteHandler)>>,
     fallback: Option<RouteHandler>,
 }
 
@@ -255,6 +255,14 @@ impl Router {
 
     /// 注册路由（`method` 大小写不敏感；`*` 匹配任意方法）。
     pub fn map(&mut self, method: &str, pattern: &str, handler: RouteHandler) -> &mut Self {
+        // 无 `{param}` 的模式同步进静态加速表（键为小写路径）
+        if !pattern.contains('{') {
+            let key = normalize_static_path(pattern);
+            self.static_routes
+                .entry(key)
+                .or_default()
+                .push((method.to_string(), handler.clone()));
+        }
         self.routes.push(RouteEntry {
             method: method.to_string(),
             segments: parse_pattern(pattern),
@@ -315,6 +323,13 @@ impl Router {
     /// 冻结为 [`HttpHandler`]（交给 `HttpServer::serve`）。
     pub fn into_handler(self) -> HttpHandler {
         let this = Arc::new(self);
+        // 无中间件快径：省一层 Box::pin + Arc 跳转（高频接口默认配置）
+        if this.middlewares.is_empty() {
+            return Arc::new(move |req: HttpRequest| {
+                let this = this.clone();
+                Box::pin(async move { this.dispatch(Ctx::build(req)).await })
+            });
+        }
         let mut next: Next = {
             let this = this.clone();
             Arc::new(move |ctx| {
@@ -337,6 +352,19 @@ impl Router {
     /// 核心分派：路由匹配 → handler；未命中 → 405 / 404 / fallback。
     async fn dispatch(&self, mut ctx: Ctx) -> HttpOutcome {
         let mut path_matched = false;
+        // 静态加速表先命中（无 {param} 模式）：一次哈希 + 小写转换，免逐条分段匹配
+        if !self.static_routes.is_empty() {
+            let lower = ctx.req.path.to_ascii_lowercase();
+            if let Some(entries) = self.static_routes.get(lower.as_str()) {
+                for (method, handler) in entries {
+                    if method == "*" || method.eq_ignore_ascii_case(&ctx.req.method) {
+                        return (handler)(ctx).await;
+                    }
+                }
+                // 路径命中、方法不符：继续参数化路由扫描（保持注册序语义），最终 405
+                path_matched = true;
+            }
+        }
         for entry in &self.routes {
             if let Some(params) = match_pattern(&entry.segments, &ctx.req.path) {
                 if entry.method == "*" || entry.method.eq_ignore_ascii_case(&ctx.req.method) {
@@ -369,6 +397,18 @@ fn parse_pattern(pattern: &str) -> Vec<Seg> {
             }
         })
         .collect()
+}
+
+/// 静态路由键：规范化（去首尾空白、保证前导 `/`）后整体小写（查询时路径同样小写比较）。
+fn normalize_static_path(pattern: &str) -> String {
+    let p = pattern.trim();
+    let p = p.strip_prefix('/').unwrap_or(p);
+    format!("/{p}").to_ascii_lowercase()
+}
+
+/// ASCII 前缀比较（大小写不敏感；无分配）。
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
 
 /// 路径匹配（返回捕获的路由参数；`None` = 不匹配）。

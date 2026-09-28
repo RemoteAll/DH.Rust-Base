@@ -32,9 +32,14 @@ async fn main() -> io::Result<()> {
         }),
     );
 
-    // 每连接独立线程：对齐 NewLife/IOCP 完成线程直处理模型（与 C# 对照同构）
+    // 分片线程池：同线程唤醒、线程数可控（对齐 NewLife 完成线程直处理模型）
+    // 分片数可用环境变量 DHRUST_SHARDS 覆盖（默认 16——32 核机器调参最优区间）
+    let shards: usize = std::env::var("DHRUST_SHARDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
     let options = HttpServerOptions {
-        thread_per_connection: true,
+        conn_shards: shards,
         ..Default::default()
     };
     server.serve_with(router.into_handler(), options).await

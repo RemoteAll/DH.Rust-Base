@@ -176,6 +176,12 @@ pub struct HttpServerOptions {
     /// 代价是每连接一线程（默认每线程保留 2MB 虚拟栈），适合连接数在
     /// 数百以内的场景（Agent 服务端典型规模）；大规模连接保持默认 `false`
     pub thread_per_connection: bool,
+    /// 分片线程池容量（`0` = 关闭）。`>0` 时启用 N 个分片线程，每片一个
+    /// current_thread 运行时承载多连接：数据到达唤醒所属分片线程本身
+    /// （同线程任务调度、无跨线程任务移交）——高并发下线程数比
+    /// “每连接一线程”少一个量级，CPU 开销与尾时延同时占优
+    /// （基准实测；与 `thread_per_connection` 同时开启时后者优先）
+    pub conn_shards: usize,
 }
 
 impl Default for HttpServerOptions {
@@ -184,6 +190,7 @@ impl Default for HttpServerOptions {
             max_body_size: DEFAULT_MAX_BODY_SIZE,
             ws: WsServerOptions::default(),
             thread_per_connection: false,
+            conn_shards: 0,
         }
     }
 }
@@ -228,6 +235,17 @@ impl HttpServer {
         handler: HttpHandler,
         options: HttpServerOptions,
     ) -> std::io::Result<()> {
+        // 分片线程池（可选）：每片一个 current_thread 运行时承载多连接
+        let shards = if options.conn_shards > 0 && !options.thread_per_connection {
+            Some(ShardPool::start(
+                options.conn_shards,
+                handler.clone(),
+                options.clone(),
+            ))
+        } else {
+            None
+        };
+        let mut rr: usize = 0;
         loop {
             let (tcp, _peer) = self.listener.accept().await?;
             let _ = tcp.set_nodelay(true);
@@ -265,9 +283,74 @@ impl HttpServer {
                             serve_connection(tcp, handler, options).await;
                         });
                     });
+            } else if let Some(shards) = &shards {
+                // 分片池：连接按轮次分发到分片线程（socket 脱钩后重注册到分片运行时）
+                if let Ok(std_tcp) = tcp.into_std() {
+                    let _ = std_tcp.set_nonblocking(true);
+                    shards.dispatch(std_tcp, rr);
+                    rr = rr.wrapping_add(1);
+                }
             } else {
                 tokio::spawn(serve_connection(tcp, handler, options));
             }
+        }
+    }
+}
+
+/// 分片线程池：N 个线程各持一个 current_thread 运行时，承载多连接。
+///
+/// 唤醒模型：socket 注册在其所属分片线程的 reactor 上，数据到达时唤醒的
+/// 就是该分片线程本身（同线程任务调度，无跨线程 IPI）；线程数 = 分片数
+/// （而非连接数），高并发下 CPU 开销与尾时延同时占优。
+struct ShardPool {
+    senders: Vec<tokio::sync::mpsc::UnboundedSender<std::net::TcpStream>>,
+}
+
+impl ShardPool {
+    /// 启动分片线程池（连接经无界通道移交；`send` 为同步调用，可在运行时外使用）。
+    fn start(n: usize, handler: HttpHandler, options: HttpServerOptions) -> ShardPool {
+        let mut senders = Vec::with_capacity(n);
+        for i in 0..n {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<std::net::TcpStream>();
+            senders.push(tx);
+            let handler = handler.clone();
+            let options = options.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("dhrust-shard-{i}"))
+                .spawn(move || {
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(_) => return,
+                    };
+                    rt.block_on(async move {
+                        // 收连接任务：std 流重注册到本分片运行时，再逐连接托管
+                        tokio::spawn(async move {
+                            while let Some(std_tcp) = rx.recv().await {
+                                let _ = std_tcp.set_nonblocking(true);
+                                let handler = handler.clone();
+                                let options = options.clone();
+                                tokio::spawn(async move {
+                                    if let Ok(tcp) = TcpStream::from_std(std_tcp) {
+                                        serve_connection(tcp, handler, options).await;
+                                    }
+                                });
+                            }
+                        });
+                        // 保持运行时活跃，直至进程退出（发送端随服务循环存活）
+                        std::future::pending::<()>().await;
+                    });
+                });
+        }
+        ShardPool { senders }
+    }
+
+    /// 分发连接（轮次由调用方维护）。
+    fn dispatch(&self, std_tcp: std::net::TcpStream, idx: usize) {
+        if let Some(tx) = self.senders.get(idx % self.senders.len()) {
+            let _ = tx.send(std_tcp);
         }
     }
 }
