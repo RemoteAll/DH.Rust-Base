@@ -1,0 +1,24 @@
+[package]
+name = "bench-net"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# DH.NCore 自研网络栈思路 vs Rust 主流实现 的性能对比基准
+# wave-1: HTTP（http_raw=自研极简 / http_hyper=hyper1 / http_axum=axum0.8）
+# wave-2: WebSocket（ws_raw=自研极简 / ws_tungstenite / ws_fast=fastwebsockets）
+# 所有服务端绑定 127.0.0.1 循环回环，由同一自研压测器施加相同负载
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+axum = "0.8"
+# wave-2：WebSocket 三方对比与公共编解码
+base64 = "0.22"
+sha1 = "0.10"
+rand = "0.8"
+futures-util = "0.3"
+tokio-tungstenite = "0.26"
+fastwebsockets = "0.8"

@@ -2,5 +2,9 @@
 /Cargo.lock
 
 # C# 互操作工具的构建产物
-tools/**/bin/
-tools/**/obj/
+tools/csharp/**/bin/
+tools/csharp/**/obj/
+
+# bench-net 基准工程：构建产物与临时压测结果
+tools/**/target/
+tools/**/load-*.txt

@@ -1,0 +1,5 @@
+# 交叉编译说明：Linux 产物统一使用 cargo-zigbuild（Zig 作链接器）
+#   cargo zigbuild --release --target x86_64-unknown-linux-musl
+#   cargo zigbuild --release --target aarch64-unknown-linux-musl
+# 本文件不固定 linker，避免与 zigbuild 的自动链接配置冲突。
+# （父目录 DH.RustBase/.cargo/config.toml 的 rsproxy 镜像配置仍会合并生效）
