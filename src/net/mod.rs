@@ -1,8 +1,9 @@
 //! 网络模块（feature `net`）：HTTP 服务端与 WebSocket 会话——DHDeploy.Agent Rust 迁移内核。
 //!
 //! 选型（依据迁移文档《网络层选型复核》，DHDeploy 仓库 `Doc/`；两条件闸门已通过并锁定）：
-//! - **HTTP**：hyper 1.x（`serve_connection` + `.with_upgrades()`）；语义层（Map/Use 路由、
-//!   请求上下文、统一返回）自研，对齐 DH.NCore `HttpServer/HttpRouter`；
+//! - **HTTP**：hyper 1.x（`serve_connection` + `.with_upgrades()`）；语义层自研——
+//!   `net::http`（服务端/未一兼返回）与 `net::router`（Map/Use 路由与上下文），
+//!   对齐 DH.NCore `HttpServer/HttpRouter`；
 //! - **WebSocket**：fastwebsockets 帧层（`after_handshake` 接管、自动行为全关），
 //!   会话/心跳/重连/发送串行/延迟响应自研，对齐 C# `MyWebSocketClient` 行为；
 //! - **RPC**：与 C# `WebSocketRpcModels` 字段级对齐的消息模型与 Dispatcher。
@@ -13,6 +14,7 @@
 //! 依赖矩阵与版本锁定见《AgentRust迁移架构》第 3 节（DHDeploy 仓库 `Doc/`）。
 
 pub mod http;
+pub mod router;
 pub mod rpc;
 pub mod ws;
 

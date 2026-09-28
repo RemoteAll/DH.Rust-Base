@@ -1,12 +1,11 @@
 //! net::http —— HTTP 服务端与语义层（自研，对齐 DH.NCore `HttpServer/HttpRouter`）。
 //!
-//! N003 已落地：监听循环、请求/响应自有类型（不泄露 hyper 类型给业务）、
-//! WebSocket 升级（hyper `serve_connection().with_upgrades()` + `TokioIo` 适配，
-//! 升级后交 [`crate::net::ws::run_server_session`]）。
-//! N004 待落地：Map/Use 路由（前缀注册 + 中间件链）、请求上下文（会话/租户/记录）、
-//! 统一返回（StateCode / DGResult 语义对齐）、静态与流式响应。
-//!
-//! 客户端封装（调用 DHDeploy.Server REST / 本地星尘服务）在 N006 前补齐。
+//! - N003：监听循环、请求/响应自有类型（不泄露 hyper 类型给业务）、WebSocket 升级
+//!   （hyper `serve_connection().with_upgrades()` + `TokioIo` 适配，升级后交
+//!   [`crate::net::ws::run_server_session`]）；
+//! - N004：统一返回 [`DGResult`]（StateCode 对齐 `Pek.Helpers.StateCode`；序列化对齐
+//!   .NET `System.Text.Json` 字段顺序与转义）；路由与中间件见 [`crate::net::router`]；
+//! - 待办：HTTP 客户端封装（调用 DHDeploy.Server REST，N006 前补齐）。
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -353,4 +352,261 @@ async fn collect_body(body: Incoming, limit: usize) -> Result<Vec<u8>, ()> {
         }
     }
     Ok(collected)
+}
+
+// ————— 状态码与统一返回（对齐 C# `Pek.Helpers.StateCode` / `Pek.Models.DGResult`）—————
+
+/// 状态码常量（数值与 `Pek.Helpers.StateCode` 枚举一致）。
+pub mod state {
+    /// 成功
+    pub const OK: i32 = 1;
+    /// 失败
+    pub const FAIL: i32 = 2;
+    /// 限流繁忙
+    pub const BUSY: i32 = 99;
+    /// 请求（或处理）成功
+    pub const STATUS: i32 = 200;
+    /// 内部请求出错
+    pub const ERROR: i32 = 500;
+    /// 未授权标识
+    pub const UNAUTHORIZED: i32 = 401;
+    /// 请求参数不完整或不正确
+    pub const PARAMETER_ERROR: i32 = 400;
+    /// 请求 TOKEN 失效
+    pub const TOKEN_INVALID: i32 = 403;
+    /// HTTP 请求类型不合法
+    pub const HTTP_METHOD_ERROR: i32 = 405;
+    /// HTTP 请求不合法
+    pub const HTTP_REQUEST_ERROR: i32 = 406;
+    /// URL 已经失效
+    pub const URL_EXPIRE_ERROR: i32 = 407;
+    /// 部分出错
+    pub const PARTIAL_ERROR: i32 = 999;
+}
+
+/// 统一返回（对齐 C# `Pek.Models.DGResult`）。
+///
+/// 序列化为 .NET `System.Text.Json` 兼容形态：字段顺序
+/// `code / errCode / message / data / extData / operationTime / id`，
+/// `null` 字段照常输出（对齐 `JsonSerializerDefaults.Web` 默认行为）。
+#[derive(Clone, Debug)]
+pub struct DGResult {
+    /// 状态码（见 [`state`] 常量）
+    pub code: i32,
+    /// 错误码
+    pub err_code: i32,
+    /// 消息
+    pub message: Option<String>,
+    /// 数据（任意 JSON 值，如 `serde_json::json!({...})`）
+    pub data: Option<serde_json::Value>,
+    /// 其他数据
+    pub ext_data: Option<serde_json::Value>,
+    /// 操作时间（本地时间 ISO 8601）
+    pub operation_time: String,
+    /// 标识
+    pub id: Option<String>,
+}
+
+impl DGResult {
+    /// 成功（携带数据；对齐 `new DGResult { Code = StateCode.Ok, Data = ... }`）。
+    pub fn ok(data: serde_json::Value) -> Self {
+        Self {
+            code: state::OK,
+            err_code: 0,
+            message: None,
+            data: Some(data),
+            ext_data: None,
+            operation_time: now_iso8601(),
+            id: None,
+        }
+    }
+
+    /// 成功（无数据）。
+    pub fn ok_empty() -> Self {
+        Self {
+            code: state::OK,
+            err_code: 0,
+            message: None,
+            data: None,
+            ext_data: None,
+            operation_time: now_iso8601(),
+            id: None,
+        }
+    }
+
+    /// 失败（携带消息；对齐 `new DGResult { Code = StateCode.Fail, Message = ... }`）。
+    pub fn fail(message: impl Into<String>) -> Self {
+        Self {
+            code: state::FAIL,
+            err_code: 0,
+            message: Some(message.into()),
+            data: None,
+            ext_data: None,
+            operation_time: now_iso8601(),
+            id: None,
+        }
+    }
+
+    /// 指定状态码与消息。
+    pub fn error(code: i32, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            err_code: 0,
+            message: Some(message.into()),
+            data: None,
+            ext_data: None,
+            operation_time: now_iso8601(),
+            id: None,
+        }
+    }
+
+    /// 序列化为 JSON 文本（字段顺序与转义对齐 .NET `System.Text.Json`）。
+    pub fn to_json(&self) -> String {
+        let mut out = String::with_capacity(192);
+        out.push_str("{\"code\":");
+        out.push_str(&self.code.to_string());
+        out.push_str(",\"errCode\":");
+        out.push_str(&self.err_code.to_string());
+        out.push_str(",\"message\":");
+        match &self.message {
+            Some(m) => push_json_string(&mut out, m),
+            None => out.push_str("null"),
+        }
+        out.push_str(",\"data\":");
+        match &self.data {
+            Some(v) => push_json_value(&mut out, v),
+            None => out.push_str("null"),
+        }
+        out.push_str(",\"extData\":");
+        match &self.ext_data {
+            Some(v) => push_json_value(&mut out, v),
+            None => out.push_str("null"),
+        }
+        out.push_str(",\"operationTime\":");
+        push_json_string(&mut out, &self.operation_time);
+        out.push_str(",\"id\":");
+        match &self.id {
+            Some(id) => push_json_string(&mut out, id),
+            None => out.push_str("null"),
+        }
+        out.push('}');
+        out
+    }
+
+    /// 转 HTTP 响应（`200` + `application/json; charset=utf-8`）。
+    pub fn to_response(&self) -> HttpResponse {
+        HttpResponse::json(200, self.to_json())
+    }
+}
+
+/// 本地时间 ISO 8601（对齐 .NET 序列化形态 `yyyy-MM-ddTHH:mm:ss.FFFFFFFK`，尾零裁剪）。
+fn now_iso8601() -> String {
+    let now = chrono::Local::now();
+    let mut frac = format!("{:07}", now.timestamp_subsec_nanos() / 100);
+    while frac.ends_with('0') {
+        frac.pop();
+    }
+    if frac.is_empty() {
+        format!("{}{}", now.format("%Y-%m-%dT%H:%M:%S"), now.format("%:z"))
+    } else {
+        format!(
+            "{}.{}{}",
+            now.format("%Y-%m-%dT%H:%M:%S"),
+            frac,
+            now.format("%:z")
+        )
+    }
+}
+
+/// JSON 字符串转义（对齐 .NET `JavaScriptEncoder.Default`：非 ASCII → `\uXXXX`（大写十六进制）、
+/// HTML 敏感字符 `< > & '` 转义、控制字符短转义 `\b \t \n \f \r`）。
+pub fn json_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    push_json_string(&mut out, text);
+    out
+}
+
+/// 写入带引号的 JSON 字符串（快速路径：无需转义时整段拷贝）。
+fn push_json_string(out: &mut String, text: &str) {
+    use std::fmt::Write as _;
+    out.push('"');
+    if !text.bytes().any(needs_json_escape) {
+        out.push_str(text);
+        out.push('"');
+        return;
+    }
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            '<' => out.push_str("\\u003C"),
+            '>' => out.push_str("\\u003E"),
+            '&' => out.push_str("\\u0026"),
+            '\'' => out.push_str("\\u0027"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04X}", c as u32);
+            }
+            c if (c as u32) > 0x7F => {
+                let u = c as u32;
+                if u <= 0xFFFF {
+                    let _ = write!(out, "\\u{:04X}", u);
+                } else {
+                    // 非 BMP：UTF-16 代理对（对齐 .NET 字符串形态）
+                    let v = u - 0x10000;
+                    let _ = write!(
+                        out,
+                        "\\u{:04X}\\u{:04X}",
+                        0xD800 + (v >> 10),
+                        0xDC00 + (v & 0x3FF)
+                    );
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+#[inline]
+fn needs_json_escape(b: u8) -> bool {
+    b >= 0x80 || b < 0x20 || matches!(b, b'"' | b'\\' | b'<' | b'>' | b'&' | b'\'')
+}
+
+/// 递归写入 JSON 值（对象保持插入序；转义对齐 .NET）。
+fn push_json_value(out: &mut String, value: &serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(true) => out.push_str("true"),
+        Value::Bool(false) => out.push_str("false"),
+        Value::Number(n) => out.push_str(&n.to_string()),
+        Value::String(s) => push_json_string(out, s),
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_value(out, item);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            for (i, (k, v)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_string(out, k);
+                out.push(':');
+                push_json_value(out, v);
+            }
+            out.push('}');
+        }
+    }
 }
