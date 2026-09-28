@@ -541,16 +541,26 @@ fn value_type_name(v: &Value) -> &'static str {
 
 // ————— HTML 转义 —————
 
-/// v0 转义字符集：`& < > " '`（对齐目标；由 F011 互操作用例逐字节补全）。
+/// v0.1 转义：等价于 .NET 10 `HtmlEncoder.Default`（由互操作工具 `probe-encode` 全字符实测对齐）。
+///
+/// - 原样输出：空格与可打印 ASCII（0x20–0x7E，排除下表中的六个特殊字符）；
+/// - `"`→`&quot;`、`&`→`&amp;`、`'`→`&#x27;`、`+`→`&#x2B;`、`<`→`&lt;`、`>`→`&gt;`；
+/// - 其余字符（含 `\r` `\n`、Tab、非 ASCII、控制符）→ `&#x` + 大写十六进制 + `;`
+///   （非 BMP 按标量编码，如 `😀`→`&#x1F600;`）。
 fn escape_html_into(text: &str, out: &mut String) {
+    use std::fmt::Write as _;
     for c in text.chars() {
         match c {
+            '"' => out.push_str("&quot;"),
             '&' => out.push_str("&amp;"),
+            '\'' => out.push_str("&#x27;"),
+            '+' => out.push_str("&#x2B;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#x27;"),
-            _ => out.push(c),
+            c if c.is_ascii() && (' '..='~').contains(&c) => out.push(c),
+            _ => {
+                let _ = write!(out, "&#x{:X};", c as u32);
+            }
         }
     }
 }
@@ -584,6 +594,20 @@ mod tests {
         let model = m(json!({"V": "&<>\"'"}));
         assert_eq!(render_ok("@Model.V", &model), "&amp;&lt;&gt;&quot;&#x27;");
         assert_eq!(render_ok("@(Model.V)", &model), "&amp;&lt;&gt;&quot;&#x27;");
+    }
+
+    #[test]
+    fn escape_matches_html_encoder_default() {
+        // `+`、Tab、非 ASCII、引号均按 HtmlEncoder.Default 实体化
+        let model = m(json!({"V": "a+b 中\t\"&'<>"}));
+        assert_eq!(
+            render_ok("@Model.V", &model),
+            "a&#x2B;b &#x4E2D;&#x9;&quot;&amp;&#x27;&lt;&gt;"
+        );
+        // 非 BMP → 单标量实体
+        assert_eq!(render_ok("@Model.E", &m(json!({"E": "😀"}))), "&#x1F600;");
+        // 换行 → 实体
+        assert_eq!(render_ok("@Model.L", &m(json!({"L": "a\nb"}))), "a&#xA;b");
     }
 
     #[test]
@@ -654,7 +678,8 @@ mod tests {
         assert_eq!(render_ok("@(2 + 3 * 4)", &m(json!({}))), "14");
         assert_eq!(render_ok("@(10 - 4.5)", &m(json!({}))), "5.5");
         assert_eq!(render_ok("@(1.5 * 2)", &m(json!({}))), "3");
-        assert_eq!(render_ok("@(1.0 / 0.0)", &m(json!({}))), "∞");
+        // 非 ASCII（∞）按 HtmlEncoder.Default 实体化
+        assert_eq!(render_ok("@(1.0 / 0.0)", &m(json!({}))), "&#x221E;");
         assert_eq!(render_ok("@(0.0 / 0.0)", &m(json!({}))), "NaN");
     }
 
@@ -732,10 +757,11 @@ mod tests {
             "Name": "首页",
             "Sites": [{"Name": "A"}, {"Name": "B"}]
         }));
-        let src = "@if (Model.Enable) { <b>@Model.Name</b> } else { off }\n@foreach (var s in Model.Sites) { <li>@s.Name</li> }";
+        // 首行 if 体保留空缩；`}` 后的换行被吞掉（对齐 Razor）；中文按实体转义
+        let src = "@if (Model.Enable) { <b>@Model.Name</b> } else { <u>off</u> }\n@foreach (var s in Model.Sites) { <li>@s.Name</li> }";
         assert_eq!(
             render_ok(src, &model),
-            " <b>首页</b> \n <li>A</li>  <li>B</li> "
+            " <b>&#x9996;&#x9875;</b>  <li>A</li>  <li>B</li> "
         );
     }
 
@@ -743,21 +769,27 @@ mod tests {
     fn if_false_renders_else_branch() {
         let model = m(json!({"Enable": false}));
         assert_eq!(
-            render_ok("@if (Model.Enable) { on } else { off }", &model),
-            " off "
+            render_ok(
+                "@if (Model.Enable) { <i>on</i> } else { <i>off</i> }",
+                &model
+            ),
+            " <i>off</i> "
         );
     }
 
     #[test]
     fn foreach_empty_and_nested() {
-        let model = m(json!({"Groups": [{"Items": ["a", "b"]}, {"Items": []}]}));
-        // 外层体 " [" + 内层 + "] "；内层体 " @i " → 逐项 " a " " b " 拼接
+        let model = m(json!({"Groups": [
+            {"Name": "G1", "Items": ["a", "b"]},
+            {"Name": "G2", "Items": []}
+        ]}));
+        // 内层循环与外层共用标记区；空集合渲染为空
         assert_eq!(
             render_ok(
-                "@foreach (var g in Model.Groups) { [@foreach (var i in g.Items) { @i }] }",
+                "@foreach (var g in Model.Groups) {<p>@g.Name:@foreach (var i in g.Items) {<i>@i</i>}</p>}",
                 &model
             ),
-            " [ a  b ]  [] "
+            "<p>G1:<i>a</i><i>b</i></p><p>G2:</p>"
         );
     }
 
@@ -786,17 +818,17 @@ mod tests {
         );
         // 顶层声明可在后续 @if 条件中使用
         assert_eq!(
-            render_ok("@{ var y = 2; }@if (y == 2) { yes }", &model),
-            " yes "
+            render_ok("@{ var y = 2; }@if (y == 2) { <i>yes</i> }", &model),
+            " <i>yes</i> "
         );
     }
 
     #[test]
     fn block_scoping_semantics() {
-        // if 体内声明在体内可见
+        // if 体内声明在体内可见（表达式周边空白为 C# 空白，不输出）
         assert_eq!(
             render_ok("@if (true) { @{ var z = 1; }@z }", &m(json!({}))),
-            " 1 "
+            "1"
         );
         // if 体内声明在体外不可见
         let e = render_err("@if (true) { @{ var z = 1; } }@z", &m(json!({})));
@@ -809,10 +841,10 @@ mod tests {
         let model = m(json!({"Sites": ["a", "b"]}));
         assert_eq!(
             render_ok(
-                "@{ var s = \"outer\"; }@foreach (var s in Model.Sites) {[@s]}@s",
+                "@{ var s = \"outer\"; }@foreach (var s in Model.Sites) {<i>@s</i>}@s",
                 &model
             ),
-            "[a][b]outer"
+            "<i>a</i><i>b</i>outer"
         );
     }
 
@@ -820,7 +852,12 @@ mod tests {
 
     #[test]
     fn render_depth_is_guarded_by_options() {
-        let src = format!("{}{}{}", "@if (true) {".repeat(40), "x", "}".repeat(40));
+        let src = format!(
+            "{}{}{}",
+            "@if (true) {".repeat(40),
+            " <i>x</i> ",
+            "}".repeat(40)
+        );
         let model = m(json!({}));
         let t = Template::parse(&src).unwrap();
         let e = t.render(&model).unwrap_err();
@@ -829,6 +866,6 @@ mod tests {
             escape: true,
             max_depth: 100,
         };
-        assert_eq!(t.render_with(&model, &options).unwrap(), "x");
+        assert_eq!(t.render_with(&model, &options).unwrap(), " <i>x</i> ");
     }
 }

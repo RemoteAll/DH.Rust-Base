@@ -713,10 +713,13 @@ mod tests {
     #[test]
     fn if_else_chain_ast() {
         assert_eq!(
-            nodes("@if (a) { 1 } else if (b) { 2 } else { 3 }"),
+            nodes("@if (a) { <i>1</i> } else if (b) { <i>2</i> } else { <i>3</i> }"),
             vec![Node::If {
-                branches: vec![(p("a"), vec![text(" 1 ")]), (p("b"), vec![text(" 2 ")]),],
-                else_: Some(vec![text(" 3 ")]),
+                branches: vec![
+                    (p("a"), vec![text(" <i>1</i> ")]),
+                    (p("b"), vec![text(" <i>2</i> ")]),
+                ],
+                else_: Some(vec![text(" <i>3</i> ")]),
             }]
         );
     }
@@ -724,18 +727,14 @@ mod tests {
     #[test]
     fn nested_if_ast() {
         assert_eq!(
-            nodes("@if (a) { @if (b) { x } }"),
+            nodes("@if (a) { @if (b) { <i>x</i> } }"),
             vec![Node::If {
                 branches: vec![(
                     p("a"),
-                    vec![
-                        text(" "),
-                        Node::If {
-                            branches: vec![(p("b"), vec![text(" x ")])],
-                            else_: None,
-                        },
-                        text(" "),
-                    ],
+                    vec![Node::If {
+                        branches: vec![(p("b"), vec![text(" <i>x</i> ")])],
+                        else_: None,
+                    }],
                 )],
                 else_: None,
             }]
@@ -749,7 +748,7 @@ mod tests {
             vec![Node::ForEach {
                 var: "s".into(),
                 iter: ex("Model.Sites"),
-                body: vec![text(" "), Node::Write(ex("s.Name")), text(" ")],
+                body: vec![Node::Write(ex("s.Name"))],
             }]
         );
     }
@@ -772,7 +771,7 @@ mod tests {
             vec![Node::ForEach {
                 var: "index".into(),
                 iter: p("Model"),
-                body: vec![text(" ")],
+                body: vec![],
             }]
         );
     }
@@ -867,14 +866,11 @@ mod tests {
                 branches: vec![(
                     p("x"),
                     vec![
-                        text(" "),
                         Node::Code(vec![Stmt::VarDecl {
                             name: "y".into(),
                             value: ex("1"),
                         }]),
-                        text(" "),
                         Node::Write(p("y")),
-                        text(" "),
                     ],
                 )],
                 else_: None,

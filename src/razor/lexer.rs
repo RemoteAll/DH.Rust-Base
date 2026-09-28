@@ -13,10 +13,19 @@
 //! - 子集外语法的显式报错（`@using`、`@switch`、`@while`、`@for`、`@await`、`@section` 等，
 //!   错误含行列号与「建议写法」，对齐「杜绝静默行为不一致」原则）。
 //!
-//! # 块边界约定
-//! `@if` / `@foreach` 的块体由嵌套模板扫描：body 中**平衡**的花括号视为字面文本
-//! （`<style>a { color: red }</style>` 等 CSS/JS 场景），未配对的 `}` 结束当前块，
-//! 与 ASP.NET Core Razor 对块内孤立 `}` 的行为一致。
+//! # 块边界约定（v0.1 修订：实测对齐 .NET 10 Razor 代码生成）
+//! `@if` / `@foreach` 块体在 **C# 上下文**与 **标记区** 之间切换：
+//! - C# 上下文中 `@` 结构按语句处理（周边空白为 C# 空白、不输出）；裸内容
+//!   （非 `@`、非 `<`、非 `}`）不是合法 C# 语句 → 显式报错；
+//! - `<` 进入标记区：标签与后续文本原样输出；标签未闭合（元素深度 > 0）时
+//!   一切原样（含 `}`），块结束前未闭合 → 报错；void 元素（`<br>` 等）与
+//!   自闭合（`/>`）不增加深度；
+//! - C# 上下文中空白：至首个 `<` 的空白丢弃到最后一次换行（缩进保留）；
+//!   至首个 `@` / `}` 的空白全部丢弃；
+//! - 标记区在深度 0 时：空白继续作为标记输出；遇到 `@` 表达式后回到 C# 上下文；
+//! - 块关闭 `}` 之后：丢弃空白直到（并含）第一个换行（对齐 Razor 关闭括号处理）；
+//! - 邮件规则：`@` 紧邻两侧均为字母/数字（含中文）时视为字面 `@`（对齐 Razor 邮件地址检测）。
+//!
 //! 块内代码（`@{ }`、`@(...)`、条件括号）的字符串 / 字符 / 注释中的括号不参与平衡。
 //!
 //! # 位置约定
@@ -100,7 +109,7 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
         col: 1,
     };
     let mut tokens = Vec::new();
-    lexer.scan_template(&mut tokens, false)?;
+    lexer.scan_template(&mut tokens)?;
     Ok(tokens)
 }
 
@@ -167,63 +176,372 @@ impl Lexer {
 
     // ———— 模板与文本 ————
 
-    /// 扫描模板内容（顶层或块体）。
-    ///
-    /// `stop_at_brace` 为 `true` 时表示当前处于 `@if` / `@foreach` 块体：
-    /// 遇到平衡计数归零的 `}` 即返回（不消耗该 `}`，由调用者处理并产出 `RightBrace`）；
-    /// body 中平衡的花括号按字面文本处理。
-    fn scan_template(
-        &mut self,
-        tokens: &mut Vec<Token>,
-        stop_at_brace: bool,
-    ) -> Result<(), ParseError> {
+    /// 扫描顶层模板内容（文件级；块体由 [`Self::scan_body`] 处理）。
+    fn scan_template(&mut self, tokens: &mut Vec<Token>) -> Result<(), ParseError> {
         let mut text = String::new();
         let mut text_pos = (self.line, self.col);
-        let mut brace_depth = 0usize;
         loop {
-            let Some(c) = self.peek() else {
-                if stop_at_brace {
-                    flush_text(&mut text, text_pos.0, text_pos.1, tokens);
-                    return Err(
-                        ParseError::new(self.line, self.col, "块未闭合：缺少匹配的 }")
-                            .with_hint("检查 @if / @foreach / @{ } 的花括号是否成对"),
-                    );
+            let Some(c) = self.peek() else { break };
+            if c == '@' {
+                if self.handle_text_at(&mut text, &mut text_pos)? {
+                    continue;
                 }
-                break;
-            };
-            match c {
-                '{' if stop_at_brace => {
-                    brace_depth += 1;
-                    self.push_text(&mut text, &mut text_pos, c);
-                }
-                '}' if stop_at_brace => {
-                    if brace_depth > 0 {
-                        brace_depth -= 1;
-                        self.push_text(&mut text, &mut text_pos, c);
-                    } else {
-                        break;
-                    }
-                }
-                '@' if self.peek_at(1) == Some('@') => {
-                    // 字面 @：并入文本
-                    self.push_text(&mut text, &mut text_pos, '@');
-                    self.bump();
-                }
-                '@' if self.peek_at(1) == Some('*') => {
-                    // 注释：透明丢弃（不打断文本缓冲，保证 "a@* *@b" 合并为 "ab"）
-                    self.scan_comment(self.line, self.col)?;
-                }
-                '@' => {
-                    flush_text(&mut text, text_pos.0, text_pos.1, tokens);
-                    self.scan_at(tokens)?;
-                }
-                _ => {
-                    self.push_text(&mut text, &mut text_pos, c);
-                }
+                flush_text(&mut text, text_pos.0, text_pos.1, tokens);
+                self.scan_at(tokens)?;
+                continue;
             }
+            self.push_text(&mut text, &mut text_pos, c);
         }
         flush_text(&mut text, text_pos.0, text_pos.1, tokens);
         Ok(())
+    }
+
+    /// 扫描 `{ ... }` 块体（对齐原生 Razor 的「C# 上下文 / 标记区」切换语义）。
+    ///
+    /// 规则见模块文档「块边界约定」；返回时位于块结束的 `}`（不消耗）。
+    fn scan_body(&mut self, tokens: &mut Vec<Token>) -> Result<(), ParseError> {
+        let mut text = String::new();
+        let mut text_pos = (self.line, self.col);
+        let mut in_code = true; // C# 上下文
+        let mut depth = 0usize; // 标记区已打开元素深度
+        loop {
+            let Some(c) = self.peek() else {
+                flush_text(&mut text, text_pos.0, text_pos.1, tokens);
+                let hint = if depth > 0 {
+                    "块结束前标记元素未闭合（检查标签是否成对）"
+                } else {
+                    "检查 @if / @foreach / @{ } 的花括号是否成对"
+                };
+                return Err(
+                    ParseError::new(self.line, self.col, "块未闭合：缺少匹配的 }").with_hint(hint),
+                );
+            };
+            if c == '@' {
+                if self.handle_text_at(&mut text, &mut text_pos)? {
+                    continue;
+                }
+                flush_text(&mut text, text_pos.0, text_pos.1, tokens);
+                self.scan_at(tokens)?;
+                if !in_code && depth == 0 {
+                    // 标记区深度 0：表达式之后回到 C# 上下文（其后空白为 C# 空白）
+                    in_code = true;
+                }
+                continue;
+            }
+            if c == '<' {
+                self.scan_tag(tokens, &mut text, &mut text_pos, &mut depth)?;
+                in_code = false; // 进入标记区
+                continue;
+            }
+            if in_code {
+                match c {
+                    '}' => {
+                        flush_text(&mut text, text_pos.0, text_pos.1, tokens);
+                        return Ok(());
+                    }
+                    c if c.is_whitespace() => {
+                        // C# 空白运行：按其后首个非空白字符决定去留
+                        let mut i = 0usize;
+                        while matches!(self.peek_at(i), Some(w) if w.is_whitespace()) {
+                            i += 1;
+                        }
+                        match self.peek_at(i) {
+                            Some('@') | Some('}') => {
+                                // 全部丢弃
+                                for _ in 0..i {
+                                    self.bump();
+                                }
+                            }
+                            Some('<') => {
+                                // 丢弃到（含）最后一次换行；其余（缩进）并入文本
+                                let mut last_nl = None;
+                                for k in 0..i {
+                                    if self.peek_at(k) == Some('\n') {
+                                        last_nl = Some(k);
+                                    }
+                                }
+                                let drop = last_nl.map_or(0, |k| k + 1);
+                                for _ in 0..drop {
+                                    self.bump();
+                                }
+                                for _ in drop..i {
+                                    let ch = self.peek().unwrap();
+                                    self.push_text(&mut text, &mut text_pos, ch);
+                                }
+                            }
+                            None => {
+                                // 空白后到文件尾：下一轮循环报块未闭合
+                                for _ in 0..i {
+                                    self.bump();
+                                }
+                            }
+                            Some(_) => {
+                                // 裸内容：不是合法 C# 语句（对齐原生编译错误）→ 显式报错
+                                for _ in 0..i {
+                                    self.bump();
+                                }
+                                let ch = self.peek().unwrap();
+                                return Err(ParseError::new(
+                                    self.line,
+                                    self.col,
+                                    format!("块体内不支持裸内容 '{ch}'（子集规约 v0.1）"),
+                                )
+                                .with_hint(
+                                    "块体内的内容须为标记（<标签>…）或以 @ 开头的表达式/语句",
+                                ));
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(ParseError::new(
+                            self.line,
+                            self.col,
+                            format!("块体内不支持裸内容 '{other}'（子集规约 v0.1）"),
+                        )
+                        .with_hint("块体内的内容须为标记（<标签>…）或以 @ 开头的表达式/语句"));
+                    }
+                }
+            } else {
+                // 标记区
+                match c {
+                    '}' if depth == 0 => {
+                        flush_text(&mut text, text_pos.0, text_pos.1, tokens);
+                        return Ok(());
+                    }
+                    c if c.is_whitespace() || c == '}' => {
+                        // 标记文本（含深度 > 0 时的 }）原样输出
+                        self.push_text(&mut text, &mut text_pos, c);
+                    }
+                    _ => {
+                        if depth == 0 {
+                            // 深度 0 的非空白文本：回到 C# 上下文（由 C# 分支处理/报错）
+                            in_code = true;
+                        } else {
+                            self.push_text(&mut text, &mut text_pos, c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 处理文本中的 `@`：邮件规则 / `@@` 转义 / `@* *@` 注释。
+    ///
+    /// 已按文本处理返回 `true`；返回 `false` 表示应调用 [`Self::scan_at`]
+    /// （需由调用方先 flush 文本）。
+    fn handle_text_at(
+        &mut self,
+        text: &mut String,
+        text_pos: &mut (usize, usize),
+    ) -> Result<bool, ParseError> {
+        // 邮件规则：前一个字符为字母/数字且后一个字符为字母/数字 → 字面 @
+        if self.is_email_at() {
+            self.push_text(text, text_pos, '@');
+            return Ok(true);
+        }
+        if self.peek_at(1) == Some('@') {
+            self.push_text(text, text_pos, '@');
+            self.bump();
+            return Ok(true);
+        }
+        if self.peek_at(1) == Some('*') {
+            self.scan_comment(self.line, self.col)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// 是否处于「邮件地址」语境（`@` 两边均为字母/数字，按 Unicode）。
+    fn is_email_at(&self) -> bool {
+        self.pos > 0
+            && self
+                .chars
+                .get(self.pos - 1)
+                .is_some_and(|c| c.is_alphanumeric())
+            && self
+                .chars
+                .get(self.pos + 1)
+                .is_some_and(|c| c.is_alphanumeric())
+    }
+
+    /// 块关闭（`}`）之后：丢弃空白直到（并含）第一个换行；无换行的空白保留。
+    fn skip_after_block_close(&mut self) {
+        let mut i = 0usize;
+        while let Some(c) = self.peek_at(i) {
+            if c == '\n' {
+                for _ in 0..=i {
+                    self.bump();
+                }
+                return;
+            }
+            if !c.is_whitespace() {
+                return;
+            }
+            i += 1;
+        }
+    }
+
+    /// 在标记区扫描一个标签 / 注释 / 声明（原样并入文本；维护元素深度）。
+    fn scan_tag(
+        &mut self,
+        tokens: &mut Vec<Token>,
+        text: &mut String,
+        text_pos: &mut (usize, usize),
+        depth: &mut usize,
+    ) -> Result<(), ParseError> {
+        let start = (self.line, self.col);
+        if text.is_empty() {
+            *text_pos = start;
+        }
+        text.push(self.bump().unwrap()); // '<'
+        match self.peek() {
+            Some('!') if self.peek_at(1) == Some('-') && self.peek_at(2) == Some('-') => {
+                // HTML 注释：原样收集到 -->
+                for _ in 0..3 {
+                    text.push(self.bump().unwrap());
+                }
+                loop {
+                    match self.bump() {
+                        None => {
+                            return Err(ParseError::new(start.0, start.1, "HTML 注释未闭合")
+                                .with_hint("补上 -->"));
+                        }
+                        Some('-') if self.peek() == Some('-') && self.peek_at(1) == Some('>') => {
+                            text.push('-');
+                            text.push('-');
+                            text.push('>');
+                            self.bump();
+                            self.bump();
+                            break;
+                        }
+                        Some(ch) => text.push(ch),
+                    }
+                }
+                Ok(())
+            }
+            Some('!') => {
+                // <!DOCTYPE ...>：原样到 '>'
+                self.scan_tag_tail(tokens, text, text_pos, start)?;
+                Ok(())
+            }
+            Some('/') => {
+                text.push(self.bump().unwrap());
+                self.scan_tag_tail(tokens, text, text_pos, start)?;
+                *depth = depth.saturating_sub(1);
+                Ok(())
+            }
+            _ => {
+                // 开标签：收集名称以判定 void / 自闭合
+                let mut name = String::new();
+                while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == '-') {
+                    let ch = self.bump().unwrap();
+                    text.push(ch);
+                    name.push(ch);
+                }
+                let self_closing = self.scan_open_tag_tail(tokens, text, text_pos, start)?;
+                if !self_closing && !is_void_element(&name) {
+                    *depth += 1;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// 关闭标签 / 声明（`</…>`、`<!…>`）的尾部扫描：原样到 `>`（引号保护 + `@` 处理）。
+    fn scan_tag_tail(
+        &mut self,
+        tokens: &mut Vec<Token>,
+        text: &mut String,
+        text_pos: &mut (usize, usize),
+        start: (usize, usize),
+    ) -> Result<(), ParseError> {
+        let mut quote: Option<char> = None;
+        loop {
+            let Some(c) = self.peek() else {
+                return Err(
+                    ParseError::new(start.0, start.1, "标签未闭合（缺少 >）").with_hint("补上 >")
+                );
+            };
+            if c == '@' {
+                if self.handle_text_at(text, text_pos)? {
+                    continue;
+                }
+                flush_text(text, text_pos.0, text_pos.1, tokens);
+                self.scan_at(tokens)?;
+                continue;
+            }
+            if let Some(q) = quote {
+                if c == q {
+                    quote = None;
+                }
+                self.push_text(text, text_pos, c);
+                continue;
+            }
+            match c {
+                '"' | '\'' => {
+                    quote = Some(c);
+                    self.push_text(text, text_pos, c);
+                }
+                '>' => {
+                    self.push_text(text, text_pos, c);
+                    return Ok(());
+                }
+                _ => self.push_text(text, text_pos, c),
+            }
+        }
+    }
+
+    /// 开标签的尾部扫描（名称之后到 `>`）：处理属性值中的 `@` 表达式；返回是否自闭合（`/>`）。
+    fn scan_open_tag_tail(
+        &mut self,
+        tokens: &mut Vec<Token>,
+        text: &mut String,
+        text_pos: &mut (usize, usize),
+        start: (usize, usize),
+    ) -> Result<bool, ParseError> {
+        let mut quote: Option<char> = None;
+        let mut last_non_ws_is_slash = false;
+        loop {
+            let Some(c) = self.peek() else {
+                return Err(
+                    ParseError::new(start.0, start.1, "标签未闭合（缺少 >）").with_hint("补上 >")
+                );
+            };
+            if c == '@' {
+                if self.handle_text_at(text, text_pos)? {
+                    continue;
+                }
+                flush_text(text, text_pos.0, text_pos.1, tokens);
+                self.scan_at(tokens)?;
+                continue;
+            }
+            if let Some(q) = quote {
+                if c == q {
+                    quote = None;
+                }
+                self.push_text(text, text_pos, c);
+                continue;
+            }
+            match c {
+                '"' | '\'' => {
+                    quote = Some(c);
+                    self.push_text(text, text_pos, c);
+                }
+                '>' => {
+                    self.push_text(text, text_pos, c);
+                    return Ok(last_non_ws_is_slash);
+                }
+                c if c.is_whitespace() => self.push_text(text, text_pos, c),
+                '/' => {
+                    last_non_ws_is_slash = true;
+                    self.push_text(text, text_pos, c);
+                }
+                _ => {
+                    last_non_ws_is_slash = false;
+                    self.push_text(text, text_pos, c);
+                }
+            }
+        }
     }
 
     // ———— `@` 结构 ————
@@ -253,6 +571,7 @@ impl Lexer {
                 tokens.push(
                     Token::new(TokenKind::Code(inner), line, col).with_content(cpos.0, cpos.1),
                 );
+                self.skip_after_block_close();
                 Ok(())
             }
             c if is_ident_start(c) => {
@@ -374,11 +693,12 @@ impl Lexer {
         let (bl, bc) = (self.line, self.col);
         self.bump(); // '{'
         tokens.push(Token::new(TokenKind::LeftBrace, bl, bc));
-        self.scan_template(tokens, true)?;
-        // scan_template 在块体未闭合时已报错，此处 peek 必为 '}'
+        self.scan_body(tokens)?;
+        // scan_body 在块体未闭合时已报错，此处 peek 必为 '}'
         let (rl, rc) = (self.line, self.col);
         self.bump(); // '}'
         tokens.push(Token::new(TokenKind::RightBrace, rl, rc));
+        self.skip_after_block_close();
         Ok(())
     }
 
@@ -673,6 +993,17 @@ fn is_ident_start(c: char) -> bool {
     c.is_alphabetic() || c == '_'
 }
 
+/// HTML void 元素（无闭合标签，不增加标记深度）。
+const VOID_ELEMENTS: [&str; 14] = [
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
+/// 是否 HTML void 元素（大小写不敏感）。
+fn is_void_element(name: &str) -> bool {
+    VOID_ELEMENTS.iter().any(|v| v.eq_ignore_ascii_case(name))
+}
+
 /// 是否标识符延续字符。
 fn is_ident_continue(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
@@ -713,13 +1044,13 @@ mod tests {
     #[test]
     fn double_at_renders_literal_at() {
         assert_eq!(kinds("a@@b"), vec![TokenKind::Text("a@b".into())]);
-        // 块体中的 @@
+        // 块体中的 @@（标记区内）
         assert_eq!(
-            kinds("@if (x) { a@@b }"),
+            kinds("@if (x) { <i>a@@b</i> }"),
             vec![
                 TokenKind::If("x".into()),
                 TokenKind::LeftBrace,
-                TokenKind::Text(" a@b ".into()),
+                TokenKind::Text(" <i>a@b</i> ".into()),
                 TokenKind::RightBrace,
             ]
         );
@@ -804,7 +1135,7 @@ mod tests {
     #[test]
     fn if_else_chain_tokens() {
         let t = kinds(
-            "@if (Model.Enable) { <b>on</b> } else if (Model.Half) { <i>half</i> } else { off }",
+            "@if (Model.Enable) { <b>on</b> } else if (Model.Half) { <i>half</i> } else { <u>off</u> }",
         );
         assert_eq!(
             t,
@@ -819,7 +1150,7 @@ mod tests {
                 TokenKind::RightBrace,
                 TokenKind::Else,
                 TokenKind::LeftBrace,
-                TokenKind::Text(" off ".into()),
+                TokenKind::Text(" <u>off</u> ".into()),
                 TokenKind::RightBrace,
             ]
         );
@@ -835,32 +1166,166 @@ mod tests {
                 TokenKind::RightBrace,
             ]
         );
-        // 只有一个空格的块体：空格属于文本
+        // 只有空白的块体：C# 空白不输出
         assert_eq!(
             kinds("@if (x) { }"),
             vec![
                 TokenKind::If("x".into()),
                 TokenKind::LeftBrace,
-                TokenKind::Text(" ".into()),
                 TokenKind::RightBrace,
             ]
         );
-        let t = kinds("@if (a) { @if (b) { x } else { y } }");
+        // 嵌套 @if：表达式前导空白（含换行）丢弃
+        let t = kinds("@if (a) { @if (b) { <p>x</p> } else { <p>y</p> } }");
         assert_eq!(
             t,
             vec![
                 TokenKind::If("a".into()),
                 TokenKind::LeftBrace,
-                TokenKind::Text(" ".into()),
                 TokenKind::If("b".into()),
                 TokenKind::LeftBrace,
-                TokenKind::Text(" x ".into()),
+                TokenKind::Text(" <p>x</p> ".into()),
                 TokenKind::RightBrace,
                 TokenKind::Else,
                 TokenKind::LeftBrace,
-                TokenKind::Text(" y ".into()),
+                TokenKind::Text(" <p>y</p> ".into()),
                 TokenKind::RightBrace,
-                TokenKind::Text(" ".into()),
+                TokenKind::RightBrace,
+            ]
+        );
+    }
+
+    // ———— 块体语义（v0.1 修订） ————
+
+    #[test]
+    fn body_leading_whitespace_rules() {
+        // 至首个 `<`：丢弃到最后一次换行，缩进保留
+        assert_eq!(
+            kinds("@if (a) {\n\n  <i>x</i>\n}"),
+            vec![
+                TokenKind::If("a".into()),
+                TokenKind::LeftBrace,
+                TokenKind::Text("  <i>x</i>\n".into()),
+                TokenKind::RightBrace,
+            ]
+        );
+        // 至首个 `@`：空白全部丢弃
+        assert_eq!(
+            kinds("@if (a) {\n  @x}"),
+            vec![
+                TokenKind::If("a".into()),
+                TokenKind::LeftBrace,
+                TokenKind::ImplicitExpr("x".into()),
+                TokenKind::RightBrace,
+            ]
+        );
+        // 同行空白保留
+        assert_eq!(
+            kinds("@if (a) { <i>x</i> }"),
+            vec![
+                TokenKind::If("a".into()),
+                TokenKind::LeftBrace,
+                TokenKind::Text(" <i>x</i> ".into()),
+                TokenKind::RightBrace,
+            ]
+        );
+    }
+
+    #[test]
+    fn body_bare_content_is_explicit_error() {
+        let e = err_of("@if (a) { hello }");
+        assert!(e.message.contains("裸内容"));
+        assert!(e.hint.is_some());
+        assert!(err_of("@if (a) {\n  1\n}").message.contains("裸内容"));
+    }
+
+    #[test]
+    fn block_close_swallows_one_newline() {
+        // `}` 后至第一个换行的空白丢弃
+        assert_eq!(
+            kinds("@{ var a = 1; }\nX"),
+            vec![
+                TokenKind::Code(" var a = 1; ".into()),
+                TokenKind::Text("X".into())
+            ]
+        );
+        // 第二个换行保留
+        assert_eq!(
+            kinds("@{ var a = 1; }\n\nX"),
+            vec![
+                TokenKind::Code(" var a = 1; ".into()),
+                TokenKind::Text("\nX".into())
+            ]
+        );
+        // 无换行的空白保留
+        assert_eq!(
+            kinds("@{ var a = 1; }  X"),
+            vec![
+                TokenKind::Code(" var a = 1; ".into()),
+                TokenKind::Text("  X".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn email_like_at_is_literal() {
+        assert_eq!(
+            kinds("A@Model.X"),
+            vec![TokenKind::Text("A@Model.X".into())]
+        );
+        assert_eq!(
+            kinds("价格@Model.X"),
+            vec![TokenKind::Text("价格@Model.X".into())]
+        );
+        // '.' 前导 → 正常转换
+        assert_eq!(
+            kinds("A.@Model.X"),
+            vec![
+                TokenKind::Text("A.".into()),
+                TokenKind::ImplicitExpr("Model.X".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn markup_tags_and_depth() {
+        // void 元素不增加深度
+        assert_eq!(
+            kinds("@if (a) {<br>}"),
+            vec![
+                TokenKind::If("a".into()),
+                TokenKind::LeftBrace,
+                TokenKind::Text("<br>".into()),
+                TokenKind::RightBrace,
+            ]
+        );
+        // 自闭合与属性引号保护
+        assert_eq!(
+            kinds("@if (a) {<img src=\"a>b\">}"),
+            vec![
+                TokenKind::If("a".into()),
+                TokenKind::LeftBrace,
+                TokenKind::Text("<img src=\"a>b\">".into()),
+                TokenKind::RightBrace,
+            ]
+        );
+        // 未闭合元素：块未闭合错误（提示标签）
+        let e = err_of("@if (a) { <li>x }");
+        assert!(e.message.contains("块未闭合"));
+        assert!(e.hint.unwrap().contains("标记元素"));
+    }
+
+    #[test]
+    fn at_expression_inside_open_tag_keeps_markup() {
+        // 表达式在未闭合元素内部：其后文本仍为标记
+        assert_eq!(
+            kinds("@if (a) {<a href=\"@Model.Url\">t</a>}"),
+            vec![
+                TokenKind::If("a".into()),
+                TokenKind::LeftBrace,
+                TokenKind::Text("<a href=\"".into()),
+                TokenKind::ImplicitExpr("Model.Url".into()),
+                TokenKind::Text("\">t</a>".into()),
                 TokenKind::RightBrace,
             ]
         );
@@ -873,9 +1338,7 @@ mod tests {
             vec![
                 TokenKind::ForEach("var s in Model.Sites".into()),
                 TokenKind::LeftBrace,
-                TokenKind::Text(" ".into()),
                 TokenKind::ImplicitExpr("s.Name".into()),
-                TokenKind::Text(" ".into()),
                 TokenKind::RightBrace,
             ]
         );
@@ -905,13 +1368,13 @@ mod tests {
     #[test]
     fn else_word_boundary_respected() {
         // "elsewhere" 不是 else 关键字，回退为文本
-        let t = kinds("@if (x) { a } elsewhere!");
+        let t = kinds("@if (x) { <i>a</i> } elsewhere!");
         assert_eq!(
             t,
             vec![
                 TokenKind::If("x".into()),
                 TokenKind::LeftBrace,
-                TokenKind::Text(" a ".into()),
+                TokenKind::Text(" <i>a</i> ".into()),
                 TokenKind::RightBrace,
                 TokenKind::Text(" elsewhere!".into()),
             ]
@@ -991,7 +1454,7 @@ mod tests {
     fn if_and_else_require_braces() {
         assert!(err_of("@if (x) <p>hi</p>").message.contains("代码块"));
         assert!(err_of("@if x { }").message.contains("缺少 ( )"));
-        assert!(err_of("@if (x) { a } else <p>b</p>")
+        assert!(err_of("@if (x) { <i>a</i> } else <p>b</p>")
             .message
             .contains("else"));
         assert!(err_of("@else { }").message.contains("else"));

@@ -12,7 +12,9 @@ param(
     [switch]$SkipBuild
 )
 
-$ErrorActionPreference = "Stop"
+# 注意：PowerShell 5.1 会把原生命令（cargo/dotnet）的 stderr 视为错误记录，
+# 因此不使用 Stop 策略；所有失败均通过显式检查 $LASTEXITCODE 处理。
+$ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $PSScriptRoot
 
 $rustExe = Join-Path $root "target\debug\examples\razor_render.exe"
