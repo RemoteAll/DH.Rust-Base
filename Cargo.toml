@@ -23,3 +23,7 @@ quick-xml = "0.36"
 [features]
 # Razor 子集模板引擎（方案 C，零新依赖；规约见 Doc/Razor子集模板引擎架构.md）
 razor = []
+
+[dev-dependencies]
+# 集成测试（tests/razor_cases.rs）读取用例数据；与主依赖同 crate 同版本（零新增供应链）
+serde_json = { version = "1", features = ["preserve_order"] }

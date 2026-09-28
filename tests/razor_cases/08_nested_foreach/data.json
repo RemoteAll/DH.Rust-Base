@@ -1,0 +1,6 @@
+{
+  "Groups": [
+    { "Name": "G1", "Items": ["a", "b"] },
+    { "Name": "G2", "Items": [] }
+  ]
+}

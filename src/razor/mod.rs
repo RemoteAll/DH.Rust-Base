@@ -14,6 +14,7 @@
 //! - T005 ✅ 表达式子集 `expr`：字面量/路径/优先级/三目/`??`（单测覆盖）
 //! - T006 ✅ 节点解析 `parser`：`@if`/`@foreach`/`@{ }` 与嵌套（单测覆盖）
 //! - T007 ✅ 渲染器 `render`：求值+转义+输出+作用域（单测覆盖）
+//! - T008 ✅ 用例集 `tests/razor_cases` + Rust 侧逐字节比对（集成测试）
 
 pub mod error;
 pub mod expr;
