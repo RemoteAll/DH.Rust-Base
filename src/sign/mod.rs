@@ -40,6 +40,18 @@ pub fn md5_hex(text: &str) -> String {
     out
 }
 
+/// FNV-1a 64 位哈希（非加密快速散列；内存混淆、短键散列等场景）。
+///
+/// 来源：PekSendToMo 房间密码哈希（2026-09-29 收编，算法与行为不变）。
+pub fn fnv1a_64(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,5 +68,13 @@ mod tests {
         let sign = create_signature("123".into(), "7".into(), "key".into());
         assert_eq!(sign.len(), 40);
         assert_eq!(getrand(12).chars().count(), 12);
+    }
+
+    #[test]
+    fn fnv1a_64_stable() {
+        // FNV-1a 64 偏移基准（空串；算法标准值）
+        assert_eq!(fnv1a_64(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a_64("hello"), fnv1a_64("hello"));
+        assert_ne!(fnv1a_64("hello"), fnv1a_64("world"));
     }
 }

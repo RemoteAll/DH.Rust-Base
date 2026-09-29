@@ -45,6 +45,8 @@ rcgen = { version = "0.13", optional = true, default-features = false, features 
 [features]
 # Razor 子集模板引擎（方案 C，零新依赖；规约见 Doc/Razor子集模板引擎架构.md）
 razor = []
+# STUN 服务（RFC 5389 Binding；UDP，仅依赖 tokio；net 特性自动包含）
+stun = ["dep:tokio"]
 # 网络内核（DHDeploy.Agent Rust 迁移；选型与红线见 DHDeploy 仓库 Doc/网络层选型复核.md）
 net = [
     "dep:tokio",
@@ -52,6 +54,7 @@ net = [
     "dep:hyper-util",
     "dep:http-body-util",
     "dep:fastwebsockets",
+    "stun",
 ]
 # wss/TLS（在 net 之上追加；根证书优先系统存储，为空时回退 webpki-roots）
 net-tls = [

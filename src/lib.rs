@@ -10,12 +10,11 @@ pub mod zip; // 极简 ZIP 打包器（store 法；内存 + 流式落盘两种�
 #[cfg(feature = "razor")]
 pub mod razor; // Razor 子集模板引擎（方案 C）：同一份 .cshtml 双端渲染
 
-#[cfg(feature = "net")]
-pub mod net; // 网络内核（hyper + fastwebsockets + 自研语义层；DHDeploy.Agent Rust 迁移）
+#[cfg(any(feature = "net", feature = "stun"))]
+pub mod net; // 网络模块（net：HTTP/WS/RPC 内核；stun：RFC 5389 STUN 服务；可独立启用）
 
 pub fn bar() {
     io::foo();
-    logs::baz();
     times::foo();
 }
 

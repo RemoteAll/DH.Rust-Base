@@ -227,18 +227,19 @@ async fn middleware_order_and_short_circuit() {
     assert_eq!((s, b.as_str()), (401, "unauthorized"));
 }
 
-/// DGResult 序列化形态（字段顺序 / null 输出 / .NET 风格转义）。
+/// DGResult 序列化形态（字段名 PascalCase——对齐 Pek 系 C# 客户端按 Code/Message 解析；
+/// 字段顺序 / null 输出 / .NET 风格转义）。
 #[test]
 fn dgresult_json_shapes() {
     let ok = DGResult::ok(serde_json::json!(["db1", "db2"]));
     let j = ok.to_json();
     assert!(
-        j.starts_with("{\"code\":1,\"errCode\":0,\"message\":null,\"data\":[\"db1\",\"db2\"],\"extData\":null,\"operationTime\":\""),
+        j.starts_with("{\"Code\":1,\"ErrCode\":0,\"Message\":null,\"Data\":[\"db1\",\"db2\"],\"ExtData\":null,\"OperationTime\":\""),
         "字段顺序/形态不符: {j}"
     );
-    assert!(j.ends_with("\",\"id\":null}"), "结尾不符: {j}");
+    assert!(j.ends_with("\",\"Id\":null}"), "结尾不符: {j}");
     // operationTime：ISO 8601 本地时间（含 T 与偏移）
-    let start = j.find("\"operationTime\":\"").unwrap() + "\"operationTime\":\"".len();
+    let start = j.find("\"OperationTime\":\"").unwrap() + "\"OperationTime\":\"".len();
     let end = j[start..].find('"').unwrap() + start;
     let time = &j[start..end];
     assert!(
@@ -248,9 +249,9 @@ fn dgresult_json_shapes() {
 
     let fail = DGResult::fail("中文错误");
     let j = fail.to_json();
-    assert!(j.contains("\"code\":2"), "fail code 应为 2: {j}");
+    assert!(j.contains("\"Code\":2"), "fail code 应为 2: {j}");
     assert!(
-        j.contains("\"message\":\"\\u4E2D\\u6587\\u9519\\u8BEF\""),
+        j.contains("\"Message\":\"\\u4E2D\\u6587\\u9519\\u8BEF\""),
         "中文应转义: {j}"
     );
 

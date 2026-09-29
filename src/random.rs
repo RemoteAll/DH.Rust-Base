@@ -18,6 +18,21 @@ pub fn token() -> String {
     base64_url_no_pad(&bytes(16))
 }
 
+/// 生成 `2 * len` 位小写十六进制随机串（连接 ID / 请求 ID 等通用短标识形态）。
+///
+/// 例：`hex(8)` → 16 位小写 hex，与 `format!("{:016x}", rand::random::<u64>())` 形态一致
+/// （来源：PekSendToMo 成员 ID 收编 2026-09-29）。
+pub fn hex(len: usize) -> String {
+    const TABLE: &[u8; 16] = b"0123456789abcdef";
+    let data = bytes(len);
+    let mut out = String::with_capacity(len * 2);
+    for byte in data {
+        out.push(TABLE[(byte >> 4) as usize] as char);
+        out.push(TABLE[(byte & 0x0F) as usize] as char);
+    }
+    out
+}
+
 /// base64url 编码（无填充；`+`→`-`、`/`→`_`）。
 fn base64_url_no_pad(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -52,5 +67,16 @@ mod tests {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn hex_shape_and_charset() {
+        let id = hex(8);
+        assert_eq!(id.len(), 16);
+        assert!(id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_ne!(hex(8), hex(8));
+        assert_eq!(hex(0), "");
     }
 }
