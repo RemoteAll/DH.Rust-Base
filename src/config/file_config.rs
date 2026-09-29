@@ -43,6 +43,9 @@ pub struct ConfigOptions {
     /// 文件不存在时是否生成默认配置文件。默认 true；环境变量 `CreateConfigOnMissing`
     /// 取值 `0/false/off/no` 时关闭（与 C# `Runtime.CreateConfigOnMissing` 一致）。
     pub create_on_missing: bool,
+    /// 解析失败时是否备份（`.bak`）并重建默认配置。默认 true（对齐 C#）；
+    /// 关闭时保持原文件不动、仅返回默认值（用于运行期热加载，避免误改用户正在编辑的文件）。
+    pub repair_corrupt: bool,
 }
 
 impl Default for ConfigOptions {
@@ -58,6 +61,7 @@ impl Default for ConfigOptions {
             .unwrap_or(true);
         Self {
             create_on_missing: enabled,
+            repair_corrupt: true,
         }
     }
 }
@@ -115,8 +119,12 @@ where
                         loaded = Some(model);
                     }
                     Err(e) => {
-                        notes.push(format!("配置解析失败，已备份为 .bak 并重建默认配置: {e}"));
-                        let _ = std::fs::rename(&path, backup_path(&path));
+                        if options.repair_corrupt {
+                            notes.push(format!("配置解析失败，已备份为 .bak 并重建默认配置: {e}"));
+                            let _ = std::fs::rename(&path, backup_path(&path));
+                        } else {
+                            notes.push(format!("配置解析失败（未改动原文件）: {e}"));
+                        }
                     }
                 },
                 Err(e) => notes.push(format!("配置读取失败，使用默认值: {e}")),
@@ -213,6 +221,24 @@ pub fn save_value<T: Serialize, P: AsRef<Path>>(path: P, value: &T) -> Result<()
     let text =
         serde_json::to_string_pretty(value).map_err(|e| ConfigError::Parse(e.to_string()))?;
     super::setting::atomic_write(path.as_ref(), &text)
+}
+
+/// 文件版本戳（长度 + 修改时间），用于检测配置文件是否被外部修改。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FileStamp {
+    /// 文件长度（字节）
+    pub len: u64,
+    /// 最后修改时间
+    pub modified: Option<std::time::SystemTime>,
+}
+
+/// 获取文件版本戳（文件不存在时返回 None）。
+pub fn file_stamp<P: AsRef<Path>>(path: P) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+    })
 }
 
 /// 解析 JSON 文本（去 BOM、清理注释，对齐 C# `JsonConfigProvider.OnRead`）。
@@ -373,6 +399,7 @@ mod tests {
             &path,
             ConfigOptions {
                 create_on_missing: false,
+                ..Default::default()
             },
         );
         assert!(!path.exists(), "关闭生成开关时不应写盘");
@@ -381,6 +408,27 @@ mod tests {
             .notes()
             .iter()
             .any(|n| n.contains("CreateConfigOnMissing")));
+    }
+
+    #[test]
+    fn repair_corrupt_disabled_keeps_file() {
+        let path = temp_path("norepair");
+        std::fs::write(&path, "{ 坏文件").unwrap();
+
+        let cfg = Config::<Demo>::load_with(
+            &path,
+            ConfigOptions {
+                create_on_missing: true,
+                repair_corrupt: false,
+            },
+        );
+        assert!(cfg.notes().iter().any(|n| n.contains("未改动原文件")));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ 坏文件",
+            "关闭修复时不应改动原文件"
+        );
+        assert!(!backup_path(&path).exists(), "关闭修复时不应产生 .bak");
     }
 
     #[test]

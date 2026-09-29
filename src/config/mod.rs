@@ -22,5 +22,5 @@ mod json;
 mod setting;
 mod xml;
 
-pub use file_config::{save_value, Config, ConfigOptions};
+pub use file_config::{file_stamp, save_value, Config, ConfigOptions, FileStamp};
 pub use setting::{ConfigError, Setting};
