@@ -7,7 +7,8 @@
 //! - 文件损坏 → 备份为 `.bak` 后重建默认配置（对齐 C# 忽略错误继续运行的语义）；
 //! - 保存时内容相同跳过、先写临时文件再原子替换（对齐 `FileConfigProvider.OnWrite`）。
 //!
-//! JSON 格式（对应 `JsonConfigProvider`）：读取容忍注释与 BOM，写出为缩进 JSON。
+//! JSON 格式（对应 `JsonConfigProvider`）：读取容忍注释与 BOM，写出为缩进 JSON；
+//! 类型不符的字段按 C# 绑定语义做容错转换（万能转换），并回写自愈。
 //!
 //! # 示例
 //!
@@ -99,15 +100,11 @@ where
 
         if existed {
             match std::fs::read_to_string(&path) {
-                Ok(text) => match parse_value(&text).and_then(|v| {
-                    serde_json::from_value::<T>(v.clone())
-                        .map(|model| (model, v))
-                        .map_err(|e| ConfigError::Parse(e.to_string()))
-                }) {
-                    Ok((model, file_value)) => {
-                        // 文件属性完整？不完整则回存补齐（对齐 C#：`config.Save()`）
+                Ok(text) => match parse_and_coerce::<T>(&text) {
+                    Ok((model, file_value, converted)) => {
+                        // 类型不符已转换 / 缺属性 → 回存规范化（对齐 C# `Current` 的 `Save()`）
                         let canonical = serde_json::to_value(&model).unwrap_or(Value::Null);
-                        if !covers(&canonical, &file_value) {
+                        if converted || !covers(&canonical, &file_value) {
                             let mut cfg = Config {
                                 path: path.clone(),
                                 value: model,
@@ -116,7 +113,11 @@ where
                                 stamp: None,
                             };
                             if cfg.save().is_ok() {
-                                cfg.notes.push("已补齐缺失属性并保存".to_string());
+                                cfg.notes.push(if converted {
+                                    "已修正类型不符的属性并保存".to_string()
+                                } else {
+                                    "已补齐缺失属性并保存".to_string()
+                                });
                             }
                             return cfg;
                         }
@@ -230,17 +231,17 @@ where
             return notes;
         }
         match std::fs::read_to_string(&self.path) {
-            Ok(text) => match parse_value(&text).and_then(|v| {
-                serde_json::from_value::<T>(v.clone())
-                    .map(|m| (m, v))
-                    .map_err(|e| ConfigError::Parse(e.to_string()))
-            }) {
-                Ok((model, file_value)) => {
+            Ok(text) => match parse_and_coerce::<T>(&text) {
+                Ok((model, file_value, converted)) => {
                     let canonical = serde_json::to_value(&model).unwrap_or(Value::Null);
                     self.value = model;
-                    if !covers(&canonical, &file_value) {
+                    if converted || !covers(&canonical, &file_value) {
                         if let Ok(()) = save_value(&self.path, &self.value) {
-                            notes.push("已补齐缺失属性并保存".to_string());
+                            notes.push(if converted {
+                                "已修正类型不符的属性并保存".to_string()
+                            } else {
+                                "已补齐缺失属性并保存".to_string()
+                            });
                         }
                     }
                     notes.push("检测到配置文件外部修改，已热加载".to_string());
@@ -333,6 +334,118 @@ fn parse_value(text: &str) -> Result<Value, ConfigError> {
     serde_json::from_str(&cleaned).map_err(|e| ConfigError::Parse(e.to_string()))
 }
 
+/// 解析 + 字段级容错转换 + 反序列化。
+///
+/// 按 [`Default`] 序列化出的“类型模板”对文件值做尽力转换（对齐 C# 绑定的“万能转换”语义：
+/// 单个字段类型不符不影响其余字段）：字符串/数字/布尔互转；不可解析的值回落该类型零值。
+/// 返回（模型, 转换后的文件值, 是否发生过转换）。
+fn parse_and_coerce<T>(text: &str) -> Result<(T, Value, bool), ConfigError>
+where
+    T: Serialize + DeserializeOwned + Default,
+{
+    let file_value = parse_value(text)?;
+    let template = serde_json::to_value(T::default()).unwrap_or(Value::Null);
+    let (coerced, converted) = coerce_value(file_value, &template);
+    let model = serde_json::from_value::<T>(coerced.clone())
+        .map_err(|e| ConfigError::Parse(e.to_string()))?;
+    Ok((model, coerced, converted))
+}
+
+/// 按类型模板做字段级容错转换（对象逐键、数组逐项；标量按目标类型转换，失败回落零值）。
+///
+/// 限制：模板为 `Null` 的字段（如 `Option<T>` 且默认值为 `None`）无法判定目标类型，
+/// 保留原值（可能仍导致反序列化失败）。
+fn coerce_value(file: Value, template: &Value) -> (Value, bool) {
+    match (file, template) {
+        (Value::Object(mut file_obj), Value::Object(tmpl_obj)) => {
+            let mut changed = false;
+            for (key, value) in file_obj.iter_mut() {
+                if let Some(tv) = tmpl_obj.get(key) {
+                    let (nv, ch) = coerce_value(value.take(), tv);
+                    *value = nv;
+                    changed |= ch;
+                }
+            }
+            (Value::Object(file_obj), changed)
+        }
+        (Value::Array(mut file_arr), Value::Array(tmpl_arr)) => {
+            let mut changed = false;
+            if let Some(first) = tmpl_arr.first() {
+                for value in file_arr.iter_mut() {
+                    let (nv, ch) = coerce_value(value.take(), first);
+                    *value = nv;
+                    changed |= ch;
+                }
+            }
+            (Value::Array(file_arr), changed)
+        }
+        (file, Value::String(_)) => match file {
+            file @ Value::String(_) => (file, false),
+            Value::Number(n) => (Value::String(n.to_string()), true),
+            Value::Bool(b) => (Value::String(b.to_string()), true),
+            _ => (template.clone(), true),
+        },
+        (file, Value::Bool(_)) => match file {
+            file @ Value::Bool(_) => (file, false),
+            Value::Number(n) => (
+                Value::Bool(n.as_f64().map(|x| x != 0.0).unwrap_or(false)),
+                true,
+            ),
+            // 对齐 C# `ToBoolean` 容错：true/1/yes/y/on 为真，其余为假
+            Value::String(s) => {
+                let low = s.trim().to_ascii_lowercase();
+                (
+                    Value::Bool(matches!(low.as_str(), "true" | "1" | "yes" | "y" | "on")),
+                    true,
+                )
+            }
+            _ => (template.clone(), true),
+        },
+        (file, Value::Number(tmpl_num)) => match file {
+            file @ Value::Number(_) => (file, false),
+            Value::Bool(b) => (number_like(tmpl_num, if b { 1 } else { 0 }), true),
+            Value::String(s) => {
+                let s = s.trim();
+                let converted = if tmpl_num.is_i64() || tmpl_num.is_u64() {
+                    s.parse::<i64>()
+                        .ok()
+                        .or_else(|| s.parse::<f64>().ok().map(|f| f.round() as i64))
+                        .map(|i| Value::Number(i.into()))
+                } else {
+                    s.parse::<f64>()
+                        .ok()
+                        .and_then(serde_json::Number::from_f64)
+                        .map(Value::Number)
+                };
+                // 不可解析 → 零值（对齐 C# `ToInt/ToDouble` 的容错回落）
+                (converted.unwrap_or_else(|| number_like(tmpl_num, 0)), true)
+            }
+            _ => (template.clone(), true),
+        },
+        (file, _) => {
+            // 模板为 Null/其它（类型无法判定）：结构不匹配时回落模板，否则保留原值
+            let mismatch = matches!(file, Value::Object(_) | Value::Array(_));
+            if mismatch && !template.is_null() {
+                (template.clone(), true)
+            } else {
+                (file, false)
+            }
+        }
+    }
+}
+
+/// 生成与模板同“整型/浮点”形态的数字值。
+fn number_like(template: &serde_json::Number, value: i64) -> Value {
+    if template.is_i64() || template.is_u64() {
+        Value::Number(value.into())
+    } else {
+        Value::Number(
+            serde_json::Number::from_f64(value as f64)
+                .unwrap_or_else(|| serde_json::Number::from(0)),
+        )
+    }
+}
+
 /// 规范化模型是否覆盖文件内容：模型中的每个键都应在文件中存在（递归；数组逐项对应）。
 ///
 /// 用于判断文件是否缺失属性：模型由文件反序列化而来（缺失字段取默认值），
@@ -381,6 +494,7 @@ mod tests {
     #[serde(default, rename_all = "PascalCase")]
     struct Demo {
         name: String,
+        count: i64,
         items: Vec<DemoItem>,
     }
 
@@ -388,6 +502,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 name: "默认名称".to_string(),
+                count: 0,
                 items: vec![DemoItem {
                     url: "http://sample/health".to_string(),
                     enabled: false,
@@ -459,7 +574,8 @@ mod tests {
     #[test]
     fn complete_file_untouched() {
         let path = temp_path("complete");
-        let text = "{\n  \"Name\": \"N\",\n  \"Items\": [{ \"Url\": \"u\", \"Enabled\": true }]\n}";
+        let text =
+            "{\n  \"Name\": \"N\",\n  \"Count\": 3,\n  \"Items\": [{ \"Url\": \"u\", \"Enabled\": true }]\n}";
         std::fs::write(&path, text).unwrap();
 
         let cfg = Config::<Demo>::load(&path);
@@ -565,6 +681,7 @@ mod tests {
             &path,
             Demo {
                 name: "初始".to_string(),
+                count: 0,
                 items: vec![],
             },
         );
@@ -579,10 +696,39 @@ mod tests {
     }
 
     #[test]
+    fn lenient_type_coercion_and_self_heal() {
+        let path = temp_path("coerce");
+        // 字符串布尔 / 数字字符串 / 数字变字符串：全部字段级容错（对齐 C# 万能转换）
+        std::fs::write(
+            &path,
+            r#"{"Name":123,"Count":"7","Items":[{"Url":"u","Enabled":"true"}]}"#,
+        )
+        .unwrap();
+
+        let cfg = Config::<Demo>::load(&path);
+        assert_eq!(cfg.value().name, "123");
+        assert_eq!(cfg.value().count, 7);
+        assert!(cfg.value().items[0].enabled);
+        assert!(cfg.notes().iter().any(|n| n.contains("类型")));
+
+        // 自愈：文件已回写为规范类型
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["Name"], "123");
+        assert_eq!(saved["Count"], 7);
+        assert!(saved["Items"][0]["Enabled"].is_boolean());
+
+        // 不可解析的数字 → 零值（对齐 C# ToInt/ToDouble 容错回落）
+        std::fs::write(&path, r#"{"Name":"n","Count":"abc","Items":[]}"#).unwrap();
+        let cfg = Config::<Demo>::load(&path);
+        assert_eq!(cfg.value().count, 0);
+        assert!(cfg.notes().iter().any(|n| n.contains("类型")));
+    }
+
+    #[test]
     fn comments_and_extra_keys_tolerated() {
         let path = temp_path("comment");
         // 整行注释 + 额外未知键：可解析、无缺失属性，则原样保留
-        let text = "{\n// 注释\n\"Name\":\"N\",\"Extra\":123,\"Items\":[{\"Url\":\"u\",\"Enabled\":true}]\n}";
+        let text = "{\n// 注释\n\"Name\":\"N\",\"Count\":5,\"Extra\":123,\"Items\":[{\"Url\":\"u\",\"Enabled\":true}]\n}";
         std::fs::write(&path, text).unwrap();
 
         let cfg = Config::<Demo>::load(&path);
