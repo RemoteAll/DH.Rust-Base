@@ -124,10 +124,16 @@ where
                     }
                     Err(e) => {
                         if options.repair_corrupt {
-                            notes.push(format!("配置解析失败，已备份为 .bak 并重建默认配置: {e}"));
+                            notes.push(format!(
+                                "配置解析失败，已备份为 .bak 并重建默认配置: {}",
+                                parse_error_detail(&e)
+                            ));
                             let _ = std::fs::rename(&path, backup_path(&path));
                         } else {
-                            notes.push(format!("配置解析失败（未改动原文件）: {e}"));
+                            notes.push(format!(
+                                "配置解析失败（未改动原文件）: {}",
+                                parse_error_detail(&e)
+                            ));
                         }
                     }
                 },
@@ -240,7 +246,10 @@ where
                     notes.push("检测到配置文件外部修改，已热加载".to_string());
                 }
                 Err(e) => {
-                    notes.push(format!("配置解析失败，保持当前值（未改动原文件）: {e}"));
+                    notes.push(format!(
+                        "配置解析失败，保持当前值（未改动原文件）: {}",
+                        parse_error_detail(&e)
+                    ));
                 }
             },
             Err(e) => notes.push(format!("配置读取失败，保持当前值: {e}")),
@@ -339,6 +348,14 @@ fn covers(canonical: &Value, file: &Value) -> bool {
         // 标量：类型已在反序列化阶段校验，只要求存在（对象键存在性在上层判断）
         _ => true,
     }
+}
+
+/// 解析失败提示的细节文本（`ConfigError::Display` 已带“配置解析失败: ”前缀，此处去重）。
+fn parse_error_detail(e: &ConfigError) -> String {
+    let text = e.to_string();
+    text.strip_prefix("配置解析失败: ")
+        .unwrap_or(&text)
+        .to_string()
 }
 
 /// 备份文件名：`Xxx.json` → `Xxx.json.bak`。
