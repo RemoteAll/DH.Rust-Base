@@ -351,6 +351,18 @@ where
     Ok((model, coerced, converted))
 }
 
+/// 按类型模板对配置值做字段级容错转换（对应 C# 配置绑定的“万能转换”语义）。
+///
+/// 供 JSON 之外的配置格式复用（如 TOML 配置：先转为 JSON 值再调用）：
+/// - `template` 通常由配置模型的默认值序列化得到：`serde_json::to_value(T::default())`；
+/// - 对象逐键、数组逐项；标量按目标类型转换（字符串/数字/布尔互转，`true/1/yes/y/on` 判真）；
+/// - 不可解析的值回落该类型零值；模板为 `Null` 的字段保留原值。
+///
+/// 返回（转换后的值, 是否发生过转换）。
+pub fn coerce_json(file: Value, template: &Value) -> (Value, bool) {
+    coerce_value(file, template)
+}
+
 /// 按类型模板做字段级容错转换（对象逐键、数组逐项；标量按目标类型转换，失败回落零值）。
 ///
 /// 限制：模板为 `Null` 的字段（如 `Option<T>` 且默认值为 `None`）无法判定目标类型，
@@ -739,5 +751,27 @@ mod tests {
             text,
             "注释与未知键应保留"
         );
+    }
+
+    #[test]
+    fn coerce_json_public_contract() {
+        // 外部格式（如 TOML）复用的公开入口：按默认值模板做字段级容错
+        let template = serde_json::json!({
+            "Port": 9100,
+            "Enable": true,
+            "Name": "x"
+        });
+        let (coerced, changed) = coerce_json(
+            serde_json::json!({ "Port": "9100", "Enable": 1, "Name": 42 }),
+            &template,
+        );
+        assert!(changed);
+        assert_eq!(coerced["Port"], 9100);
+        assert_eq!(coerced["Enable"], true);
+        assert_eq!(coerced["Name"], "42");
+
+        // 类型已正确时不标记转换
+        let (_, changed) = coerce_json(serde_json::json!({ "Port": 1 }), &template);
+        assert!(!changed);
     }
 }
