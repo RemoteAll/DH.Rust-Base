@@ -16,8 +16,9 @@
 //! 控制帧由会话层处理。wss/TLS：启用 `net-tls` 特性（rustls + ring；根证书优先系统
 //! 存储、为空时回退 webpki-roots；生产环境 `wss://d.hlktech.com` 路径由此支持）。
 //! 服务端（N003）：hyper 升级后交 [`run_server_session`]——ping json 自动回
-//! pong json（对齐 C# `WebSocketHelper.HandlePingPongMessageAsync`）、消息在
-//! blocking 池分发、发送经单一写通道串行化。
+//! pong json（对齐 C# `WebSocketHelper.HandlePingPongMessageAsync`）、文本/二进制
+//! 消息分发、可选服务端主动 Ping 保活（`server_ping`）与慢消费者溢出断开
+//! （`close_on_send_overflow`）、发送经单一写通道串行化。
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +27,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fastwebsockets::{FragmentCollectorRead, Frame, OpCode, Payload, Role, WebSocket};
+use hyper::body::Bytes;
 use rand::Rng as _;
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -628,6 +630,14 @@ pub struct WsServerOptions {
     /// 读→处理→写同一任务完成，最低时延；仅适合纯内存快速处理。阻塞型
     /// 业务保持默认 `false`，走专用处理器线程池——对齐 C# `Task.Run` 隔离语义）
     pub inline_handlers: bool,
+    /// 服务端主动心跳间隔（`None` = 不发）。按间隔发送帧层 Ping——客户端
+    /// 网络栈自动回 Pong（不经业务），用于穿透 Nginx 等反向代理的空闲断开；
+    /// 配合 `idle_timeout` 即为半开连接判活（Pong 刷新活动时间）
+    pub server_ping: Option<Duration>,
+    /// 发送队列溢出时断开连接（慢消费者保护；默认 `false` 保持既有语义——
+    /// 仅令发送返回 `false` 由业务决定）。启用后队列满即通知会话循环
+    /// 写 Close 帧并结束会话（防慢消费者长期占用连接与内存）
+    pub close_on_send_overflow: bool,
 }
 
 impl Default for WsServerOptions {
@@ -637,6 +647,8 @@ impl Default for WsServerOptions {
             idle_timeout: None,
             send_queue: 1024,
             inline_handlers: false,
+            server_ping: None,
+            close_on_send_overflow: false,
         }
     }
 }
@@ -648,6 +660,8 @@ pub struct WsServerHooks {
     pub on_open: Option<Arc<dyn Fn(WsServerConn) + Send + Sync>>,
     /// 应用消息（在 blocking 池分发——读循环永不阻塞；ping/pong 已在会话层消化）
     pub on_message: Option<Arc<dyn Fn(WsServerMessage) + Send + Sync>>,
+    /// 二进制消息（文件分片等；分发策略与 `on_message` 相同；未注册时静默忽略）
+    pub on_binary: Option<Arc<dyn Fn(WsServerBinary) + Send + Sync>>,
     /// 连接关闭（原因）
     pub on_close: Option<Arc<dyn Fn(WsServerConn, String) + Send + Sync>>,
 }
@@ -669,10 +683,31 @@ impl std::fmt::Debug for WsServerMessage {
     }
 }
 
+/// 服务端视角的二进制消息（文件分片等；Pong 已在会话层消化，不会投递）。
+#[derive(Clone)]
+pub struct WsServerBinary {
+    /// 帧负载
+    pub data: Bytes,
+    /// 连接句柄（可在后台任务中延迟发送响应）
+    pub conn: WsServerConn,
+}
+
+impl std::fmt::Debug for WsServerBinary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsServerBinary")
+            .field("data", &format_args!("{} 字节", self.data.len()))
+            .finish()
+    }
+}
+
 /// 服务端发送命令（单一写通道串行化）。
 enum ServerCmd {
     Text {
         text: String,
+        ack: Option<oneshot::Sender<bool>>,
+    },
+    Binary {
+        data: Bytes,
         ack: Option<oneshot::Sender<bool>>,
     },
     Close,
@@ -683,6 +718,20 @@ enum ServerCmd {
 pub struct WsServerConn {
     cmd_tx: mpsc::Sender<ServerCmd>,
     connected: Arc<AtomicBool>,
+    /// 溢出/强制关闭的内部信号（会话循环监听）
+    signal: Arc<ConnSignal>,
+}
+
+/// 发送队列溢出 / 强制关闭的内部信号（会话循环监听收尾）。
+struct ConnSignal {
+    /// 队列溢出标记（慢消费者保护；置位后会话循环写 Close 并断开）
+    overflow: AtomicBool,
+    /// 强制关闭标记（`close()` 在队列满时无法排队，改由会话循环收尾）
+    force_close: AtomicBool,
+    /// 唤醒会话循环
+    notify: Notify,
+    /// 是否启用溢出断开（来自 [`WsServerOptions::close_on_send_overflow`]）
+    close_on_overflow: bool,
 }
 
 impl WsServerConn {
@@ -693,15 +742,41 @@ impl WsServerConn {
 
     /// 发送文本（fire-and-forget；未连接或队列满返回 `false`）。
     pub fn send_text(&self, text: impl Into<String>) -> bool {
+        self.send_cmd(ServerCmd::Text {
+            text: text.into(),
+            ack: None,
+        })
+    }
+
+    /// 发送二进制帧（fire-and-forget；未连接或队列满返回 `false`）。
+    ///
+    /// 文件分片等大流量场景推荐——与文本共用单一写通道（天然串行，
+    /// WebSocket 不允许并发发送）。
+    pub fn send_binary(&self, data: impl Into<Bytes>) -> bool {
+        self.send_cmd(ServerCmd::Binary {
+            data: data.into(),
+            ack: None,
+        })
+    }
+
+    /// 发送命令（统一未连接判定与溢出处理）。
+    fn send_cmd(&self, cmd: ServerCmd) -> bool {
         if !self.is_connected() {
             return false;
         }
-        self.cmd_tx
-            .try_send(ServerCmd::Text {
-                text: text.into(),
-                ack: None,
-            })
-            .is_ok()
+        match self.cmd_tx.try_send(cmd) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // 慢消费者：启用保护时通知会话循环收尾（写 Close 并断开）
+                if self.signal.close_on_overflow
+                    && !self.signal.overflow.swap(true, Ordering::Relaxed)
+                {
+                    self.signal.notify.notify_one();
+                }
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
     }
 
     /// 发送文本并等待写入结果（真实送达判定）。
@@ -727,9 +802,43 @@ impl WsServerConn {
         }
     }
 
+    /// 发送二进制帧并等待写入结果（真实送达判定）。
+    pub async fn send_binary_wait(&self, data: impl Into<Bytes>) -> Result<(), WsError> {
+        if !self.is_connected() {
+            return Err(WsError::Closed);
+        }
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(ServerCmd::Binary {
+                data: data.into(),
+                ack: Some(tx),
+            })
+            .await
+            .is_err()
+        {
+            return Err(WsError::Closed);
+        }
+        match rx.await {
+            Ok(true) => Ok(()),
+            _ => Err(WsError::Closed),
+        }
+    }
+
     /// 请求关闭连接（发送 Close 帧后结束会话）。
+    ///
+    /// 队列满时（慢消费者）改由会话循环直接收尾（写 Close 并断开），
+    /// 保证关闭请求不丢失。
     pub fn close(&self) {
-        let _ = self.cmd_tx.try_send(ServerCmd::Close);
+        match self.cmd_tx.try_send(ServerCmd::Close) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if !self.signal.force_close.swap(true, Ordering::Relaxed) {
+                    self.signal.notify.notify_one();
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
     }
 }
 
@@ -750,6 +859,14 @@ fn is_ping_text(text: &str) -> bool {
     text.contains("\"Type\":\"ping\"")
 }
 
+/// 可选定时器 tick：未启用时永久挂起（供 `select!` 占位）。
+async fn maybe_tick(timer: &mut Option<tokio::time::Interval>) -> tokio::time::Instant {
+    match timer {
+        Some(timer) => timer.tick().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// 运行服务端会话（`stream` = 已升级的 IO；返回断开原因）。
 ///
 /// 语义：ping json 自动回 pong json（不进入业务分发）；应用消息在 blocking 池
@@ -766,9 +883,16 @@ where
     let rt = tokio::runtime::Handle::current();
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<ServerCmd>(options.send_queue.max(1));
     let connected = Arc::new(AtomicBool::new(true));
+    let signal = Arc::new(ConnSignal {
+        overflow: AtomicBool::new(false),
+        force_close: AtomicBool::new(false),
+        notify: Notify::new(),
+        close_on_overflow: options.close_on_send_overflow,
+    });
     let conn = WsServerConn {
         cmd_tx,
         connected: connected.clone(),
+        signal: signal.clone(),
     };
 
     // 帧层接管（Role::Server：读帧自动解掩码、出帧不加掩码）
@@ -789,6 +913,14 @@ where
     let mut last_activity = Instant::now();
     let mut send_fn = noop_send;
 
+    // 服务端主动心跳（可选）：按间隔发帧层 Ping——客户端网络栈自动回 Pong
+    //（刷新 idle 判活），用于穿透反向代理的空闲断开
+    let mut ping_timer = options.server_ping.map(|period| {
+        let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        timer
+    });
+
     if let Some(cb) = &hooks.on_open {
         cb(conn.clone());
     }
@@ -799,6 +931,18 @@ where
                 Some(ServerCmd::Text { text, ack }) => {
                     let res = tx
                         .write_frame(Frame::text(Payload::Owned(text.into_bytes())))
+                        .await;
+                    if let Some(ack) = ack {
+                        let _ = ack.send(res.is_ok());
+                    }
+                    match res {
+                        Ok(()) => None,
+                        Err(e) => Some(format!("发送失败: {e}")),
+                    }
+                }
+                Some(ServerCmd::Binary { data, ack }) => {
+                    let res = tx
+                        .write_frame(Frame::binary(Payload::Owned(data.to_vec())))
                         .await;
                     if let Some(ack) = ack {
                         let _ = ack.send(res.is_ok());
@@ -861,6 +1005,30 @@ where
                                 None
                             }
                         }
+                        OpCode::Binary => {
+                            if let Some(handler) = &hooks.on_binary {
+                                let handler = handler.clone();
+                                let msg = WsServerBinary {
+                                    data: Bytes::from(frame.payload.to_vec()),
+                                    conn: conn.clone(),
+                                };
+                                if options.inline_handlers {
+                                    // 内联模式：会话循环内就地处理（与 on_message 同策略）
+                                    handler(msg);
+                                    flush_pending(&mut cmd_rx, &mut tx).await
+                                } else {
+                                    // 隔离模式：handler 在专用执行器线程执行
+                                    let rt = rt.clone();
+                                    HandlerExecutor::global().spawn(Box::new(move || {
+                                        let _guard = rt.enter();
+                                        handler(msg);
+                                    }));
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        }
                         OpCode::Ping => {
                             let payload = frame.payload.to_vec();
                             match tx.write_frame(Frame::pong(Payload::Owned(payload))).await {
@@ -892,6 +1060,32 @@ where
                     None
                 }
             }
+            _ = maybe_tick(&mut ping_timer) => {
+                // 帧层 Ping 无便捷构造器（fastwebsockets 仅提供 pong），用通用构造函数
+                let ping = Frame::new(true, OpCode::Ping, None, Payload::Owned(Vec::new()));
+                match tx.write_frame(ping).await {
+                    Ok(()) => None,
+                    Err(e) => Some(format!("Ping 发送失败: {e}")),
+                }
+            }
+            _ = signal.notify.notified() => {
+                // 溢出/强制关闭信号：写通道已无法承接（队列满或已请求关闭），
+                // 由会话循环直接写 Close 帧收尾（队列中未送达的消息一并丢弃——
+                // 对应客户端已不消费的场景）
+                let reason = if signal.overflow.load(Ordering::Relaxed) {
+                    format!(
+                        "发送队列溢出（慢消费者，上限 {} 帧），已断开",
+                        options.send_queue
+                    )
+                } else {
+                    "服务端关闭连接".to_string()
+                };
+                // 写 Close 带超时兜底（客户端完全不读时 TCP 背压会让写卡住，
+                // 不能无限等待——3 秒后直接结束会话）
+                let close = tx.write_frame(Frame::close(1000, b""));
+                let _ = tokio::time::timeout(Duration::from_secs(3), close).await;
+                Some(reason)
+            }
         };
         if let Some(r) = step {
             break r;
@@ -918,6 +1112,17 @@ where
             ServerCmd::Text { text, ack } => {
                 let res = tx
                     .write_frame(Frame::text(Payload::Owned(text.into_bytes())))
+                    .await;
+                if let Some(ack) = ack {
+                    let _ = ack.send(res.is_ok());
+                }
+                if let Err(e) = res {
+                    return Some(format!("发送失败: {e}"));
+                }
+            }
+            ServerCmd::Binary { data, ack } => {
+                let res = tx
+                    .write_frame(Frame::binary(Payload::Owned(data.to_vec())))
                     .await;
                 if let Some(ack) = ack {
                     let _ = ack.send(res.is_ok());

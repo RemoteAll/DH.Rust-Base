@@ -42,7 +42,7 @@ pub fn ensure_self_signed_cert(
     }
 
     let key_pair = rcgen::KeyPair::generate()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("生成密钥失败: {e}")))?;
+        .map_err(|e| io::Error::other(format!("生成密钥失败: {e}")))?;
     let mut params = rcgen::CertificateParams::new(sans)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("证书参数失败: {e}")))?;
     params
@@ -52,7 +52,7 @@ pub fn ensure_self_signed_cert(
 
     let cert = params
         .self_signed(&key_pair)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("签发自签证书失败: {e}")))?;
+        .map_err(|e| io::Error::other(format!("签发自签名证书失败: {e}")))?;
 
     std::fs::write(cert_path, cert.pem())?;
     std::fs::write(key_path, key_pair.serialize_pem())?;

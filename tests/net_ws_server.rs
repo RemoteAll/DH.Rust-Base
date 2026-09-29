@@ -51,6 +51,10 @@ async fn start_server(st: Arc<St>, options: HttpServerOptions) -> SocketAddr {
             // 回显（带前缀便于断言）
             m.conn.send_text(format!("echo:{}", m.text));
         })),
+        on_binary: Some(Arc::new(move |m| {
+            // 二进制原样回显（send_binary 走同一写通道）
+            m.conn.send_binary(m.data.clone());
+        })),
         on_close: Some(Arc::new(move |_c, reason| {
             st_close.closes.lock().unwrap().push(reason);
         })),
@@ -138,14 +142,24 @@ async fn raw_upgrade_handshake(
     }
 }
 
-/// 构造客户端掩码文本帧（RFC 6455：客户端必须掩码）。
-fn masked_text_frame(payload: &[u8], mask: [u8; 4]) -> Vec<u8> {
-    let mut out = vec![0x81, 0x80 | payload.len() as u8];
+/// 构造客户端掩码帧（RFC 6455：客户端必须掩码；仅测试用短负载）。
+fn masked_frame(opcode: u8, payload: &[u8], mask: [u8; 4]) -> Vec<u8> {
+    let mut out = vec![0x80 | opcode, 0x80 | payload.len() as u8];
     out.extend_from_slice(&mask);
     for (i, b) in payload.iter().enumerate() {
         out.push(b ^ mask[i % 4]);
     }
     out
+}
+
+/// 构造客户端掩码文本帧。
+fn masked_text_frame(payload: &[u8], mask: [u8; 4]) -> Vec<u8> {
+    masked_frame(0x1, payload, mask)
+}
+
+/// 构造客户端掩码二进制帧。
+fn masked_binary_frame(payload: &[u8], mask: [u8; 4]) -> Vec<u8> {
+    masked_frame(0x2, payload, mask)
 }
 
 /// 读一个服务端帧（服务端出帧不应掩码）。
@@ -459,4 +473,130 @@ async fn idle_timeout_disconnects() {
         st.closes.lock().unwrap()
     );
     client.close();
+}
+
+/// 等待服务端记录最近连接句柄（on_open 先于测试逻辑完成）。
+async fn wait_for_conn(st: &St, timeout_ms: u64) -> WsServerConn {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if let Some(conn) = st.last_conn.lock().unwrap().clone() {
+            return conn;
+        }
+        assert!(std::time::Instant::now() < deadline, "等待连接句柄超时");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// 二进制帧：服务端 on_binary 收到并按原样回显（send_binary 走同一写通道）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn binary_frame_echo() {
+    let st = Arc::new(St::default());
+    let addr = start_server(st.clone(), HttpServerOptions::default()).await;
+
+    let (head, mut rest, mut tcp) =
+        raw_upgrade_handshake(addr, "/ws", Some("dGhlIHNhbXBsZSBub25jZQ=="), 13).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "应返回 101: {head}");
+
+    // 发掩码二进制帧 → 服务端回显（不掩码）
+    let frame = masked_binary_frame(b"bin-hello", [0x11, 0x22, 0x33, 0x44]);
+    tcp.write_all(&frame).await.unwrap();
+    let (opcode, payload) = read_server_frame(&mut tcp, &mut rest).await;
+    assert_eq!(opcode, 0x2, "应为二进制帧");
+    assert_eq!(payload, b"bin-hello");
+}
+
+/// 服务端主动 Ping（server_ping）：按间隔发帧层 Ping；配合 idle_timeout 由 Pong 保活。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_ping_keeps_alive() {
+    let st = Arc::new(St::default());
+    let options = HttpServerOptions {
+        ws: WsServerOptions {
+            server_ping: Some(Duration::from_millis(100)),
+            idle_timeout: Some(Duration::from_millis(250)),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let addr = start_server(st.clone(), options).await;
+
+    let (head, mut rest, mut tcp) =
+        raw_upgrade_handshake(addr, "/ws", Some("dGhlIHNhbXBsZSBub25jZQ=="), 13).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "应返回 101: {head}");
+
+    // 连续响应 6 轮 Ping（约 600ms，超过 idle_timeout）：每轮回 Pong 刷新服务端活动时间
+    for _ in 0..6 {
+        let (opcode, payload) = read_server_frame(&mut tcp, &mut rest).await;
+        assert_eq!(opcode, 0x9, "应持续收到服务端 Ping 帧");
+        let pong = masked_frame(0xA, &payload, [0x01, 0x02, 0x03, 0x04]);
+        tcp.write_all(&pong).await.unwrap();
+    }
+    assert!(
+        st.closes.lock().unwrap().is_empty(),
+        "有 Pong 响应不应被空闲超时断开: {:?}",
+        st.closes.lock().unwrap()
+    );
+}
+
+/// 慢消费者溢出保护（close_on_send_overflow）：队列满后客户端恢复读取，
+/// 会话应写出 Close 并断开（服务端记录溢出原因）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_consumer_disconnected_on_overflow() {
+    let st = Arc::new(St::default());
+    let options = HttpServerOptions {
+        ws: WsServerOptions {
+            send_queue: 2,
+            close_on_send_overflow: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let addr = start_server(st.clone(), options).await;
+
+    // raw 客户端连接后先不读——制造 TCP 背压
+    let (head, rest, mut tcp) =
+        raw_upgrade_handshake(addr, "/ws", Some("dGhlIHNhbXBsZSBub25jZQ=="), 13).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "应返回 101: {head}");
+    let conn = wait_for_conn(&st, 2000).await;
+
+    // 灌入大消息（每条 128KB），直到发送返回 false（队列溢出）
+    let big = "x".repeat(128 * 1024);
+    let mut overflowed = false;
+    for _ in 0..16 {
+        if !conn.send_text(big.clone()) {
+            overflowed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(overflowed, "持续发送应触发队列溢出（返回 false）");
+
+    // 客户端恢复读取（让会话循环写完当前帧并处理溢出通知）：最终应读到 EOF（连接被断开）
+    let mut drained = rest;
+    let mut chunk = vec![0u8; 64 * 1024];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!left.is_zero(), "等待服务端断开超时");
+        match tokio::time::timeout(left, tcp.read(&mut chunk)).await {
+            Ok(Ok(0)) => break, // EOF：服务端已关闭
+            Ok(Ok(n)) => drained.extend_from_slice(&chunk[..n]),
+            Ok(Err(_)) => break, // RST：等同断开
+            Err(_) => panic!("等待服务端断开超时"),
+        }
+    }
+    assert!(!drained.is_empty(), "断开前应已收到部分积压数据");
+    assert!(
+        wait_until(
+            || st
+                .closes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.contains("发送队列溢出")),
+            2000
+        )
+        .await,
+        "溢出断开未记录: {:?}",
+        st.closes.lock().unwrap()
+    );
 }

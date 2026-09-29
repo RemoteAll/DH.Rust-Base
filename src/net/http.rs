@@ -791,7 +791,7 @@ fn push_json_string(out: &mut String, text: &str) {
 
 #[inline]
 fn needs_json_escape(b: u8) -> bool {
-    b >= 0x80 || b < 0x20 || matches!(b, b'"' | b'\\' | b'<' | b'>' | b'&' | b'\'')
+    !(0x20..0x80).contains(&b) || matches!(b, b'"' | b'\\' | b'<' | b'>' | b'&' | b'\'')
 }
 
 /// 递归写入 JSON 值（对象保持插入序；转义对齐 .NET）。

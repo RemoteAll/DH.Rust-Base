@@ -598,18 +598,21 @@ pub enum RenderMode {
     Partial = 3,
 }
 
-/// Partial 渲染宿主回调（C 风格两段指针：避免 trait 对象胖指针构造；
-/// 宿主数据指针在单次渲染调用期间由引擎保证有效）。
+/// Partial 渲染回调类型（C 风格两段指针：避免 trait 对象胖指针构造；
+/// `data` 为宿主数据指针——在单次渲染调用期间由引擎保证有效）。
+pub type PartialRenderFn = fn(
+    data: *const (),
+    name: &str,
+    model: &Value,
+    out: &mut String,
+    depth: u32,
+) -> Result<(), Box<RenderError>>;
+
+/// Partial 渲染宿主回调
 #[derive(Clone, Copy)]
 pub struct PartialHost {
     /// 渲染回调（trampoline：`data` → 引擎引用 → 渲染命名 Partial）
-    pub render: fn(
-        data: *const (),
-        name: &str,
-        model: &Value,
-        out: &mut String,
-        depth: u32,
-    ) -> Result<(), Box<RenderError>>,
+    pub render: PartialRenderFn,
     /// 宿主数据（引擎自身薄指针）
     pub data: *const (),
 }

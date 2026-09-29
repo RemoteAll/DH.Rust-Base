@@ -188,8 +188,7 @@ impl Lexer {
     fn scan_template(&mut self, tokens: &mut Vec<Token>) -> Result<(), ParseError> {
         let mut text = String::new();
         let mut text_pos = (self.line, self.col);
-        loop {
-            let Some(c) = self.peek() else { break };
+        while let Some(c) = self.peek() {
             if c == '@' {
                 if self.handle_text_at(&mut text, &mut text_pos)? {
                     continue;

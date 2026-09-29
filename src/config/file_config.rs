@@ -580,7 +580,7 @@ mod tests {
 
         let cfg = Config::<Demo>::load(&path);
         assert!(cfg.notes().is_empty());
-        assert_eq!(cfg.value().items[0].enabled, true);
+        assert!(cfg.value().items[0].enabled);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             text,

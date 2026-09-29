@@ -234,8 +234,7 @@ impl<'t> NodeParser<'t> {
         let body = self.parse_block_body()?;
         let mut branches = vec![(cond_expr, body)];
         let mut else_: Option<Vec<Node>> = None;
-        loop {
-            let Some(next) = self.peek() else { break };
+        while let Some(next) = self.peek() {
             match &next.kind {
                 TokenKind::ElseIf(cond2) => {
                     if else_.is_some() {
@@ -408,6 +407,9 @@ fn parse_code_block(source: &str, tok: &Token) -> Result<Option<Node>, ParseErro
     Ok(Some(Node::Code(stmts)))
 }
 
+/// 语句文本与（行、列）起始位置。
+type StatementChunk = (String, (usize, usize));
+
 /// 按顶层 `;` 拆分语句（字符串 / 字符 / 注释内的分号不拆分）。
 ///
 /// 返回 `(语句文本, 起始位置)` 列表；尾部非空且无 `;` 时报「缺少 ;」。
@@ -415,7 +417,7 @@ fn split_statements(
     source: &str,
     line: usize,
     col: usize,
-) -> Result<Vec<(String, (usize, usize))>, ParseError> {
+) -> Result<Vec<StatementChunk>, ParseError> {
     let mut sc = Scanner::new(source, line, col);
     let mut segments = Vec::new();
     let mut seg_start_idx = 0usize;

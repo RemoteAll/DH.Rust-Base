@@ -16,7 +16,7 @@ Pek 生态的 Rust 基础库，对应 C# 的 **DH.NCore**：为 Rust 项目提�
 | `config` | 核心设置 `Setting`，读写 `Config/Core.config`（XML）/ `Core.json` | `NewLife.Setting` / `Configuration` |
 | `logs` | 分级日志：控制台/文本文件/复合输出、全局门面与 `info!` 等宏 | `NewLife.Log`（`XTrace`/`ILog`/`TextFileLog`/`ConsoleLog`/`CompositeLog`） |
 | `zip` | 极简 ZIP 打包器（store 法；内存 + 流式落盘） | — |
-| `net` | 网络内核：HTTP 服务端/客户端、WebSocket、RPC（feature `net`） | `Http` / `Net` / `Remoting`（部分） |
+| `net` | 网络内核：HTTP 服务端/客户端、WebSocket（文本/二进制、可选服务端 Ping 保活与慢消费者断开）、RPC（feature `net`） | `Http` / `Net` / `Remoting`（部分） |
 | `stun` | STUN 服务（RFC 5389 Binding；feature `stun`，`net` 自动包含） | — |
 | `razor` | Razor 子集模板引擎（feature `razor`） | — |
 
