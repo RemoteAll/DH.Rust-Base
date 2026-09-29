@@ -14,6 +14,7 @@
 //! 依赖矩阵与版本锁定见《AgentRust迁移架构》第 3 节（DHDeploy 仓库 `Doc/`）。
 
 pub mod http;
+pub mod http_client;
 pub mod router;
 pub mod rpc;
 pub mod ws;

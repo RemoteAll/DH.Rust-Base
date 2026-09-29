@@ -22,9 +22,9 @@ quick-xml = "0.36"
 
 # ———— feature `net`（DHDeploy.Agent Rust 迁移网络内核；版本与 bench-net 已验证一致）————
 # 运行时（多线程调度/网络/定时/同步）
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "fs"], optional = true }
 # HTTP 服务端/客户端（连接层；语义层（路由/上下文）在 dhrust::net::http 自研）
-hyper = { version = "1", features = ["http1", "server"], optional = true }
+hyper = { version = "1", features = ["http1", "server", "client"], optional = true }
 # Tokio IO 适配
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 # 响应体工具
