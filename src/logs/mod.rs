@@ -6,6 +6,7 @@
 //! - [`ILog`]：日志接口；实现方只需提供 write/enabled/level 五件套，其余方法有默认实现；
 //! - [`TextFileLog`]：文本文件日志——异步队列落盘、按天与按大小滚动、备份清理、进程日志头；
 //! - [`ConsoleLog`]：控制台日志——队列异步输出、级别着色（警告黄/错误红/调试灰）；
+//! - [`enable_windows_console`]：Windows 控制台初始化——UTF-8 输出代码页 + ANSI 虚拟终端（`ConsoleLog` 创建时自动调用）；
 //! - [`CompositeLog`]：复合日志——多路同时输出（如控制台 + 文件）；
 //! - 全局门面：`log()`/`set_log()`/`use_console()`/`use_file()` 及 `info!` 等宏（对应 `XTrace`）。
 //!
@@ -29,11 +30,13 @@
 
 mod composite_log;
 mod console_log;
+mod console_setup;
 mod text_file_log;
 mod xtrace;
 
 pub use composite_log::CompositeLog;
 pub use console_log::ConsoleLog;
+pub use console_setup::enable_windows_console;
 pub use text_file_log::{FileLogOptions, TextFileLog};
 pub use xtrace::{
     level_from_env, log, null, set_level, set_log, use_console, use_console_options, use_file,

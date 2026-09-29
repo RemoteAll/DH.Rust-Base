@@ -148,18 +148,9 @@ fn parse_url(url: &str) -> Result<ParsedUrl, HttpClientError> {
 }
 
 /// application/x-www-form-urlencoded 值编码（RFC 3986：不含 `A-Za-z0-9-._~` 全部转义）。
-pub fn url_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for b in value.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(*b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
+///
+/// 统一实现已迁至 [`crate::web::url_encode`]；此处保留 re-export 以兼容既有调用方。
+pub use crate::web::url_encode;
 
 /// GET 请求（全量响应）。
 pub async fn get(

@@ -28,6 +28,9 @@ impl ConsoleLog {
 
     /// 新建（指定是否着色）
     pub fn with_color(use_color: bool) -> ConsoleLog {
+        // Windows：先切换 UTF-8 输出代码页并启用 ANSI 虚拟终端（否则中文乱码、颜色转义不生效）
+        super::console_setup::enable_once();
+
         let (tx, rx) = std::sync::mpsc::channel::<(LogLevel, String)>();
         let queued = Arc::new(AtomicUsize::new(0));
         let worker_queued = queued.clone();

@@ -1,4 +1,7 @@
-//! 网络模块（特性 `net`/`stun`）：HTTP 服务端、WebSocket 会话与 STUN 服务。
+//! 网络模块：基础能力无条件可用（仅依赖标准库）；`net`/`stun`/`net-tls` 特性扩展 HTTP/WS/RPC/STUN。
+//!
+//! 基础：
+//! - [`my_ip`]：本机首选局域网 IPv4 地址（UDP 出口路由法；对应 DH.NCore `NetHelper.MyIP()`）。
 //!
 //! `net`（网络内核，DHDeploy.Agent Rust 迁移；选型依据迁移文档《网络层选型复核》，
 //! DHDeploy 仓库 `Doc/`；两条件闸门已通过并锁定）：
@@ -32,6 +35,23 @@ pub mod tls;
 #[cfg(feature = "net")]
 pub mod ws;
 
+// ———— 基础能力（零依赖，无条件可用）————
+
+/// 获取本机首选的局域网 IPv4 地址（对应 DH.NCore `NetHelper.MyIP()`）。
+///
+/// 原理：向外部地址发起 UDP connect（不产生实际报文），由系统路由表选出出口网卡；
+/// 纯内网无默认路由时返回 None，属正常情况。
+pub fn my_ip() -> Option<std::net::Ipv4Addr> {
+    use std::net::{SocketAddr, UdpSocket};
+
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("223.5.5.5:80").ok()?;
+    match sock.local_addr().ok()? {
+        SocketAddr::V4(addr) => Some(*addr.ip()),
+        _ => None,
+    }
+}
+
 // ———— N001 依赖闸门（防 feature 空转：编译期验证依赖版本 API 形态）————
 
 /// 编译期自检：hyper 服务端连接构造器 API 形态（http1 + server 特性）。
@@ -50,4 +70,15 @@ fn _dep_gate_ws(
     ws: fastwebsockets::WebSocket<tokio::io::DuplexStream>,
 ) -> fastwebsockets::WebSocket<tokio::io::DuplexStream> {
     ws
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn my_ip_never_panics() {
+        // 结果依赖运行环境（可能有网卡也可能没有），这里只验证不崩溃
+        let _ = my_ip();
+    }
 }
