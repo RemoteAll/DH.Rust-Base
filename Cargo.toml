@@ -37,6 +37,10 @@ tokio-rustls = { version = "0.26", optional = true, default-features = false, fe
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = { version = "0.8", optional = true }
 webpki-roots = { version = "0.26", optional = true }
+# PEM 证书/私钥解析（HTTPS 服务端证书加载）
+rustls-pemfile = { version = "2", optional = true }
+# 自签证书生成（Agent HTTPS 监听开箱即用；纯 Rust，ring 后端）
+rcgen = { version = "0.13", optional = true, default-features = false, features = ["pem", "ring"] }
 
 [features]
 # Razor 子集模板引擎（方案 C，零新依赖；规约见 Doc/Razor子集模板引擎架构.md）
@@ -56,6 +60,8 @@ net-tls = [
     "dep:rustls",
     "dep:rustls-native-certs",
     "dep:webpki-roots",
+    "dep:rustls-pemfile",
+    "dep:rcgen",
 ]
 
 [profile.release]

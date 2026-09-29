@@ -208,15 +208,41 @@ impl Default for HttpServerOptions {
 /// server.serve(svc).await
 /// # }
 /// ```
+/// 服务端 TLS 接受器（无 `net-tls` 特性时为占位类型，恒为 None）。
+#[cfg(feature = "net-tls")]
+type ServerTlsAcceptor = tokio_rustls::TlsAcceptor;
+#[cfg(not(feature = "net-tls"))]
+type ServerTlsAcceptor = ();
+
 pub struct HttpServer {
     listener: TcpListener,
+    tls: Option<ServerTlsAcceptor>,
 }
 
 impl HttpServer {
     /// 绑定监听地址（`127.0.0.1:0` 随机端口便于测试）。
     pub async fn bind(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<HttpServer> {
         let listener = TcpListener::bind(addr).await?;
-        Ok(HttpServer { listener })
+        Ok(HttpServer {
+            listener,
+            tls: None,
+        })
+    }
+
+    /// 绑定 HTTPS 监听地址（TLS 1.2/1.3；PEM 证书链 + 私钥；需 `net-tls` 特性）。
+    #[cfg(feature = "net-tls")]
+    pub async fn bind_tls(
+        addr: impl tokio::net::ToSocketAddrs,
+        cert_pem: &[u8],
+        key_pem: &[u8],
+    ) -> std::io::Result<HttpServer> {
+        let config = super::tls::server_config(cert_pem, key_pem)?;
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind(addr).await?;
+        Ok(HttpServer {
+            listener,
+            tls: Some(acceptor),
+        })
     }
 
     /// 实际监听地址。
@@ -241,6 +267,7 @@ impl HttpServer {
                 options.conn_shards,
                 handler.clone(),
                 options.clone(),
+                self.tls.clone(),
             ))
         } else {
             None
@@ -251,6 +278,7 @@ impl HttpServer {
             let _ = tcp.set_nodelay(true);
             let handler = handler.clone();
             let options = options.clone();
+            let tls = self.tls.clone();
             if options.thread_per_connection {
                 // 每连接独立线程（current_thread 运行时）：数据到达直接唤醒本线程
                 // 处理（对齐 NewLife/IOCP 完成线程直处理模型）；基准实测回环乒乓
@@ -280,7 +308,7 @@ impl HttpServer {
                                 Ok(t) => t,
                                 Err(_) => return,
                             };
-                            serve_connection(tcp, handler, options).await;
+                            run_connection(tcp, tls, handler, options).await;
                         });
                     });
             } else if let Some(shards) = &shards {
@@ -291,7 +319,7 @@ impl HttpServer {
                     rr = rr.wrapping_add(1);
                 }
             } else {
-                tokio::spawn(serve_connection(tcp, handler, options));
+                tokio::spawn(run_connection(tcp, tls, handler, options));
             }
         }
     }
@@ -308,13 +336,19 @@ struct ShardPool {
 
 impl ShardPool {
     /// 启动分片线程池（连接经无界通道移交；`send` 为同步调用，可在运行时外使用）。
-    fn start(n: usize, handler: HttpHandler, options: HttpServerOptions) -> ShardPool {
+    fn start(
+        n: usize,
+        handler: HttpHandler,
+        options: HttpServerOptions,
+        tls: Option<ServerTlsAcceptor>,
+    ) -> ShardPool {
         let mut senders = Vec::with_capacity(n);
         for i in 0..n {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<std::net::TcpStream>();
             senders.push(tx);
             let handler = handler.clone();
             let options = options.clone();
+            let tls = tls.clone();
             let _ = std::thread::Builder::new()
                 .name(format!("dhrust-shard-{i}"))
                 .spawn(move || {
@@ -332,9 +366,10 @@ impl ShardPool {
                                 let _ = std_tcp.set_nonblocking(true);
                                 let handler = handler.clone();
                                 let options = options.clone();
+                                let tls = tls.clone();
                                 tokio::spawn(async move {
                                     if let Ok(tcp) = TcpStream::from_std(std_tcp) {
-                                        serve_connection(tcp, handler, options).await;
+                                        run_connection(tcp, tls, handler, options).await;
                                     }
                                 });
                             }
@@ -355,12 +390,35 @@ impl ShardPool {
     }
 }
 
+/// 连接入口：配置 TLS 时先完成握手（失败静默丢弃——扫描/探测流量不产生噪声日志）；
+/// 随后交由单连接服务。无 `net-tls` 特性时 `ServerTlsAcceptor` 为占位类型，恒直通。
+async fn run_connection(
+    tcp: TcpStream,
+    tls: Option<ServerTlsAcceptor>,
+    handler: HttpHandler,
+    options: HttpServerOptions,
+) {
+    #[cfg(feature = "net-tls")]
+    if let Some(acceptor) = tls {
+        if let Ok(stream) = acceptor.accept(tcp).await {
+            serve_connection(stream, handler, options).await;
+        }
+        return;
+    }
+    #[cfg(not(feature = "net-tls"))]
+    let _ = tls;
+    serve_connection(tcp, handler, options).await;
+}
+
 /// 单连接服务（hyper HTTP/1.1 + 升级支持）。
 ///
 /// 升级后的 WS 会话由**本任务就地继续驱动**（不 spawn 独立任务）：在
 /// “每连接独立线程”模式下 `block_on` 返回即销毁运行时，会让被 spawn 的会话
 /// 任务被连带取消（曾表现为 101 后连接被 RST）；就地续跑同时少一次任务跳转。
-async fn serve_connection(tcp: TcpStream, handler: HttpHandler, options: HttpServerOptions) {
+async fn serve_connection<S>(stream: S, handler: HttpHandler, options: HttpServerOptions)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let upgrade_slot: Arc<Mutex<Option<(hyper::upgrade::OnUpgrade, WsServerHooks)>>> =
         Arc::new(Mutex::new(None));
     // 会话配置先取出（options 会被闭包 move）
@@ -374,7 +432,7 @@ async fn serve_connection(tcp: TcpStream, handler: HttpHandler, options: HttpSer
     });
     // 连接错误（含正常关闭）静默；升级路径由 with_upgrades 支撑
     let _ = http1::Builder::new()
-        .serve_connection(TokioIo::new(tcp), service)
+        .serve_connection(TokioIo::new(stream), service)
         .with_upgrades()
         .await;
 

@@ -17,6 +17,8 @@ pub mod http;
 pub mod http_client;
 pub mod router;
 pub mod rpc;
+#[cfg(feature = "net-tls")]
+pub mod tls;
 pub mod ws;
 
 // ———— N001 依赖闸门（防 feature 空转：编译期验证依赖版本 API 形态）————
