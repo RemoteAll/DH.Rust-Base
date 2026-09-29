@@ -392,7 +392,7 @@ fn setting_from_xml(text: &str) -> Result<Setting, ConfigError> {
 }
 
 /// 原子写入：先写临时文件，再重命名替换。对应 C# `FileConfigProvider.OnWrite`。
-fn atomic_write(path: &Path, text: &str) -> Result<(), ConfigError> {
+pub(crate) fn atomic_write(path: &Path, text: &str) -> Result<(), ConfigError> {
     // 空内容防御：序列化异常退化为空时，不修改目标文件
     if text.is_empty() {
         return Ok(());
