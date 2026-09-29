@@ -602,8 +602,10 @@ pub mod state {
 /// 统一返回（对齐 C# `Pek.Models.DGResult`）。
 ///
 /// 序列化为 .NET `System.Text.Json` 兼容形态：字段顺序
-/// `code / errCode / message / data / extData / operationTime / id`，
-/// `null` 字段照常输出（对齐 `JsonSerializerDefaults.Web` 默认行为）。
+/// `Code / ErrCode / Message / Data / ExtData / OperationTime / Id`（**PascalCase**，
+/// 对齐 Pek 系 `JsonSerializerOptions.PropertyNamingPolicy = null` 的配置，
+/// 客户端按 `Code == 1 || Code == 200` 判定成功），
+/// `null` 字段照常输出（对齐 .NET 默认不忽略 null 的行为）。
 #[derive(Clone, Debug)]
 pub struct DGResult {
     /// 状态码（见 [`state`] 常量）
@@ -678,28 +680,28 @@ impl DGResult {
     /// 序列化为 JSON 文本（字段顺序与转义对齐 .NET `System.Text.Json`）。
     pub fn to_json(&self) -> String {
         let mut out = String::with_capacity(192);
-        out.push_str("{\"code\":");
+        out.push_str("{\"Code\":");
         out.push_str(&self.code.to_string());
-        out.push_str(",\"errCode\":");
+        out.push_str(",\"ErrCode\":");
         out.push_str(&self.err_code.to_string());
-        out.push_str(",\"message\":");
+        out.push_str(",\"Message\":");
         match &self.message {
             Some(m) => push_json_string(&mut out, m),
             None => out.push_str("null"),
         }
-        out.push_str(",\"data\":");
+        out.push_str(",\"Data\":");
         match &self.data {
             Some(v) => push_json_value(&mut out, v),
             None => out.push_str("null"),
         }
-        out.push_str(",\"extData\":");
+        out.push_str(",\"ExtData\":");
         match &self.ext_data {
             Some(v) => push_json_value(&mut out, v),
             None => out.push_str("null"),
         }
-        out.push_str(",\"operationTime\":");
+        out.push_str(",\"OperationTime\":");
         push_json_string(&mut out, &self.operation_time);
-        out.push_str(",\"id\":");
+        out.push_str(",\"Id\":");
         match &self.id {
             Some(id) => push_json_string(&mut out, id),
             None => out.push_str("null"),
