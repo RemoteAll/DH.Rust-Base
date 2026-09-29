@@ -141,7 +141,14 @@ where
             None => {
                 let is_new = true;
                 let value = T::default();
-                if options.create_on_missing {
+                // 文件不存在 → 由 create_on_missing 决定是否生成默认文件；
+                // 文件存在但解析/读取失败 → 由 repair_corrupt 决定是否重建（关闭时保持原文件不动）。
+                let may_write = if existed {
+                    options.repair_corrupt
+                } else {
+                    options.create_on_missing
+                };
+                if may_write {
                     if let Ok(()) = save_value(&path, &value) {
                         notes.push(if existed {
                             "已重建默认配置".to_string()
