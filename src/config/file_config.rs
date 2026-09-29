@@ -69,12 +69,15 @@ impl Default for ConfigOptions {
 /// 通用配置文件（`Config<T>`）。
 ///
 /// 一次 [`Config::load`] 即完成 C# `Config<T>.Current` 的全部行为：
-/// 生成缺失文件、补齐缺失属性并回存、损坏备份重建。
+/// 生成缺失文件、补齐缺失属性并回存、损坏备份重建；
+/// 常驻实例可配合 [`Config::reload_if_changed`] 热加载（对齐 C# 文件监视器语义）。
 pub struct Config<T> {
     path: PathBuf,
     value: T,
     is_new: bool,
     notes: Vec<String>,
+    /// 文件版本戳（热加载检测；load/save 后刷新）。
+    stamp: Option<FileStamp>,
 }
 
 impl<T> Config<T>
@@ -110,6 +113,7 @@ where
                                 value: model,
                                 is_new: false,
                                 notes,
+                                stamp: None,
                             };
                             if cfg.save().is_ok() {
                                 cfg.notes.push("已补齐缺失属性并保存".to_string());
@@ -132,12 +136,16 @@ where
         }
 
         match loaded {
-            Some(value) => Config {
-                path,
-                value,
-                is_new: false,
-                notes,
-            },
+            Some(value) => {
+                let stamp = file_stamp(&path);
+                Config {
+                    path,
+                    value,
+                    is_new: false,
+                    notes,
+                    stamp,
+                }
+            }
             None => {
                 let is_new = true;
                 let value = T::default();
@@ -159,11 +167,13 @@ where
                 } else if !existed {
                     notes.push("文件不存在（CreateConfigOnMissing=false，跳过生成）".to_string());
                 }
+                let stamp = file_stamp(&path);
                 Config {
                     path,
                     value,
                     is_new,
                     notes,
+                    stamp,
                 }
             }
         }
@@ -175,9 +185,68 @@ where
         self.save()
     }
 
-    /// 保存当前值到文件（内容相同跳过；原子替换）。
-    pub fn save(&self) -> Result<(), ConfigError> {
-        save_value(&self.path, &self.value)
+    /// 保存当前值到文件（内容相同跳过；原子替换），并刷新文件版本戳。
+    pub fn save(&mut self) -> Result<(), ConfigError> {
+        let r = save_value(&self.path, &self.value);
+        self.stamp = file_stamp(&self.path);
+        r
+    }
+
+    /// 用已有值构造（不读盘；版本戳取自当前文件，供 [`Config::reload_if_changed`] 检测外部修改）。
+    pub fn from_value<P: AsRef<Path>>(path: P, value: T) -> Config<T> {
+        let path = path.as_ref().to_path_buf();
+        let stamp = file_stamp(&path);
+        Config {
+            path,
+            value,
+            is_new: false,
+            notes: Vec::new(),
+            stamp,
+        }
+    }
+
+    /// 文件是否被外部修改（版本戳比较；文件被删除时保持当前值，返回 false）。
+    pub fn is_stale(&self) -> bool {
+        match file_stamp(&self.path) {
+            Some(stamp) => self.stamp != Some(stamp),
+            None => false,
+        }
+    }
+
+    /// 文件被外部修改时热加载（对齐 C# `FileConfigProvider` 监视器重载）：
+    /// - 解析失败 → 保持当前值、不动原文件（对齐 C# `DoRefresh` 捕获异常不改 Root）；
+    /// - 加载成功 → 替换当前值，缺失属性回写保存（如有）。
+    ///
+    /// 返回提示文本（空 = 未发生变化），供调用方写日志。
+    pub fn reload_if_changed(&mut self) -> Vec<String> {
+        let mut notes = Vec::new();
+        if !self.is_stale() {
+            return notes;
+        }
+        match std::fs::read_to_string(&self.path) {
+            Ok(text) => match parse_value(&text).and_then(|v| {
+                serde_json::from_value::<T>(v.clone())
+                    .map(|m| (m, v))
+                    .map_err(|e| ConfigError::Parse(e.to_string()))
+            }) {
+                Ok((model, file_value)) => {
+                    let canonical = serde_json::to_value(&model).unwrap_or(Value::Null);
+                    self.value = model;
+                    if !covers(&canonical, &file_value) {
+                        if let Ok(()) = save_value(&self.path, &self.value) {
+                            notes.push("已补齐缺失属性并保存".to_string());
+                        }
+                    }
+                    notes.push("检测到配置文件外部修改，已热加载".to_string());
+                }
+                Err(e) => {
+                    notes.push(format!("配置解析失败，保持当前值（未改动原文件）: {e}"));
+                }
+            },
+            Err(e) => notes.push(format!("配置读取失败，保持当前值: {e}")),
+        }
+        self.stamp = file_stamp(&self.path);
+        notes
     }
 
     /// 加载时文件是否不存在（对应 C# `IsNew`）。
@@ -436,6 +505,60 @@ mod tests {
             "关闭修复时不应改动原文件"
         );
         assert!(!backup_path(&path).exists(), "关闭修复时不应产生 .bak");
+    }
+
+    #[test]
+    fn reload_if_changed_hot_reload() {
+        let path = temp_path("reload");
+        let mut cfg = Config::<Demo>::load(&path);
+        assert!(!cfg.is_stale());
+
+        // 外部修改 → 热加载
+        std::fs::write(
+            &path,
+            r#"{"Name":"外部","Items":[{"Url":"u","Enabled":true}]}"#,
+        )
+        .unwrap();
+        assert!(cfg.is_stale());
+        let notes = cfg.reload_if_changed();
+        assert!(notes.iter().any(|n| n.contains("已热加载")));
+        assert_eq!(cfg.value().name, "外部");
+        assert!(!cfg.is_stale());
+
+        // 自身 save 后不应被当作“外部修改”
+        cfg.value_mut().name = "自改".into();
+        cfg.save().unwrap();
+        assert!(!cfg.is_stale());
+        assert!(cfg.reload_if_changed().is_empty());
+
+        // 损坏的外部修改：保持当前值、不动原文件、不产生 .bak
+        std::fs::write(&path, "{ 坏文件").unwrap();
+        let notes = cfg.reload_if_changed();
+        assert!(notes.iter().any(|n| n.contains("保持当前值")));
+        assert_eq!(cfg.value().name, "自改");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ 坏文件");
+        assert!(!backup_path(&path).exists());
+        assert!(!cfg.is_stale(), "失败后戳应同步，避免重复告警");
+    }
+
+    #[test]
+    fn from_value_tracks_external_change() {
+        let path = temp_path("fromval");
+        let mut cfg = Config::<Demo>::from_value(
+            &path,
+            Demo {
+                name: "初始".to_string(),
+                items: vec![],
+            },
+        );
+        assert!(!path.exists());
+        assert!(!cfg.is_stale(), "文件不存在不算外部修改");
+
+        std::fs::write(&path, r#"{"Name":"后来"}"#).unwrap();
+        assert!(cfg.is_stale());
+        let notes = cfg.reload_if_changed();
+        assert!(notes.iter().any(|n| n.contains("已热加载")));
+        assert_eq!(cfg.value().name, "后来");
     }
 
     #[test]
