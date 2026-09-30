@@ -35,8 +35,13 @@ pub fn set_color_enabled(enabled: bool) {
 
 /// 用 ANSI 颜色码着色（颜色不可用时原样返回）。
 pub fn paint(s: &str, code: u8) -> String {
+    paint_sgr(s, &code.to_string())
+}
+
+/// 用复合 SGR 参数着色（如 `2;34` 表示暗淡蓝；颜色不可用时原样返回）。
+pub fn paint_sgr(s: &str, sgr: &str) -> String {
     if color_enabled() {
-        format!("\x1b[{code}m{s}\x1b[0m")
+        format!("\x1b[{sgr}m{s}\x1b[0m")
     } else {
         s.to_string()
     }
@@ -45,6 +50,16 @@ pub fn paint(s: &str, code: u8) -> String {
 /// 暗灰（时间戳等次要信息）
 pub fn dim(s: &str) -> String {
     paint(s, 90)
+}
+
+/// 亮蓝（原始报文预览等高频行：与 SCAN 同亮度等级，色相区分）
+pub fn bright_blue(s: &str) -> String {
+    paint(s, 94)
+}
+
+/// 亮洋红（周期保活行，如设备心跳：与时间戳、信息青、连接绿均可区分）
+pub fn bright_magenta(s: &str) -> String {
+    paint(s, 95)
 }
 
 /// 红色（错误）
@@ -80,10 +95,14 @@ mod tests {
     fn paint_respects_switch() {
         set_color_enabled(false);
         assert_eq!(red("x"), "x");
+        assert_eq!(bright_blue("x"), "x");
+        assert_eq!(bright_magenta("x"), "x");
         assert!(!color_enabled());
 
         set_color_enabled(true);
         assert_eq!(red("x"), "\x1b[31mx\x1b[0m");
+        assert_eq!(bright_blue("x"), "\x1b[94mx\x1b[0m");
+        assert_eq!(bright_magenta("x"), "\x1b[95mx\x1b[0m");
         assert!(color_enabled());
     }
 }
