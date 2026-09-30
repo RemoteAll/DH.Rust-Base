@@ -4,6 +4,9 @@
 //! 推送至群机器人 Webhook 地址（`https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...`）。
 //!
 //! - 依赖 `http-client` 特性；企业微信线上地址为 `https`，需 `http-tls` 特性（`net-tls` 已包含）
+//! - 注意（官方文档）：`<font color="info|comment|warning">` 字体颜色仅 `markdown` 消息支持，
+//!   `markdown_v2` 不支持颜色与 @群成员
+//! - 注意（实测）：markdown 类消息在**微信端无法查看**（显示“不支持的内容”），需要全端可见时请用 [`WeComBot::send_text`]
 //! - 响应按 `errcode` 判定：0 成功；非 0（如 93000 无效 key）返回 [`WeComError`] 并附带 errmsg
 //! - 载荷构造与响应解析为纯函数（[`text_payload`] / [`markdown_payload`] / [`markdown_v2_payload`] /
 //!   [`parse_response`]），便于组合复用与单元测试
