@@ -1,6 +1,6 @@
-//! MQTT 客户端（协议 3.1 / 3.1.1 / 5.0）：连接认证 / QoS0·1 发布 / 保活心跳 / 断线自动重连。
+//! MQTT 客户端（协议 3.1 / 3.1.1 / 5.0）：连接认证 / QoS0·1 发布与订阅接收 / 保活心跳 / 断线自动重连。
 //!
-//! 面向“设备数据上行”的最小客户端（互通目标：NewLife.MQTT / DH.NMQTT 服务端——
+//! 面向“设备数据上行 + 回显下行”的最小客户端（互通目标：NewLife.MQTT / DH.NMQTT 服务端——
 //! 其 V310/V311/V500 三档均已支持；默认 3.1.1）。
 //! 特性门控 `feature = "mqtt"`（仅依赖 tokio，不含 TLS——对齐组织“明文局域网”现状）。
 //!
@@ -9,6 +9,9 @@
 //! - [`MqttClient::publish`] 在未连接时**快速失败**（Err），已连接时：
 //!   QoS0 写出即返回；QoS1 等待服务端 `PUBACK`（超时由调用方限定）——
 //!   调用方可据此把发布纳入“失败重试”的上层保障（如发件箱补发）；
+//! - [`MqttClient::subscribe`] 仅记录订阅意图并发送 SUBSCRIBE；**订阅跨断线持久**
+//!   （重连成功后自动全量恢复）；收到的订阅消息经 [`MqttClient::message_receiver`]
+//!   广播给应用层（QoS1 自动回 `PUBACK`，QoS2 防御性回 `PUBREC`）；
 //! - 连接状态变化通过 [`MqttClient::status`] / [`MqttClient::status_generation`] 暴露，
 //!   供调用方打日志（变化时 generation 自增）。
 
@@ -24,7 +27,7 @@ use std::{
 use tokio::{
     io::AsyncWriteExt,
     net::TcpStream,
-    sync::{mpsc, oneshot},
+    sync::{broadcast, mpsc, oneshot},
 };
 
 /// MQTT 协议版本（与服务端 NewLife.MQTT 的三档对齐；默认 3.1.1）。
@@ -127,6 +130,19 @@ impl Default for MqttOptions {
     }
 }
 
+/// 服务端下发的发布消息（订阅收到；`retain` 为订阅时推送的历史保留消息）。
+#[derive(Debug, Clone)]
+pub struct MqttMessage {
+    /// 主题
+    pub topic: String,
+    /// 载荷（原样字节）
+    pub payload: Vec<u8>,
+    /// 服务质量（0/1）
+    pub qos: u8,
+    /// 保留标志
+    pub retain: bool,
+}
+
 /// 共享状态（连接标志 / 状态文本 / 变化代数）。
 struct Shared {
     connected: AtomicBool,
@@ -152,6 +168,8 @@ enum Cmd {
         qos: u8,
         ack: oneshot::Sender<Result<(), String>>,
     },
+    /// 订阅主题（记录订阅意图；连接后与重连后自动发送 SUBSCRIBE）
+    Subscribe { topic: String, qos: u8 },
 }
 
 /// MQTT 客户端句柄。
@@ -161,6 +179,8 @@ enum Cmd {
 pub struct MqttClient {
     tx: mpsc::UnboundedSender<Cmd>,
     shared: Arc<Shared>,
+    /// 订阅消息广播端（由 [`Self::message_receiver`] 获取接收端）
+    messages: broadcast::Sender<MqttMessage>,
 }
 
 impl MqttClient {
@@ -172,8 +192,13 @@ impl MqttClient {
             generation: AtomicU64::new(0),
             status: Mutex::new("尚未连接".to_string()),
         });
-        tokio::spawn(supervisor(opts, rx, shared.clone()));
-        Self { tx, shared }
+        let (messages, _) = broadcast::channel(256);
+        tokio::spawn(supervisor(opts, rx, shared.clone(), messages.clone()));
+        Self {
+            tx,
+            shared,
+            messages,
+        }
     }
 
     /// 当前是否已连接（已完成 MQTT 握手）。
@@ -193,6 +218,34 @@ impl MqttClient {
     /// 状态变化代数（连接成功/断开/重连均自增；调用方对比前后值即可只在变化时打日志）。
     pub fn status_generation(&self) -> u64 {
         self.shared.generation.load(Ordering::Acquire)
+    }
+
+    /// 订阅消息接收端（广播；可在连接前获取）。
+    ///
+    /// 收到订阅主题的发布消息后广播给所有接收端；无接收端时消息直接丢弃。
+    pub fn message_receiver(&self) -> broadcast::Receiver<MqttMessage> {
+        self.messages.subscribe()
+    }
+
+    /// 记录订阅意图并请求订阅（重复主题自动去重）。
+    ///
+    /// 未连接时仅记录，连接（或重连）成功后自动补发 SUBSCRIBE——订阅跨断线持久；
+    /// 服务端确认（SUBACK）由后台任务处理，本方法立即返回。
+    pub fn subscribe(&self, topic: &str, qos: u8) -> Result<(), String> {
+        if qos > 1 {
+            return Err(format!("仅支持 QoS 0/1（收到 {qos}）"));
+        }
+        if topic.is_empty() {
+            return Err("主题不能为空".to_string());
+        }
+        let cmd = Cmd::Subscribe {
+            topic: topic.to_string(),
+            qos,
+        };
+        if self.tx.send(cmd).is_err() {
+            return Err("MQTT 后台任务已退出".to_string());
+        }
+        Ok(())
     }
 
     /// 发布一条消息。
@@ -237,13 +290,21 @@ impl MqttClient {
     }
 }
 
-/// 连接管理器：循环“建连 → 会话 → 断线等待重连”。
-async fn supervisor(opts: MqttOptions, mut rx: mpsc::UnboundedReceiver<Cmd>, shared: Arc<Shared>) {
+/// 连接管理器：循环“建连 → 会话 → 断线等待重连”；订阅集合跨重连保留。
+async fn supervisor(
+    opts: MqttOptions,
+    mut rx: mpsc::UnboundedReceiver<Cmd>,
+    shared: Arc<Shared>,
+    messages: broadcast::Sender<MqttMessage>,
+) {
+    // 订阅集合（去重）；服务端为 Clean Session，每次连接后全量重发恢复
+    let mut subs: Vec<(String, u8)> = Vec::new();
+
     loop {
         match connect_and_handshake(&opts).await {
             Ok(stream) => {
                 shared.set(true, format!("{}:{} 已连接", opts.host, opts.port));
-                session(stream, &mut rx, &opts).await;
+                session(stream, &mut rx, &opts, &mut subs, &messages).await;
                 shared.set(false, format!("{}:{} 连接已断开", opts.host, opts.port));
             }
             Err(e) => {
@@ -251,7 +312,7 @@ async fn supervisor(opts: MqttOptions, mut rx: mpsc::UnboundedReceiver<Cmd>, sha
             }
         }
 
-        // 重连等待：期间到达的发布直接回错误（未连接语义），通道关闭则退出
+        // 重连等待：期间到达的发布直接回错误（未连接语义）、订阅仅记录，通道关闭则退出
         let wait = opts.reconnect.max(Duration::from_millis(50));
         let deadline = tokio::time::Instant::now() + wait;
         loop {
@@ -262,9 +323,17 @@ async fn supervisor(opts: MqttOptions, mut rx: mpsc::UnboundedReceiver<Cmd>, sha
                     Some(Cmd::Publish { ack, .. }) => {
                         let _ = ack.send(Err("MQTT 未连接（等待重连）".to_string()));
                     }
+                    Some(Cmd::Subscribe { topic, qos }) => record_subscription(&mut subs, &topic, qos),
                 },
             }
         }
+    }
+}
+
+/// 记录订阅（去重；已存在则不重复）。
+fn record_subscription(subs: &mut Vec<(String, u8)>, topic: &str, qos: u8) {
+    if !subs.iter().any(|(t, _)| t == topic) {
+        subs.push((topic.to_string(), qos));
     }
 }
 
@@ -298,11 +367,18 @@ async fn connect_and_handshake(opts: &MqttOptions) -> Result<TcpStream, String> 
     Ok(stream)
 }
 
-/// 单次连接上的会话循环：处理发布命令、服务端报文与保活心跳；返回即断开。
+/// 单次连接上的会话循环：处理发布/订阅命令、服务端报文与保活心跳；返回即断开。
 ///
-/// 读写半部分离：写半部专职发送（发布/PINGREQ），读半部专职接收
-/// （PUBACK 按 packet id 唤醒对应发布，PINGRESP/服务端踢出等在此识别）。
-async fn session(stream: TcpStream, rx: &mut mpsc::UnboundedReceiver<Cmd>, opts: &MqttOptions) {
+/// 读写半部分离：写半部专职发送（发布/订阅/PINGREQ/回执），读半部专职接收
+/// （PUBACK 按 packet id 唤醒对应发布；订阅下发的 PUBLISH 广播给应用层；PINGRESP/服务端踢出等在此识别）。
+/// 订阅集合跨重连保留（见 [`supervisor`]）：连接（或重连）成功后全量重发 SUBSCRIBE。
+async fn session(
+    stream: TcpStream,
+    rx: &mut mpsc::UnboundedReceiver<Cmd>,
+    opts: &MqttOptions,
+    subs: &mut Vec<(String, u8)>,
+    messages: &broadcast::Sender<MqttMessage>,
+) {
     let (mut rd, mut wr) = tokio::io::split(stream);
 
     // 保活：每 keepalive 周期发送一次 PINGREQ（首 tick 跳过）
@@ -314,6 +390,14 @@ async fn session(stream: TcpStream, rx: &mut mpsc::UnboundedReceiver<Cmd>, opts:
         t.tick().await;
         Some(t)
     };
+
+    // 连接（或重连）成功：全量恢复订阅（服务端 Clean Session 不保留订阅关系）
+    for (topic, qos) in subs.iter() {
+        let id = next_packet_id();
+        if wr.write_all(&codec::encode_subscribe(id, topic, *qos, opts.version)).await.is_err() {
+            return;
+        }
+    }
 
     // 等待 PUBACK 的发布（packet id → 结果回调）
     let mut pending: HashMap<u16, oneshot::Sender<Result<(), String>>> = HashMap::new();
@@ -337,6 +421,16 @@ async fn session(stream: TcpStream, rx: &mut mpsc::UnboundedReceiver<Cmd>, opts:
                         pending.insert(id, ack);
                     }
                 }
+                Some(Cmd::Subscribe { topic, qos }) => {
+                    // 已订阅过的主题不重复发送（订阅集合跨重连保留、会话开始时已全量恢复）
+                    if !subs.iter().any(|(t, _)| t == &topic) {
+                        subs.push((topic.clone(), qos));
+                        let id = next_packet_id();
+                        if wr.write_all(&codec::encode_subscribe(id, &topic, qos, opts.version)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
             },
             packet = codec::read_packet(&mut rd) => match packet {
                 Ok((first, data)) => match codec::packet_type(first) {
@@ -347,9 +441,45 @@ async fn session(stream: TcpStream, rx: &mut mpsc::UnboundedReceiver<Cmd>, opts:
                             }
                         }
                     }
+                    codec::SUBACK => {} // 订阅确认（无需处理）
                     codec::PINGRESP => {}
-                    // 未订阅主题：忽略服务端下发的发布消息（预留订阅能力）
-                    codec::PUBLISH => {}
+                    codec::PUBLISH => {
+                        // 订阅下发的发布消息：QoS1 回 PUBACK、QoS2 防御性回 PUBREC；随后广播给应用层
+                        if let Some(msg) = codec::parse_publish(first, &data, opts.version) {
+                            match msg.qos {
+                                1 => {
+                                    if let Some(id) = msg.packet_id {
+                                        if wr.write_all(&codec::encode_ack(codec::PUBACK, id)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                                2 => {
+                                    // 本客户端订阅上限 QoS1，正常不会收到 QoS2；防御性回执避免服务端重发
+                                    if let Some(id) = msg.packet_id {
+                                        if wr.write_all(&codec::encode_ack(codec::PUBREC, id)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                            let _ = messages.send(MqttMessage {
+                                topic: msg.topic,
+                                payload: msg.payload,
+                                qos: msg.qos,
+                                retain: msg.retain,
+                            });
+                        }
+                    }
+                    codec::PUBREL => {
+                        // QoS2 放行：回 PUBCOMP（防御性；订阅上限 QoS1 时不会出现）
+                        if let Some(id) = codec::parse_puback(&data) {
+                            if wr.write_all(&codec::encode_ack(codec::PUBCOMP, id)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
                     // 服务端主动断开（如会话被顶替）
                     codec::DISCONNECT => break,
                     _ => {}
@@ -399,6 +529,14 @@ pub(crate) mod codec {
     pub const PUBLISH: u8 = 3;
     /// 报文类型（PUBACK）
     pub const PUBACK: u8 = 4;
+    /// 报文类型（PUBREC）
+    pub const PUBREC: u8 = 5;
+    /// 报文类型（PUBREL）
+    pub const PUBREL: u8 = 6;
+    /// 报文类型（PUBCOMP）
+    pub const PUBCOMP: u8 = 7;
+    /// 报文类型（SUBACK）
+    pub const SUBACK: u8 = 9;
     /// 报文类型（PINGRESP）
     pub const PINGRESP: u8 = 13;
     /// 报文类型（DISCONNECT）
@@ -504,6 +642,110 @@ pub(crate) mod codec {
     /// 解析 PUBACK 的报文 id。
     pub fn parse_puback(data: &[u8]) -> Option<u16> {
         (data.len() >= 2).then(|| u16::from_be_bytes([data[0], data[1]]))
+    }
+
+    /// 变长整数解码：返回（值, 占用字节数）。
+    fn decode_variable_len(data: &[u8]) -> Option<(usize, usize)> {
+        let mut value = 0usize;
+        let mut multiplier = 1usize;
+        for (i, b) in data.iter().enumerate() {
+            value += (b & 0x7F) as usize * multiplier;
+            if b & 0x80 == 0 {
+                return Some((value, i + 1));
+            }
+            multiplier *= 128;
+            if multiplier > 128 * 128 * 128 {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// 编码 SUBSCRIBE（固定头 0x82；正文 = 报文 id +（5.0 空属性）+ 主题过滤器 + 订阅选项字节）。
+    pub fn encode_subscribe(packet_id: u16, topic: &str, qos: u8, version: MqttVersion) -> Vec<u8> {
+        let mut body = Vec::with_capacity(topic.len() + 8);
+        body.extend_from_slice(&packet_id.to_be_bytes());
+        if version.has_properties() {
+            // 5.0：订阅属性长度 = 0（无属性）
+            body.push(0x00);
+        }
+        encode_string(&mut body, topic);
+        body.push(qos & 0x03);
+
+        let mut out = Vec::with_capacity(body.len() + 6);
+        out.push(0x82); // SUBSCRIBE（固定头标志位必须为 0b0010）
+        encode_remaining_length(&mut out, body.len());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// 编码确认类报文（PUBACK/PUBREC/PUBREL/PUBCOMP：高 4 位报文类型，正文 = 2 字节报文 id）。
+    pub fn encode_ack(packet_type: u8, packet_id: u16) -> Vec<u8> {
+        vec![
+            packet_type << 4,
+            0x02,
+            (packet_id >> 8) as u8,
+            packet_id as u8,
+        ]
+    }
+
+    /// 入站 PUBLISH 解析结果。
+    #[derive(Debug, Clone)]
+    pub struct InboundPublish {
+        /// 主题
+        pub topic: String,
+        /// 载荷
+        pub payload: Vec<u8>,
+        /// 服务质量（0/1/2）
+        pub qos: u8,
+        /// 保留标志
+        pub retain: bool,
+        /// 报文 id（QoS>0 时存在）
+        pub packet_id: Option<u16>,
+    }
+
+    /// 解析入站 PUBLISH（`first` 为固定头首字节：含 QoS 与 Retain 标志；5.0 跳过属性区）。
+    pub fn parse_publish(first: u8, data: &[u8], version: MqttVersion) -> Option<InboundPublish> {
+        if data.len() < 2 {
+            return None;
+        }
+        let qos = (first >> 1) & 0x03;
+        let retain = first & 0x01 == 1;
+
+        let tlen = u16::from_be_bytes([data[0], data[1]]) as usize;
+        if data.len() < 2 + tlen {
+            return None;
+        }
+        let topic = String::from_utf8_lossy(&data[2..2 + tlen]).into_owned();
+        let mut pos = 2 + tlen;
+
+        let packet_id = if qos > 0 {
+            if data.len() < pos + 2 {
+                return None;
+            }
+            let id = u16::from_be_bytes([data[pos], data[pos + 1]]);
+            pos += 2;
+            Some(id)
+        } else {
+            None
+        };
+
+        if version.has_properties() {
+            // 5.0：跳过属性区（长度前缀为变长整数）
+            let (plen, used) = decode_variable_len(data.get(pos..)?)?;
+            pos += used + plen;
+            if data.len() < pos {
+                return None;
+            }
+        }
+
+        Some(InboundPublish {
+            topic,
+            payload: data[pos..].to_vec(),
+            qos,
+            retain,
+            packet_id,
+        })
     }
 
     /// 读取一个完整报文：返回 `(固定头首字节, 正文)`。
@@ -820,5 +1062,144 @@ mod tests {
             .expect("等 PINGREQ 超时")
             .unwrap();
         assert!(pings >= 1, "至少应收到一次 PINGREQ，实际 {pings}");
+    }
+
+    #[test]
+    fn encode_subscribe_and_ack_bytes() {
+        // SUBSCRIBE：固定头 0x82 + id + 主题过滤器 + QoS 字节
+        let packet = codec::encode_subscribe(7, "t", 1, MqttVersion::V311);
+        assert_eq!(
+            packet,
+            [0x82, 0x06, 0x00, 0x07, 0x00, 0x01, b't', 0x01].to_vec()
+        );
+        // 5.0：报文 id 后插空属性长度
+        let packet = codec::encode_subscribe(7, "t", 1, MqttVersion::V500);
+        assert_eq!(
+            packet,
+            [0x82, 0x07, 0x00, 0x07, 0x00, 0x00, 0x01, b't', 0x01].to_vec()
+        );
+
+        // 回执报文
+        assert_eq!(codec::encode_ack(codec::PUBACK, 9), vec![0x40, 0x02, 0x00, 0x09]);
+        assert_eq!(codec::encode_ack(codec::PUBREC, 9), vec![0x50, 0x02, 0x00, 0x09]);
+        assert_eq!(codec::encode_ack(codec::PUBCOMP, 9), vec![0x70, 0x02, 0x00, 0x09]);
+    }
+
+    #[test]
+    fn parse_publish_variants() {
+        // QoS0：主题 + 载荷；无报文 id
+        let data = [0x00, 0x01, b't', b'h', b'i'];
+        let msg = codec::parse_publish(0x30, &data, MqttVersion::V311).unwrap();
+        assert_eq!(msg.topic, "t");
+        assert_eq!(msg.payload, b"hi");
+        assert_eq!(msg.qos, 0);
+        assert!(!msg.retain);
+        assert_eq!(msg.packet_id, None);
+
+        // QoS1：主题后含报文 id
+        let data = [0x00, 0x01, b't', 0x00, 0x07, b'h', b'i'];
+        let msg = codec::parse_publish(0x32, &data, MqttVersion::V311).unwrap();
+        assert_eq!(msg.packet_id, Some(7));
+        assert_eq!(msg.qos, 1);
+
+        // Retain 标志（首字节 bit0）
+        let data = [0x00, 0x01, b't', b'x'];
+        let msg = codec::parse_publish(0x31, &data, MqttVersion::V311).unwrap();
+        assert!(msg.retain);
+
+        // 5.0：报文 id 之后为属性长度（0 = 无属性），载荷在属性区之后
+        let data = [0x00, 0x01, b't', 0x00, 0x07, 0x00, b'h', b'i'];
+        let msg = codec::parse_publish(0x32, &data, MqttVersion::V500).unwrap();
+        assert_eq!(msg.packet_id, Some(7));
+        assert_eq!(msg.payload, b"hi");
+
+        // 截断数据：返回 None
+        assert!(codec::parse_publish(0x32, &[0x00, 0x01, b't'], MqttVersion::V311).is_none());
+    }
+
+    #[tokio::test]
+    async fn subscribe_receives_publish_and_acks() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let broker = tokio::spawn(async move {
+            let mut sock = broker_accept(&listener).await;
+            // 期望 SUBSCRIBE：主题 "t"、QoS1
+            let (first, data) = codec::read_packet(&mut sock).await.unwrap();
+            assert_eq!(first, 0x82, "应发送 SUBSCRIBE");
+            let id = u16::from_be_bytes([data[0], data[1]]);
+            let tlen = u16::from_be_bytes([data[2], data[3]]) as usize;
+            assert_eq!(&data[4..4 + tlen], b"t");
+            sock.write_all(&[0x90, 0x03, (id >> 8) as u8, id as u8, 0x01])
+                .await
+                .unwrap(); // SUBACK
+
+            // 服务端下发 QoS1 发布（id=9）
+            sock.write_all(&codec::encode_publish("t", b"hi", 1, 9, MqttVersion::V311))
+                .await
+                .unwrap();
+            // 期望客户端回 PUBACK(id=9)
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let (first, data) = tokio::time::timeout(left, codec::read_packet(&mut sock))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if codec::packet_type(first) == codec::PUBACK {
+                    assert_eq!(codec::parse_puback(&data), Some(9));
+                    break;
+                }
+            }
+        });
+
+        let client = MqttClient::spawn(test_opts(port));
+        let mut rx = client.message_receiver();
+        assert!(wait_connected(&client, Duration::from_secs(5)).await, "首连失败：{}", client.status());
+        client.subscribe("t", 1).unwrap();
+
+        let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("未收到订阅消息")
+            .unwrap();
+        assert_eq!(msg.topic, "t");
+        assert_eq!(msg.payload, b"hi");
+        assert_eq!(msg.qos, 1);
+
+        tokio::time::timeout(Duration::from_secs(5), broker)
+            .await
+            .expect("等 PUBACK 超时")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscription_survives_reconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let broker = tokio::spawn(async move {
+            // 第一段：收 SUBSCRIBE 后断开
+            let mut sock = broker_accept(&listener).await;
+            let (first, _data) = codec::read_packet(&mut sock).await.unwrap();
+            assert_eq!(first, 0x82);
+            drop(sock);
+
+            // 第二段：重连后应自动恢复订阅（再次收到 SUBSCRIBE）
+            let mut sock2 = broker_accept(&listener).await;
+            let (first, data) = codec::read_packet(&mut sock2).await.unwrap();
+            assert_eq!(first, 0x82, "重连后应自动恢复订阅");
+            let tlen = u16::from_be_bytes([data[2], data[3]]) as usize;
+            String::from_utf8_lossy(&data[4..4 + tlen]).into_owned()
+        });
+
+        let client = MqttClient::spawn(test_opts(port));
+        assert!(wait_connected(&client, Duration::from_secs(5)).await);
+        client.subscribe("re", 1).unwrap();
+
+        let topic = tokio::time::timeout(Duration::from_secs(10), broker)
+            .await
+            .expect("重连未发生")
+            .unwrap();
+        assert_eq!(topic, "re");
     }
 }
