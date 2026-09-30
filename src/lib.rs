@@ -11,4 +11,4 @@ pub mod zip; // 极简 ZIP 打包器（store 法；内存 + 流式落盘两种�
 #[cfg(feature = "razor")]
 pub mod razor; // Razor 子集模板引擎（方案 C）：同一份 .cshtml 双端渲染
 
-pub mod net; // 网络模块（基础：本机 IP；net/stun/net-tls 特性扩展 HTTP/WS/RPC/TLS/STUN）
+pub mod net; // 网络模块（基础：本机 IP + 字节流分帧；http-client/net/stun/net-tls 特性扩展 HTTP/WS/RPC/TLS/STUN）

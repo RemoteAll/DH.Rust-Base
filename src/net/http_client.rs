@@ -3,11 +3,12 @@
 //! 用途：Agent 间 HTTP 调用（跨节点文件拉取 `Fetch*Transfer*`、部署包中转下载校验等），
 //! 对齐 C# 侧 `HttpClient` + `ServerCertificateCustomValidationCallback`（忽略自签证书）能力。
 //!
-//! - [`get`] / [`post_form`]：全量响应（小响应、JSON 错误体解析）
+//! - [`get`] / [`post_form`] / [`request`]：全量响应（小响应、JSON 错误体解析；
+//!   `request` 支持任意方法/自定义请求头与 Content-Type/原始请求体，供配置驱动转发场景）
 //! - [`download_to_file`]：流式落盘（大文件/大包，不驻留内存）
 //! - `insecure_tls`：忽略服务器证书校验（服务器间自签证书部署场景必需）
 //!
-//! 依赖：`net` 特性（hyper client + tokio）；`https` 需 `net-tls` 特性（rustls）。
+//! 依赖：`http-client` 特性（hyper client + tokio；`net` 特性自动包含）；`https` 需 `net-tls` 特性（rustls）。
 
 use std::path::Path;
 use std::time::Duration;
@@ -182,6 +183,31 @@ pub async fn post_form(
         options,
     )
     .await
+}
+
+/// 通用请求：任意 HTTP 方法、自定义请求头与 Content-Type、原始请求体（全量响应）。
+///
+/// 供“方法/请求头/请求体模板均可配置”的转发场景使用（如 tcp-scanner-server 的 WMS 上报）。
+pub async fn request(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    content_type: Option<&str>,
+    body: Vec<u8>,
+    options: &HttpClientOptions,
+) -> Result<HttpResponse, HttpClientError> {
+    execute(parse_method(method)?, url, headers, content_type, body, options).await
+}
+
+/// 校验 HTTP 方法是否合法（配置加载时快速失败；不发起请求）。
+pub fn validate_method(method: &str) -> Result<(), HttpClientError> {
+    parse_method(method).map(|_| ())
+}
+
+/// 解析 HTTP 方法名（`GET`/`POST`/`PUT` 等，含自定义扩展方法）。
+fn parse_method(method: &str) -> Result<Method, HttpClientError> {
+    Method::from_bytes(method.trim().as_bytes())
+        .map_err(|e| HttpClientError::new(format!("无效的 HTTP 方法 \"{method}\"：{e}")))
 }
 
 /// GET 请求流式落盘（2xx 时写目标文件；非 2xx 回读错误体）。
@@ -683,6 +709,45 @@ mod tests {
         assert!(head.contains("application/x-www-form-urlencoded"));
         assert!(body.contains("path=C%3A%5Cdata%20%E7%9B%AE%E5%BD%95"));
         assert!(body.contains("offset=0"));
+    }
+
+    #[tokio::test]
+    async fn request_custom_method_headers_and_body() {
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let port = spawn_mock_server(
+            "HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok",
+            captured.clone(),
+        )
+        .await;
+        let resp = request(
+            "PUT",
+            &format!("http://127.0.0.1:{port}/Api/V1/Order/SetBarcode"),
+            &[("X-Device", "packing-3")],
+            Some("application/json"),
+            br#"{"barcode":"HLT01"}"#.to_vec(),
+            &HttpClientOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status, 201);
+        assert!(resp.is_success());
+
+        let req = captured.lock().await.clone();
+        assert!(req.starts_with("PUT /Api/V1/Order/SetBarcode HTTP/1.1"), "请求行：{req}");
+        // hyper 会把请求头名规范为小写；服务端侧统一按大小写不敏感读取
+        let req_lower = req.to_lowercase();
+        assert!(req_lower.contains("content-type: application/json"));
+        assert!(req_lower.contains("x-device: packing-3"));
+        assert!(req.ends_with(r#"{"barcode":"HLT01"}"#), "请求体：{req}");
+    }
+
+    #[test]
+    fn validate_method_accepts_tokens_rejects_junk() {
+        assert!(validate_method("POST").is_ok());
+        assert!(validate_method(" put ").is_ok());
+        assert!(validate_method("PROPFIND").is_ok());
+        assert!(validate_method("GE T").is_err());
+        assert!(validate_method("中文").is_err());
     }
 
     #[tokio::test]

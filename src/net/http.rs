@@ -214,6 +214,16 @@ type ServerTlsAcceptor = tokio_rustls::TlsAcceptor;
 #[cfg(not(feature = "net-tls"))]
 type ServerTlsAcceptor = ();
 
+/// 克隆 TLS 接受器引用（无 `net-tls` 特性时为占位类型，恒为 None，无需克隆）。
+#[cfg(feature = "net-tls")]
+fn clone_tls(tls: &Option<ServerTlsAcceptor>) -> Option<ServerTlsAcceptor> {
+    tls.clone()
+}
+#[cfg(not(feature = "net-tls"))]
+fn clone_tls(_tls: &Option<ServerTlsAcceptor>) -> Option<ServerTlsAcceptor> {
+    None
+}
+
 pub struct HttpServer {
     listener: TcpListener,
     tls: Option<ServerTlsAcceptor>,
@@ -267,7 +277,7 @@ impl HttpServer {
                 options.conn_shards,
                 handler.clone(),
                 options.clone(),
-                self.tls.clone(),
+                clone_tls(&self.tls),
             ))
         } else {
             None
@@ -278,7 +288,7 @@ impl HttpServer {
             let _ = tcp.set_nodelay(true);
             let handler = handler.clone();
             let options = options.clone();
-            let tls = self.tls.clone();
+            let tls = clone_tls(&self.tls);
             if options.thread_per_connection {
                 // 每连接独立线程（current_thread 运行时）：数据到达直接唤醒本线程
                 // 处理（对齐 NewLife/IOCP 完成线程直处理模型）；基准实测回环乒乓
@@ -348,7 +358,7 @@ impl ShardPool {
             senders.push(tx);
             let handler = handler.clone();
             let options = options.clone();
-            let tls = tls.clone();
+            let tls = clone_tls(&tls);
             let _ = std::thread::Builder::new()
                 .name(format!("dhrust-shard-{i}"))
                 .spawn(move || {
@@ -366,7 +376,7 @@ impl ShardPool {
                                 let _ = std_tcp.set_nonblocking(true);
                                 let handler = handler.clone();
                                 let options = options.clone();
-                                let tls = tls.clone();
+                                let tls = clone_tls(&tls);
                                 tokio::spawn(async move {
                                     if let Ok(tcp) = TcpStream::from_std(std_tcp) {
                                         run_connection(tcp, tls, handler, options).await;

@@ -1,7 +1,8 @@
-//! 网络模块：基础能力无条件可用（仅依赖标准库）；`net`/`stun`/`net-tls` 特性扩展 HTTP/WS/RPC/STUN。
+//! 网络模块：基础能力无条件可用（仅依赖标准库）；`http-client`/`net`/`stun`/`net-tls` 特性扩展 HTTP/WS/RPC/STUN。
 //!
 //! 基础：
 //! - [`my_ip`]：本机首选局域网 IPv4 地址（UDP 出口路由法；对应 DH.NCore `NetHelper.MyIP()`）。
+//! - [`framing`]：字节流分帧器（终结符切分/保活串剥除/超长保护/空闲结算；tcp-scanner-server 现场实践收编）。
 //!
 //! `net`（网络内核，DHDeploy.Agent Rust 迁移；选型依据迁移文档《网络层选型复核》，
 //! DHDeploy 仓库 `Doc/`；两条件闸门已通过并锁定）：
@@ -22,7 +23,7 @@
 
 #[cfg(feature = "net")]
 pub mod http;
-#[cfg(feature = "net")]
+#[cfg(feature = "http-client")]
 pub mod http_client;
 #[cfg(feature = "net")]
 pub mod router;
@@ -36,6 +37,9 @@ pub mod tls;
 pub mod ws;
 
 // ———— 基础能力（零依赖，无条件可用）————
+
+/// 字节流分帧（终结符切分 + 保活串剥除 + 超长保护 + 空闲结算；tcp-scanner-server 实践沉淀收编）。
+pub mod framing;
 
 /// 获取本机首选的局域网 IPv4 地址（对应 DH.NCore `NetHelper.MyIP()`）。
 ///
