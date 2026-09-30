@@ -1,7 +1,7 @@
-//! MQTT 3.1.1 客户端：连接认证 / QoS0·1 发布 / 保活心跳 / 断线自动重连。
+//! MQTT 客户端（协议 3.1 / 3.1.1 / 5.0）：连接认证 / QoS0·1 发布 / 保活心跳 / 断线自动重连。
 //!
-//! 面向“设备数据上行”的最小客户端（互通目标：NewLife.MQTT / DH.NMQTT 服务端；
-//! 来源：tcp-scanner-server 对接 WMSMqttServer 现场收编）。
+//! 面向“设备数据上行”的最小客户端（互通目标：NewLife.MQTT / DH.NMQTT 服务端——
+//! 其 V310/V311/V500 三档均已支持；默认 3.1.1）。
 //! 特性门控 `feature = "mqtt"`（仅依赖 tokio，不含 TLS——对齐组织“明文局域网”现状）。
 //!
 //! 行为约定：
@@ -27,6 +27,67 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
+/// MQTT 协议版本（与服务端 NewLife.MQTT 的三档对齐；默认 3.1.1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MqttVersion {
+    /// MQTT 3.1（协议名 `MQIsdp`，协议级别 3；客户端标识惯例限 23 字节）
+    V310,
+    /// MQTT 3.1.1（默认，最广泛兼容）
+    #[default]
+    V311,
+    /// MQTT 5.0（报文含属性字段；本客户端发送空属性）
+    V500,
+}
+
+impl MqttVersion {
+    /// 协议名（3.1 为 `MQIsdp`，其余为 `MQTT`）。
+    /// <returns>协议名</returns>
+    pub fn protocol_name(self) -> &'static str {
+        match self {
+            Self::V310 => "MQIsdp",
+            _ => "MQTT",
+        }
+    }
+
+    /// 协议级别数字（3 / 4 / 5）。
+    /// <returns>协议级别</returns>
+    pub fn level(self) -> u8 {
+        match self {
+            Self::V310 => 3,
+            Self::V311 => 4,
+            Self::V500 => 5,
+        }
+    }
+
+    /// 是否 5.0 及以上（CONNECT/PUBLISH 含属性字段）。
+    /// <returns>是否带属性</returns>
+    pub fn has_properties(self) -> bool {
+        matches!(self, Self::V500)
+    }
+
+    /// 解析版本文本（支持 `3.1` / `3.1.1` / `5.0`，宽容常见写法）。
+    /// <param name="text">版本文本</param>
+    /// <returns>版本；无法识别时为 None</returns>
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "3.1" | "310" | "v310" => Some(Self::V310),
+            "3.1.1" | "311" | "v311" | "4" => Some(Self::V311),
+            "5" | "5.0" | "500" | "v500" => Some(Self::V500),
+            _ => None,
+        }
+    }
+
+    /// 版本名称（`3.1` / `3.1.1` / `5.0`）。
+    /// <returns>名称</returns>
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::V310 => "3.1",
+            Self::V311 => "3.1.1",
+            Self::V500 => "5.0",
+        }
+    }
+}
+
 /// 连接参数。
 #[derive(Debug, Clone)]
 pub struct MqttOptions {
@@ -34,6 +95,8 @@ pub struct MqttOptions {
     pub host: String,
     /// 服务端端口（MQTT 默认 1883）
     pub port: u16,
+    /// 协议版本（默认 3.1.1）
+    pub version: MqttVersion,
     /// 客户端标识（空时按进程自动生成）
     pub client_id: String,
     /// 用户名（空串表示不带用户名）
@@ -53,6 +116,7 @@ impl Default for MqttOptions {
         Self {
             host: "127.0.0.1".into(),
             port: 1883,
+            version: MqttVersion::default(),
             client_id: String::new(),
             username: String::new(),
             password: String::new(),
@@ -261,7 +325,7 @@ async fn session(stream: TcpStream, rx: &mut mpsc::UnboundedReceiver<Cmd>, opts:
                 None => break,
                 Some(Cmd::Publish { topic, payload, qos, ack }) => {
                     let id = next_packet_id();
-                    let packet = codec::encode_publish(&topic, &payload, qos, id);
+                    let packet = codec::encode_publish(&topic, &payload, qos, id, opts.version);
                     if let Err(e) = wr.write_all(&packet).await {
                         let _ = ack.send(Err(format!("发送失败：{e}")));
                         break;
@@ -327,7 +391,7 @@ fn next_packet_id() -> u16 {
 pub(crate) mod codec {
     use tokio::io::{AsyncRead, AsyncReadExt};
 
-    use super::MqttOptions;
+    use super::{MqttOptions, MqttVersion};
 
     /// 报文类型（CONNACK）
     pub const CONNACK: u8 = 2;
@@ -369,15 +433,16 @@ pub(crate) mod codec {
         out.extend_from_slice(s.as_bytes());
     }
 
-    /// 编码 CONNECT（协议名 MQTT / 版本 4 / clean session / 可选用户名密码 / keepalive 秒）。
+    /// 编码 CONNECT（协议名/级别按 [`MqttVersion`]；3.1.1 与 5.0 可选用户名密码；keepalive 秒）。
     pub fn encode_connect(opts: &MqttOptions) -> Vec<u8> {
+        let version = opts.version;
         let client_id = if opts.client_id.is_empty() {
             format!("dhrust-{}", std::process::id())
         } else {
             opts.client_id.clone()
         };
 
-        let mut flags = 0x02u8; // Clean Session
+        let mut flags = 0x02u8; // Clean Session / Clean Start
         if !opts.username.is_empty() {
             flags |= 0x80;
         }
@@ -387,10 +452,14 @@ pub(crate) mod codec {
         let keepalive = opts.keepalive.as_secs().min(u16::MAX as u64) as u16;
 
         let mut body = Vec::with_capacity(64);
-        encode_string(&mut body, "MQTT"); // 协议名
-        body.push(4); // 协议版本 3.1.1
+        encode_string(&mut body, version.protocol_name());
+        body.push(version.level());
         body.push(flags);
         body.extend_from_slice(&keepalive.to_be_bytes());
+        if version.has_properties() {
+            // 5.0：连接属性长度 = 0（无属性）
+            body.push(0x00);
+        }
         encode_string(&mut body, &client_id);
         if !opts.username.is_empty() {
             encode_string(&mut body, &opts.username);
@@ -406,12 +475,22 @@ pub(crate) mod codec {
         out
     }
 
-    /// 编码 PUBLISH（QoS0 不含报文 id；QoS1 含 2 字节 id）。
-    pub fn encode_publish(topic: &str, payload: &[u8], qos: u8, packet_id: u16) -> Vec<u8> {
+    /// 编码 PUBLISH（QoS0 不含报文 id；QoS1 含 2 字节 id；5.0 含空属性长度）。
+    pub fn encode_publish(
+        topic: &str,
+        payload: &[u8],
+        qos: u8,
+        packet_id: u16,
+        version: MqttVersion,
+    ) -> Vec<u8> {
         let mut body = Vec::with_capacity(topic.len() + payload.len() + 8);
         encode_string(&mut body, topic);
         if qos > 0 {
             body.extend_from_slice(&packet_id.to_be_bytes());
+        }
+        if version.has_properties() {
+            // 5.0：发布属性长度 = 0（无属性）
+            body.push(0x00);
         }
         body.extend_from_slice(payload);
 
@@ -474,6 +553,7 @@ mod tests {
         MqttOptions {
             host: "127.0.0.1".into(),
             port,
+            version: MqttVersion::default(),
             client_id: "test-client".into(),
             username: "u".into(),
             password: "p".into(),
@@ -561,18 +641,76 @@ mod tests {
     #[test]
     fn encode_publish_qos_variants() {
         // QoS1：含 2 字节报文 id
-        let packet = codec::encode_publish("t", b"hi", 1, 7);
+        let packet = codec::encode_publish("t", b"hi", 1, 7, MqttVersion::V311);
         assert_eq!(
             packet,
             [0x32, 0x07, 0x00, 0x01, b't', 0x00, 0x07, b'h', b'i'].to_vec()
         );
 
         // QoS0：无报文 id
-        let packet = codec::encode_publish("t", b"hi", 0, 0);
+        let packet = codec::encode_publish("t", b"hi", 0, 0, MqttVersion::V311);
         assert_eq!(packet, [0x30, 0x05, 0x00, 0x01, b't', b'h', b'i'].to_vec());
+
+        // 5.0：报文 id（或主题）之后含空属性长度
+        let packet = codec::encode_publish("t", b"hi", 1, 7, MqttVersion::V500);
+        assert_eq!(
+            packet,
+            [0x32, 0x08, 0x00, 0x01, b't', 0x00, 0x07, 0x00, b'h', b'i'].to_vec()
+        );
+        let packet = codec::encode_publish("t", b"hi", 0, 0, MqttVersion::V500);
+        assert_eq!(
+            packet,
+            [0x30, 0x06, 0x00, 0x01, b't', 0x00, b'h', b'i'].to_vec()
+        );
 
         assert_eq!(codec::parse_puback(&[0x00, 0x07]), Some(7));
         assert_eq!(codec::parse_puback(&[0x00]), None);
+    }
+
+    #[test]
+    fn version_parse_and_connect_variants() {
+        // 版本解析与属性
+        assert_eq!(MqttVersion::parse("3.1"), Some(MqttVersion::V310));
+        assert_eq!(MqttVersion::parse("3.1.1"), Some(MqttVersion::V311));
+        assert_eq!(MqttVersion::parse("5.0"), Some(MqttVersion::V500));
+        assert_eq!(MqttVersion::parse("v500"), Some(MqttVersion::V500));
+        assert_eq!(MqttVersion::parse("4"), Some(MqttVersion::V311));
+        assert_eq!(MqttVersion::parse("bogus"), None);
+        assert_eq!(MqttVersion::default(), MqttVersion::V311);
+        assert_eq!(MqttVersion::V500.name(), "5.0");
+        assert!(MqttVersion::V500.has_properties());
+        assert!(!MqttVersion::V311.has_properties());
+        assert_eq!(MqttVersion::V310.protocol_name(), "MQIsdp");
+        assert_eq!(MqttVersion::V311.protocol_name(), "MQTT");
+
+        let options = |version: MqttVersion| MqttOptions {
+            client_id: "abc".into(),
+            username: "u".into(),
+            password: "p".into(),
+            keepalive: Duration::from_secs(60),
+            version,
+            ..Default::default()
+        };
+
+        // 3.1：协议名 MQIsdp（0x00 0x06）+ 级别 3
+        let packet = codec::encode_connect(&options(MqttVersion::V310));
+        assert_eq!(packet[0], 0x10);
+        assert_eq!(packet[1], 0x17, "剩余长度 23（协议名多 2 字节）");
+        assert_eq!(&packet[2..10], b"\x00\x06MQIsdp");
+        assert_eq!(packet[10], 3, "协议级别 3");
+        assert_eq!(packet[11], 0xC2, "connect flags");
+        assert_eq!(&packet[12..14], &[0x00, 0x3C], "keepalive 60");
+        assert_eq!(&packet[14..19], b"\x00\x03abc");
+
+        // 5.0：级别 5 + 空属性长度（keepalive 后）
+        let packet = codec::encode_connect(&options(MqttVersion::V500));
+        assert_eq!(packet[1], 0x16, "剩余长度 22");
+        assert_eq!(&packet[2..8], b"\x00\x04MQTT");
+        assert_eq!(packet[8], 5, "协议级别 5");
+        assert_eq!(packet[9], 0xC2);
+        assert_eq!(&packet[10..12], &[0x00, 0x3C]);
+        assert_eq!(packet[12], 0x00, "5.0 连接属性长度应为 0");
+        assert_eq!(&packet[13..18], b"\x00\x03abc");
     }
 
     #[tokio::test]
