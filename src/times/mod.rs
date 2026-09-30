@@ -2,10 +2,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::NaiveDateTime;
 
-pub fn foo() {
-    println!("Hello from times!");
-}
-
 pub fn gettimestamp() -> u64 {
     // 返回不带毫秒的时间戳
     let now = SystemTime::now();

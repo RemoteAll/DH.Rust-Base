@@ -34,6 +34,8 @@ mod console_setup;
 mod text_file_log;
 mod xtrace;
 
+pub mod style;
+
 pub use composite_log::CompositeLog;
 pub use console_log::ConsoleLog;
 pub use console_setup::enable_windows_console;

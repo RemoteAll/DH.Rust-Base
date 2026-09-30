@@ -2,10 +2,6 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-pub fn foo() {
-    println!("Hello from io!");
-}
-
 /// 读取文本文件全文（UTF-8；自动去除 BOM，对齐 C# `File.ReadAllText` 行为）。
 pub fn read_all_text<P: AsRef<Path>>(path: P) -> io::Result<String> {
     let text = fs::read_to_string(path)?;

@@ -12,23 +12,3 @@ pub mod zip; // 极简 ZIP 打包器（store 法；内存 + 流式落盘两种�
 pub mod razor; // Razor 子集模板引擎（方案 C）：同一份 .cshtml 双端渲染
 
 pub mod net; // 网络模块（基础：本机 IP；net/stun/net-tls 特性扩展 HTTP/WS/RPC/TLS/STUN）
-
-pub fn bar() {
-    io::foo();
-    times::foo();
-}
-
-pub fn add(left: usize, right: usize) -> usize {
-    left + right
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}

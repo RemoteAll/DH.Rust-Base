@@ -5,7 +5,7 @@
 //! 默认自动着色：标准输出为终端且未设置 `NO_COLOR` 时启用
 //! （对齐现代 Rust 生态习惯；DH.NCore 为 Windows 控制台默认固定着色）。
 
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
@@ -20,10 +20,9 @@ pub struct ConsoleLog {
 }
 
 impl ConsoleLog {
-    /// 新建（自动着色：标准输出为终端且未设置 `NO_COLOR` 时启用）
+    /// 新建（自动着色：与 [`style`](super::style) 同源——标准输出为终端且未设置 `NO_COLOR` 时启用）
     pub fn new() -> ConsoleLog {
-        let auto = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-        ConsoleLog::with_color(auto)
+        ConsoleLog::with_color(super::style::color_enabled())
     }
 
     /// 新建（指定是否着色）
