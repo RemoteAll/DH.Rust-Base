@@ -53,6 +53,9 @@ toml = ["dep:toml", "dep:toml_edit"]
 razor = []
 # STUN 服务（RFC 5389 Binding；UDP，仅依赖 tokio；net 特性自动包含）
 stun = ["dep:tokio"]
+# MQTT 客户端（MQTT 3.1.1：连接认证 / QoS0·1 发布 / 保活 / 断线重连；
+# tcp-scanner-server 对接 WMSMqttServer 现场收编）
+mqtt = ["dep:tokio"]
 # HTTP 客户端（hyper 连接层 + tokio；tcp-scanner-server 等“仅需 client”的消费方使用）
 http-client = ["dep:tokio", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 # 网络内核（DHDeploy.Agent Rust 迁移；选型与红线见 DHDeploy 仓库 Doc/网络层选型复核.md）

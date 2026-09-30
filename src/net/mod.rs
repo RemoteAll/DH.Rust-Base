@@ -16,6 +16,10 @@
 //! `stun`（独立特性，仅依赖 tokio UDP；`net` 特性自动包含）：RFC 5389 Binding 服务，
 //! 供浏览器 WebRTC 公网地址发现（来源：PekSendToMo 收编 2026-09-29）。
 //!
+//! `mqtt`（独立特性，仅依赖 tokio）：MQTT 3.1.1 客户端（连接认证 / QoS0·1 发布 /
+//! 保活心跳 / 断线自动重连；互通目标 NewLife.MQTT；来源：tcp-scanner-server 对接
+//! WMSMqttServer 收编 2026-09-30）。
+//!
 //! 设计约束（C# 排障教训固化，见《AgentRust迁移需求》第 4 节，DHDeploy 仓库 `Doc/`）：
 //! 接收循环永不阻塞（长任务后台化）；发送经单一写通道串行；Pong 超时 90s 触发重连。
 //!
@@ -25,6 +29,8 @@
 pub mod http;
 #[cfg(feature = "http-client")]
 pub mod http_client;
+#[cfg(feature = "mqtt")]
+pub mod mqtt;
 #[cfg(feature = "net")]
 pub mod router;
 #[cfg(feature = "net")]
