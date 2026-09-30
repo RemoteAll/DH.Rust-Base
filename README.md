@@ -18,6 +18,7 @@ Pek 生态的 Rust 基础库，对应 C# 的 **DH.NCore**：为 Rust 项目提�
 | `zip` | 极简 ZIP 打包器（store 法；内存 + 流式落盘） | — |
 | `net` | 网络内核：HTTP 服务端/客户端、WebSocket（文本/二进制、可选服务端 Ping 保活与慢消费者断开）、RPC（feature `net`） | `Http` / `Net` / `Remoting`（部分） |
 | `stun` | STUN 服务（RFC 5389 Binding；feature `stun`，`net` 自动包含） | — |
+| `wecom` | 企业微信机器人（Webhook 推送：文本/Markdown/Markdown V2 + 响应解析；feature `http-client`，https 需 `http-tls`） | `Pek.WebHook`（`WeChatWorkRobot`） |
 | `razor` | Razor 子集模板引擎（feature `razor`） | — |
 
 ## 定时与 Cron（threading）

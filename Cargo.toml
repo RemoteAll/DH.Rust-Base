@@ -58,15 +58,21 @@ stun = ["dep:tokio"]
 mqtt = ["dep:tokio"]
 # HTTP 客户端（hyper 连接层 + tokio；tcp-scanner-server 等“仅需 client”的消费方使用）
 http-client = ["dep:tokio", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
-# 网络内核（DHDeploy.Agent Rust 迁移；选型与红线见 DHDeploy 仓库 Doc/网络层选型复核.md）
-net = ["http-client", "dep:fastwebsockets", "stun"]
-# wss/TLS（在 net 之上追加；根证书优先系统存储，为空时回退 webpki-roots）
-net-tls = [
-    "net",
+# HTTPS 客户端 TLS（在 http-client 之上追加；不打 WS/服务端证书工具——企业微信推送等 config 驱动场景）
+# 根证书优先系统存储，为空时回退 webpki-roots
+http-tls = [
+    "http-client",
     "dep:tokio-rustls",
     "dep:rustls",
     "dep:rustls-native-certs",
     "dep:webpki-roots",
+]
+# 网络内核（DHDeploy.Agent Rust 迁移；选型与红线见 DHDeploy 仓库 Doc/网络层选型复核.md）
+net = ["http-client", "dep:fastwebsockets", "stun"]
+# wss/TLS（在 net 之上追加；含 HTTPS 客户端与服务端证书能力）
+net-tls = [
+    "net",
+    "http-tls",
     "dep:rustls-pemfile",
     "dep:rcgen",
 ]

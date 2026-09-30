@@ -8,7 +8,7 @@
 //! - [`download_to_file`]：流式落盘（大文件/大包，不驻留内存）
 //! - `insecure_tls`：忽略服务器证书校验（服务器间自签证书部署场景必需）
 //!
-//! 依赖：`http-client` 特性（hyper client + tokio；`net` 特性自动包含）；`https` 需 `net-tls` 特性（rustls）。
+//! 依赖：`http-client` 特性（hyper client + tokio；`net` 特性自动包含）；`https` 需 `http-tls` 特性（rustls；`net-tls` 已包含）。
 
 use std::path::Path;
 use std::time::Duration;
@@ -416,8 +416,8 @@ async fn send_request(
     ),
     HttpClientError,
 > {
-    #[cfg(not(feature = "net-tls"))]
-    let _ = &options; // insecure_tls 仅 TLS 分支使用（net-only 编译时避免未使用告警）
+    #[cfg(not(feature = "http-tls"))]
+    let _ = &options; // insecure_tls 仅 TLS 分支使用（http-only 编译时避免未使用告警）
 
     let tcp = TcpStream::connect((target.host.as_str(), target.port))
         .await
@@ -426,16 +426,16 @@ async fn send_request(
         })?;
     let _ = tcp.set_nodelay(true);
 
-    #[cfg(feature = "net-tls")]
+    #[cfg(feature = "http-tls")]
     let stream: BoxStream = if target.tls {
         wrap_tls(&target.host, tcp, options.insecure_tls).await?
     } else {
         Box::new(tcp)
     };
-    #[cfg(not(feature = "net-tls"))]
+    #[cfg(not(feature = "http-tls"))]
     let stream: BoxStream = {
         if target.tls {
-            return Err(HttpClientError::new("https 需要启用 net-tls 特性"));
+            return Err(HttpClientError::new("https 需要启用 http-tls 特性"));
         }
         Box::new(tcp)
     };
@@ -477,7 +477,7 @@ async fn send_request(
     Ok((sender, response))
 }
 
-#[cfg(feature = "net-tls")]
+#[cfg(feature = "http-tls")]
 async fn wrap_tls(
     host: &str,
     tcp: TcpStream,
@@ -524,11 +524,11 @@ async fn wrap_tls(
 }
 
 /// 忽略服务器证书校验的验证器（`insecure_tls` 专用；签名校验仍走 provider 算法）。
-#[cfg(feature = "net-tls")]
+#[cfg(feature = "http-tls")]
 #[derive(Debug)]
 struct NoCertificateVerification(std::sync::Arc<tokio_rustls::rustls::crypto::CryptoProvider>);
 
-#[cfg(feature = "net-tls")]
+#[cfg(feature = "http-tls")]
 impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
     fn verify_server_cert(
         &self,
