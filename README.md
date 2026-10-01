@@ -95,7 +95,7 @@ dhrust::logs::set_level(dhrust::logs::level_from_env());
 dhrust::logs::info!("服务已启动：端口 {port}", port = 8080);
 dhrust::logs::warn!("磁盘空间不足");
 
-// 文件日志：按天一个文件（yyyy_MM_dd.log），单文件 10MB 拆分（_2、_3…），最多保留 200 份
+// 文件日志：按天一个文件（文件名格式默认 {0:yyyy_MM_dd}.log，兼容 {date} 占位符），单文件 10MB 拆分（_2、_3…），最多保留 200 份
 dhrust::logs::use_file("Log");
 dhrust::logs::info!("写入 Log 目录");
 
@@ -105,8 +105,9 @@ dhrust::logs::use_console_options(true, true);
 
 - 未设置时首次写入懒初始化为控制台日志（自动着色：终端且未设置 `NO_COLOR` 时启用）；
 - 行格式与控制台一致：`HH:mm:ss.fff 线程ID 类型 名称 正文`（逐列对齐 DH.NCore 默认 `LogLineFormat`；线程池线程名显示 `P`）；
-- 文件日志自带进程日志头（进程号/命令行/OS/CPU 等，字段与列序对齐 `GetHead`）；
-- 队列积压超过 1024 条时丢弃新日志（对齐 DH.NCore，防磁盘故障时内存无界）。
+- 文件日志自带进程日志头（进程号/命令行/OS/CPU 等，字段与列序对齐 `GetHead`；Windows 下 `#OS` 用 `RtlGetVersion`，输出与 .NET `OSDescription` 一致）；
+- 队列积压超过 1024 条时丢弃新日志（对齐 DH.NCore，防磁盘故障时内存无界）；
+- 备份清理对齐 DH.NCore：空闲 5 秒检查目录、超量删除最旧的（提示行随下一批写入、大小千分位），候选文件全满（1023 个）时放弃本批写入。
 
 ## 互操作校验
 

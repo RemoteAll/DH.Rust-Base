@@ -32,11 +32,12 @@ const EOL: &str = if cfg!(windows) { "\r\n" } else { "\n" };
 /// 文件日志选项
 #[derive(Debug, Clone)]
 pub struct FileLogOptions {
-    /// 单文件大小上限（字节；超过后拆分 `_1`、`_2`…；0 不限制）。默认 10MB（对齐 DH.NCore）
+    /// 单文件大小上限（字节；超过后拆分 `_2`、`_3`…；0 不限制）。默认 10MB（对齐 DH.NCore）
     pub max_bytes: u64,
     /// 备份个数上限（目录内日志文件超过后删除最旧的；0 不限制）。默认 200（对齐 DH.NCore）
     pub backups: usize,
-    /// 文件名格式（`{date}` 占位符 = `yyyy_MM_dd`）。默认 `{date}.log`
+    /// 文件名格式：`{0:yyyy_MM_dd}`（C# 风格）与 `{date}` 占位符都展开为 `yyyy_MM_dd`。
+    /// 默认 `{0:yyyy_MM_dd}.log`（对齐 DH.NCore `Setting.LogFileFormat`）
     pub file_format: String,
 }
 
@@ -45,7 +46,7 @@ impl Default for FileLogOptions {
         Self {
             max_bytes: 10 * 1024 * 1024,
             backups: 200,
-            file_format: "{date}.log".to_owned(),
+            file_format: "{0:yyyy_MM_dd}.log".to_owned(),
         }
     }
 }
@@ -78,6 +79,8 @@ struct WriterState {
     current: Option<PathBuf>,
     /// 是否已写过日志头（每进程一次，对齐 DH.NCore）
     head_written: bool,
+    /// 待写入的提示行（备份清理产生；随下一批日志落盘，对齐 DH.NCore 提示入队延迟写入）
+    pending_tips: Vec<String>,
 }
 
 /// 进程内文件日志实例缓存（对应 DH.NCore `TextFileLog` 静态 cache）
@@ -196,7 +199,11 @@ fn writer_loop(shared: &Shared, rx: &Receiver<Msg>) {
                     let _ = ack.send(());
                 }
             }
-            Err(RecvTimeoutError::Timeout) => close_file(shared),
+            Err(RecvTimeoutError::Timeout) => {
+                close_file(shared);
+                // 空闲时清理超量备份（对齐 DH.NCore 定时器回调：关闭文件后检查目录备份数）
+                enqueue_prune_tips(shared, &mut writer);
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
@@ -215,10 +222,12 @@ fn collect(msg: Msg, shared: &Shared, batch: &mut Vec<String>, acks: &mut Vec<Se
     }
 }
 
-/// 写入一批日志（确定目标文件；切换文件时清理超量备份）
+/// 写入一批日志（确定目标文件；必要时切换并清理超量备份）
 fn write_batch(shared: &Shared, writer: &mut WriterState, batch: &[String]) {
-    let target = pick_file(shared);
-    let mut removed = Vec::new();
+    // 候选文件全部达到上限时放弃本批（对齐 DH.NCore `GetLogFile` 返回 null）
+    let Some(target) = pick_file(shared) else {
+        return;
+    };
 
     let mut file_guard = shared
         .file
@@ -229,7 +238,7 @@ fn write_batch(shared: &Shared, writer: &mut WriterState, batch: &[String]) {
         *file_guard = None;
         writer.current = Some(target.clone());
         shared.open_errors.store(0, Ordering::Relaxed);
-        removed = prune_backups(shared);
+        enqueue_prune_tips(shared, writer);
     }
 
     if file_guard.is_none() {
@@ -245,9 +254,9 @@ fn write_batch(shared: &Shared, writer: &mut WriterState, batch: &[String]) {
             Ok(mut file) => {
                 if !writer.head_written {
                     writer.head_written = true;
-                    // 追加到已有内容的文件时，先空一行分隔（对齐 DH.NCore）
+                    // 追加到已有内容的文件时，先空一行分隔（对齐 DH.NCore；换行随平台）
                     if file.metadata().map(|meta| meta.len() > 10).unwrap_or(false) {
-                        let _ = file.write_all(b"\r\n");
+                        let _ = file.write_all(EOL.as_bytes());
                     }
                     let _ = file.write_all(process_head().as_bytes());
                 }
@@ -266,19 +275,42 @@ fn write_batch(shared: &Shared, writer: &mut WriterState, batch: &[String]) {
             let _ = file.write_all(EOL.as_bytes());
         }
 
-        // 对齐 DH.NCore：清理超量备份后补一条提示日志（写入新文件）
-        for (name, size) in removed {
-            let tip = format_line(
-                LogLevel::Info,
-                &format!(
-                    "日志文件达到上限 {}，删除 {}，大小 {}Byte",
-                    shared.options.backups, name, size
-                ),
-            );
-            let _ = file.write_all(tip.text.as_bytes());
-            let _ = file.write_all(EOL.as_bytes());
+        // 清理提示行落盘（对齐 DH.NCore：删除超量文件后补一条 Info 日志）
+        if !writer.pending_tips.is_empty() {
+            for tip in writer.pending_tips.drain(..) {
+                let _ = file.write_all(tip.as_bytes());
+                let _ = file.write_all(EOL.as_bytes());
+            }
         }
     }
+}
+
+/// 清理超量备份，并把删除提示暂存到下一批写入（对齐 DH.NCore：`OnWrite` 提示经队列延迟落盘）
+fn enqueue_prune_tips(shared: &Shared, writer: &mut WriterState) {
+    for (name, size) in prune_backups(shared) {
+        let tip = format!(
+            "日志文件达到上限 {}，删除 {}，大小 {}Byte",
+            shared.options.backups,
+            name,
+            format_thousands(size)
+        );
+        writer
+            .pending_tips
+            .push(format_line(LogLevel::Info, &tip).text);
+    }
+}
+
+/// 数字千分位（对齐 C# 格式串 `{2:n0}`，如 `1,234,567`）
+fn format_thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// 刷写当前文件（把缓冲数据写入磁盘）
@@ -303,36 +335,43 @@ fn close_file(shared: &Shared) {
 
 /// 选择当前应写入的文件。
 ///
-/// `{date}` 展开为 `yyyy_MM_dd`；限制大小时向后寻找第一个未达上限的 `_N` 文件
-/// （对齐 DH.NCore `GetLogFile`）。
-fn pick_file(shared: &Shared) -> PathBuf {
+/// `{0:yyyy_MM_dd}`/`{date}` 展开为 `yyyy_MM_dd`；限制大小时向后寻找第一个未达上限的
+/// `_2`、`_3`… 文件（对齐 DH.NCore `GetLogFile`）；候选全部达到上限时返回 `None`（放弃本批写入）。
+fn pick_file(shared: &Shared) -> Option<PathBuf> {
     let date = Local::now().format("%Y_%m_%d").to_string();
-    let name = shared.options.file_format.replace("{date}", &date);
+    let name = expand_file_name(&shared.options.file_format, &date);
     let path = shared.dir.join(&name);
 
     if shared.options.max_bytes == 0 {
-        return path;
+        return Some(path);
     }
 
-    // 找到第一个未达到上限的文件（原名、_2、_3…，最多尝试 1024 个；对齐 DH.NCore）
+    // 找到第一个未达到上限的文件（原名、_2、_3…，最多尝试 1023 个；对齐 DH.NCore）
     let (stem, ext) = match name.rsplit_once('.') {
         Some((stem, ext)) => (stem.to_owned(), format!(".{ext}")),
         None => (name.clone(), String::new()),
     };
-    for i in 0..1024u32 {
-        let candidate = if i == 0 {
+    for i in 1..1024u32 {
+        let candidate = if i == 1 {
             path.clone()
         } else {
-            shared.dir.join(format!("{stem}_{}{ext}", i + 1))
+            shared.dir.join(format!("{stem}_{i}{ext}"))
         };
         let Ok(meta) = std::fs::metadata(&candidate) else {
-            return candidate; // 文件不存在：直接使用
+            return Some(candidate); // 文件不存在：直接使用
         };
         if meta.len() < shared.options.max_bytes {
-            return candidate;
+            return Some(candidate);
         }
     }
-    path
+    None
+}
+
+/// 展开文件名格式：`{0:yyyy_MM_dd}`（C# `String.Format` 风格）与 `{date}` 均展开为日期。
+fn expand_file_name(format: &str, date: &str) -> String {
+    format
+        .replace("{0:yyyy_MM_dd}", date)
+        .replace("{date}", date)
 }
 
 /// 清理超量备份。返回被删除的文件 `(名称, 大小)`，供调用方补提示日志（对齐 DH.NCore）。
@@ -514,23 +553,77 @@ fn application_type() -> &'static str {
     }
 }
 
-/// 操作系统描述（对齐 C# `#OS` 第一段：尽量给出名称与版本）。
+/// 操作系统描述（对齐 C# `#OS` 第一段）\uff1aLinux 取发行版名称与版本）。
+#[cfg(target_os = "linux")]
 fn os_description() -> String {
-    if cfg!(target_os = "linux") {
-        if let Ok(text) = std::fs::read_to_string("/etc/os-release") {
-            for line in text.lines() {
-                if let Some(value) = line.strip_prefix("PRETTY_NAME=") {
-                    return value.trim().trim_matches('"').to_string();
-                }
+    if let Ok(text) = std::fs::read_to_string("/etc/os-release") {
+        for line in text.lines() {
+            if let Some(value) = line.strip_prefix("PRETTY_NAME=") {
+                return value.trim().trim_matches('"').to_string();
             }
         }
-        "Linux".to_string()
-    } else if cfg!(windows) {
-        std::env::var("OS").unwrap_or_else(|_| "Windows".to_string())
-    } else if cfg!(target_os = "macos") {
-        "macOS".to_string()
-    } else {
-        std::env::consts::OS.to_string()
+    }
+    "Linux".to_string()
+}
+
+/// 操作系统描述（对齐 C# `#OS` 第一段\uff1a`Microsoft Windows NT {主}.{次}.{构建}.0`）。
+#[cfg(windows)]
+fn os_description() -> String {
+    windows_version_description().unwrap_or_else(|| {
+        std::env::var("OS")
+            .ok()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "Windows".to_string())
+    })
+}
+
+/// 操作系统描述（对齐 C# `#OS` 第一段）。
+#[cfg(target_os = "macos")]
+fn os_description() -> String {
+    "macOS".to_string()
+}
+
+/// 操作系统描述（其它平台）。
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+fn os_description() -> String {
+    std::env::consts::OS.to_string()
+}
+
+/// Windows 版本描述（对齐 C# `RuntimeInformation.OSDescription`\uff1a`Microsoft Windows NT 10.0.26200.0`）。
+///
+/// 用 `RtlGetVersion` 取真实版本（不受兼容性清单影响的 API）。
+#[cfg(windows)]
+fn windows_version_description() -> Option<String> {
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn RtlGetVersion(version_info: *mut OSVERSIONINFOW) -> i32;
+    }
+
+    let mut info: OSVERSIONINFOW = unsafe { std::mem::zeroed() };
+    info.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOW>() as u32;
+    // 返回 0（STATUS_SUCCESS）时版本字段有效
+    let status = unsafe { RtlGetVersion(&mut info) };
+    if status != 0 {
+        return None;
+    }
+    Some(format!(
+        "Microsoft Windows NT {}.{}.{}.0",
+        info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber
+    ))
+}
+
+/// `RtlGetVersion` 输出形状校验（本机 Windows 10/11 均应报 `Microsoft Windows NT 10.x.y.0`）。
+#[cfg(all(test, windows))]
+mod windows_desc_tests {
+    use super::*;
+
+    #[test]
+    fn windows_version_description_shape() {
+        let desc = windows_version_description().expect("RtlGetVersion 应可用");
+        assert!(desc.starts_with("Microsoft Windows NT 10."), "{desc}");
+        assert_eq!(desc.matches('.').count(), 3, "{desc}");
     }
 }
 
@@ -634,7 +727,7 @@ mod tests {
             FileLogOptions {
                 max_bytes: 0,
                 backups: 0,
-                file_format: "{date}.log".to_owned(),
+                file_format: "{0:yyyy_MM_dd}.log".to_owned(),
             },
         );
 
@@ -707,5 +800,59 @@ mod tests {
         // backups = 1：除最新文件外应已被清理
         assert!(second.exists(), "_2 文件应保留（最新备份）");
         assert!(!first.exists(), "最旧文件应被清理");
+    }
+
+    /// 文件名格式支持 C# 风格 `{0:yyyy_MM_dd}` 与 `{date}` 占位符
+    #[test]
+    fn file_name_format_placeholders() {
+        let date = "2026_10_01";
+        assert_eq!(
+            expand_file_name("{0:yyyy_MM_dd}.log", date),
+            "2026_10_01.log"
+        );
+        assert_eq!(expand_file_name("{date}.log", date), "2026_10_01.log");
+    }
+
+    /// 数字千分位（对齐 C# 格式串 `{2:n0}`）
+    #[test]
+    fn thousands_separator() {
+        assert_eq!(format_thousands(0), "0");
+        assert_eq!(format_thousands(999), "999");
+        assert_eq!(format_thousands(1_000), "1,000");
+        assert_eq!(format_thousands(12_345_678), "12,345,678");
+    }
+
+    /// 全部候选文件达到上限时放弃写入（对齐 DH.NCore `GetLogFile` 返回 null）
+    #[test]
+    fn gives_up_when_all_candidates_full() {
+        let dir = temp_dir("full");
+        let log = TextFileLog::create_with(
+            &dir,
+            FileLogOptions {
+                max_bytes: 1,
+                backups: 0,
+                file_format: "{date}.log".to_owned(),
+            },
+        );
+
+        // 造满 1023 个候选文件（原名 + `_2`..`_1023`），每个均超过 1 字节
+        let date = Local::now().format("%Y_%m_%d").to_string();
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 1..1024u32 {
+            let name = if i == 1 {
+                format!("{date}.log")
+            } else {
+                format!("{date}_{i}.log")
+            };
+            std::fs::write(dir.join(name), "xx").unwrap();
+        }
+        assert!(pick_file(&log.shared).is_none(), "候选全满应放弃写入");
+
+        // 腾空一个候选后应能继续写入（首个未满文件）
+        std::fs::write(dir.join(format!("{date}_2.log")), "").unwrap();
+        assert_eq!(
+            pick_file(&log.shared),
+            Some(dir.join(format!("{date}_2.log")))
+        );
     }
 }
