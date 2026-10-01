@@ -221,6 +221,23 @@ pub fn blocking_get_text(url: &str, timeout: Duration) -> Result<String, HttpCli
     Ok(rsp.body_text())
 }
 
+/// GET 请求（同步版，全量响应；内部创建临时 tokio 运行时）。
+///
+/// 供阻塞上下文低频调用、且需要读取状态码/响应头的场景（站点探活、健康探测等）；
+/// 异步上下文请直接用 [`get`]。
+pub fn blocking_get(url: &str, timeout: Duration) -> Result<HttpResponse, HttpClientError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| HttpClientError::new(format!("创建 tokio 运行时失败: {e}")))?;
+
+    let options = HttpClientOptions {
+        timeout,
+        ..Default::default()
+    };
+    rt.block_on(get(url, &[], &options))
+}
+
 /// 解析 HTTP 方法名（`GET`/`POST`/`PUT` 等，含自定义扩展方法）。
 fn parse_method(method: &str) -> Result<Method, HttpClientError> {
     Method::from_bytes(method.trim().as_bytes())

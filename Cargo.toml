@@ -53,7 +53,13 @@ rcgen = { version = "0.13", optional = true, default-features = false, features 
 
 [target.'cfg(windows)'.dependencies]
 # 系统运行时长（日志头 `#SystemStarted`，对齐 C# Environment.TickCount64 → GetTickCount64）
-windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }
+# 网卡累计流量（sys::net::net_totals → GetIfTable2；IpHelper + Ndis + WinSock）
+windows-sys = { version = "0.59", features = [
+    "Win32_System_SystemInformation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
 
 [features]
 # TOML 配置维护管线（tcp-scanner-server 实践沉淀；启用后提供 config::toml 模块）

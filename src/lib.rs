@@ -13,5 +13,7 @@ pub mod razor; // Razor 子集模板引擎（方案 C）：同一份 .cshtml 双
 
 pub mod net; // 网络模块（基础：本机 IP + 字节流分帧；http-client/http-tls/net/stun/net-tls 特性扩展 HTTP/WS/RPC/TLS/STUN）
 
+pub mod sys; // 系统信息采集（磁盘挂载过滤 / 网卡累计流量；跨平台）
+
 #[cfg(feature = "http-client")]
 pub mod wecom; // 企业微信机器人（Webhook 推送：文本/Markdown/Markdown V2；对应 C# Pek.WebHook 的 WeChatWorkRobot）

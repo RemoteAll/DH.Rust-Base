@@ -116,6 +116,18 @@ impl WeComBot {
         self.send_value(markdown_v2_payload(content)).await
     }
 
+    /// 发送 Markdown V2 消息（同步版；内部创建临时 tokio 运行时）。
+    ///
+    /// 供阻塞上下文低频调用（告警/日报任务线程等）；异步上下文请直接用
+    /// [`send_markdown_v2`]。
+    pub fn send_markdown_v2_blocking(&self, content: &str) -> Result<WeComResult, WeComError> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| WeComError::new(format!("创建 tokio 运行时失败: {e}")))?;
+        rt.block_on(self.send_markdown_v2(content))
+    }
+
     /// 发送已构造好的消息载荷（`msgtype` 已在载荷中）。
     /// <param name="payload">消息 JSON 载荷</param>
     async fn send_value(&self, payload: Value) -> Result<WeComResult, WeComError> {
