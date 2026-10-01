@@ -171,6 +171,11 @@ fn set_at_path(doc: &mut DocumentMut, path: &[String], value: toml_edit::Value) 
         return false;
     };
 
+    if rest.is_empty() {
+        // 根级键（无节包裹的顶层配置项）
+        return replace_item_value(item, value);
+    }
+
     // 定位到父表（rest 的最后一段是目标键）
     let Some((last, parents)) = rest.split_last() else {
         return false;
@@ -185,14 +190,19 @@ fn set_at_path(doc: &mut DocumentMut, path: &[String], value: toml_edit::Value) 
     let Some(table) = item.as_table_like_mut() else {
         return false;
     };
-    let Some(old) = table.get_mut(last) else {
+    let Some(target) = table.get_mut(last) else {
         return false;
     };
-    match old.as_value() {
-        Some(old_value) => {
+    replace_item_value(target, value)
+}
+
+/// 替换条目值（仅对值条目有效；沿用原值装饰，保留注释与空白）。
+fn replace_item_value(item: &mut Item, value: toml_edit::Value) -> bool {
+    match item.as_value_mut() {
+        Some(old) => {
             let mut new_value = value;
-            *new_value.decor_mut() = old_value.decor().clone();
-            *old = Item::Value(new_value);
+            *new_value.decor_mut() = old.decor().clone();
+            *old = new_value;
             true
         }
         None => false,
@@ -227,6 +237,81 @@ fn json_to_toml_edit(value: &Value) -> Option<toml_edit::Value> {
             Toml::InlineTable(t)
         }
     })
+}
+
+/// 就地同步文档中的数组表（`[[name]]`）：按索引对齐更新各段字段值（保留字段装饰与注释）、
+/// 删除多余条目、追加新条目；`null` 值按空字符串 `""` 写入（TOML 无 null）。
+///
+/// 返回发生变更的条目/字段数。文档中该键不存在时会创建（即使 `entries` 为空）。
+pub fn sync_array_of_tables(doc: &mut DocumentMut, name: &str, entries: &[Value]) -> usize {
+    if !matches!(doc.get(name), Some(Item::ArrayOfTables(_))) {
+        doc.insert(name, Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+    }
+    let Some(Item::ArrayOfTables(tables)) = doc.get_mut(name) else {
+        return 0;
+    };
+
+    let mut changed = 0;
+
+    // 多余条目删除（配置里已移除的元素，如已删除的应用）
+    while tables.len() > entries.len() {
+        tables.remove(tables.len() - 1);
+        changed += 1;
+    }
+
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(object) = entry.as_object() else { continue };
+
+        if index >= tables.len() {
+            // 新增条目
+            let mut table = Table::new();
+            for (key, value) in object {
+                let Some(new_value) = json_scalar_or_value(value) else {
+                    continue;
+                };
+                table.insert(key, Item::Value(new_value));
+            }
+            tables.push(table);
+            changed += 1;
+            continue;
+        }
+
+        let Some(table) = tables.get_mut(index) else {
+            continue;
+        };
+        for (key, value) in object {
+            let Some(new_value) = json_scalar_or_value(value) else {
+                continue;
+            };
+            match table.get_mut(key) {
+                Some(Item::Value(old)) => {
+                    // 在相同装饰下比较（行内注释相同则值相同判定准确；值变化时沿用原装饰写回）
+                    let mut replacement = new_value.clone();
+                    *replacement.decor_mut() = old.decor().clone();
+                    if old.to_string() != replacement.to_string() {
+                        *old = replacement;
+                        changed += 1;
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    table.insert(key, Item::Value(new_value));
+                    changed += 1;
+                }
+            }
+        }
+    }
+
+    changed
+}
+
+/// JSON 值 → toml_edit 值；`null` 按空字符串处理（TOML 无 null）。
+fn json_scalar_or_value(value: &Value) -> Option<toml_edit::Value> {
+    if value.is_null() {
+        Some(toml_edit::Value::from(""))
+    } else {
+        json_to_toml_edit(value)
+    }
 }
 
 /// 备份文件路径：`xxx.toml` → `xxx.toml.bak`。
@@ -302,5 +387,44 @@ mod tests {
         assert_eq!(fs::read_to_string(&file).unwrap(), "new");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn type_fix_handles_root_level_keys() {
+        let mut doc: DocumentMut = "# 端口\nLocalPort = 5500\n".parse().unwrap();
+        let base = serde_json::json!({ "LocalPort": 5500 });
+        let coerced = serde_json::json!({ "LocalPort": 5599 });
+
+        let fixed = apply_type_fixes(&mut doc, &base, &coerced);
+        assert_eq!(fixed, 1);
+
+        let text = doc.to_string();
+        assert!(text.contains("LocalPort = 5599"), "根级键应被回写：{text}");
+        assert!(text.contains("# 端口"), "注释应保留：{text}");
+    }
+
+    #[test]
+    fn sync_array_of_tables_keeps_comments_updates_and_appends() {
+        let mut doc: DocumentMut =
+            "# 应用列表\n[[Apps]]\n# 应用A的注释\nName = \"a\"\nEnable = true\n".parse().unwrap();
+
+        let entries = vec![
+            serde_json::json!({ "Name": "a", "Enable": false }),
+            serde_json::json!({ "Name": "b", "Enable": true, "Arguments": null }),
+        ];
+        let changed = sync_array_of_tables(&mut doc, "Apps", &entries);
+        let text = doc.to_string();
+
+        assert!(changed >= 2, "changed={changed}\n{text}");
+        assert!(text.contains("# 应用A的注释"), "段内注释应保留：\n{text}");
+        assert!(text.contains("Enable = false"), "值应更新：\n{text}");
+        assert!(text.contains("Name = \"b\""), "新段应追加：\n{text}");
+        assert!(text.contains("Arguments = \"\""), "null 应按空串写入：\n{text}");
+
+        // 删除多余条目
+        let changed = sync_array_of_tables(&mut doc, "Apps", &[serde_json::json!({ "Name": "a" })]);
+        let text = doc.to_string();
+        assert!(changed >= 1, "应有变更：\n{text}");
+        assert!(!text.contains("Name = \"b\""), "多余段应删除：\n{text}");
     }
 }

@@ -16,10 +16,51 @@ Pek 生态的 Rust 基础库，对应 C# 的 **DH.NCore**：为 Rust 项目提�
 | `config` | 核心设置 `Setting`，读写 `Config/Core.config`（XML）/ `Core.json` | `NewLife.Setting` / `Configuration` |
 | `logs` | 分级日志：控制台/文本文件/复合输出、全局门面与 `info!` 等宏 | `NewLife.Log`（`XTrace`/`ILog`/`TextFileLog`/`ConsoleLog`/`CompositeLog`） |
 | `zip` | 极简 ZIP 打包器（store 法；内存 + 流式落盘） | — |
-| `net` | 网络内核：HTTP 服务端/客户端、WebSocket（文本/二进制、可选服务端 Ping 保活与慢消费者断开）、RPC（feature `net`） | `Http` / `Net` / `Remoting`（部分） |
+| `net` | 网络内核：HTTP 服务端/客户端、WebSocket（文本/二进制、可选服务端 Ping 保活与慢消费者断开）、RPC、**HTTP 控制器（MVC 风格动作分发 + 视图约定）与静态文件服务**（feature `net`） | `Http` / `Net` / `Remoting`（部分）/ `MapController` / `MapEmbedded` |
 | `stun` | STUN 服务（RFC 5389 Binding；feature `stun`，`net` 自动包含） | — |
 | `wecom` | 企业微信机器人（Webhook 推送：文本/Markdown/Markdown V2 + 响应解析；feature `http-client`，https 需 `http-tls`） | `Pek.WebHook`（`WeChatWorkRobot`） |
 | `razor` | Razor 子集模板引擎（feature `razor`） | — |
+
+## HTTP 控制器与静态文件（net）
+
+对齐 C# NewLife 的 `MapController<T>`、MVC 视图约定与 `MapEmbedded`：
+
+```rust
+use dhrust::net::controller::{arg, json_result, Controller};
+use dhrust::net::router::Router;
+use dhrust::net::static_files::StaticFiles;
+
+let mut router = Router::new();
+
+// 控制器：/api/{action}（动作名与方法大小写不敏感）
+Controller::new("api")
+    .get("ping", |_ctx| json_result(0, "", None))          // 统一信封 {code, message?, data?}
+    .post("login", |ctx| {
+        let user = arg(ctx, "user").unwrap_or_default();   // 路由参数→查询串→表单→JSON body
+        json_result(0, "", Some(serde_json::json!({ "user": user })))
+    })
+    .mount(&mut router);
+
+// 视图约定（feature `razor`）：Views/{Controller}/{Action}.cshtml，`view(model)` 渲染 HTML
+// Controller::new("home").get("index", |_ctx| view(model)).mount(&mut router);
+
+// 静态文件：默认 `wwwroot` 目录 + 编译期嵌入资源（嵌入优先命中，单文件部署稳定）
+let statics = StaticFiles::default()
+    .embed("/index.html", include_bytes!("web/index.html"), "text/html; charset=utf-8");
+router.fallback(route(move |ctx| {
+    let statics = statics.clone();
+    async move {
+        if let Some(response) = statics.try_serve(&ctx.req.path) {
+            return HttpOutcome::Response(response);
+        }
+        HttpOutcome::Response(HttpResponse::text(404, "Not Found"))
+    }
+}));
+```
+
+- 统一 JSON 信封：`json_result(code, message, data)` / `json_error(code, message)`（空 `message` 与 `None` data 自动省略）；
+- 动作参数绑定顺序对齐 C#：路由参数 → 查询串 → 表单 → JSON body 字段（大小写不敏感）；路径穿越防护内置于静态文件服务；
+- `HttpRequest.remote_addr`：客户端地址（`IP:Port`，未知为 `None`），可用于登录限流、审计等场景。
 
 ## 定时与 Cron（threading）
 

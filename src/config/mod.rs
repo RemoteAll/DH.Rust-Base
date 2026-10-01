@@ -33,3 +33,4 @@ pub mod toml;
 pub use file_config::{coerce_json, file_stamp, save_value, Config, ConfigOptions, FileStamp};
 pub use file_watch::{FileChange, FileWatcher};
 pub use setting::{ConfigError, Setting};
+pub use xml::read_to_json as read_xml_to_json;

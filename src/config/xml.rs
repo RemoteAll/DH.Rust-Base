@@ -104,6 +104,139 @@ pub(crate) fn write_fields(root: &str, fields: &[(&str, &str, String)]) -> Strin
     out
 }
 
+/// 读取任意嵌套 XML 为 JSON 值（元素→对象、属性→键、重复同名子元素→数组、文本→字符串）。
+///
+/// 用于导入 C# NewLife 生成的配置（如 `StarAgent.config`：
+/// `<Services><ServiceInfo Name=".." FileName=".." /></Services>`）。
+/// 无属性无子元素的空元素映射为 `""`；有属性或子元素且带文本时，文本放入 `#text` 键；
+/// 返回值以根元素名作为顶层键（如 `{"StarAgent": {...}}`）；无根元素时返回 `Null`。
+pub fn read_to_json(text: &str) -> Result<serde_json::Value, ConfigError> {
+    use serde_json::{Map, Value};
+
+    struct Frame {
+        name: String,
+        attrs: Map<String, Value>,
+        children: Map<String, Value>,
+        text: String,
+    }
+
+    fn collect_attrs(e: &quick_xml::events::BytesStart<'_>) -> Map<String, Value> {
+        let mut attrs = Map::new();
+        for attr in e.attributes().flatten() {
+            let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+            let value = attr
+                .unescape_value()
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            attrs.insert(key, Value::String(value));
+        }
+        attrs
+    }
+
+    /// 同名重复元素在父级容器中提升为数组（与 C# 列表序列化形态对应）。
+    fn insert_child(container: &mut Map<String, Value>, name: String, value: Value) {
+        match container.get_mut(&name) {
+            Some(Value::Array(list)) => list.push(value),
+            Some(existing) => {
+                let prev = existing.take();
+                *existing = Value::Array(vec![prev, value]);
+            }
+            None => {
+                container.insert(name, value);
+            }
+        }
+    }
+
+    /// 收帧：构造元素值并挂到父容器。
+    fn finish_frame(frame: Frame, parent: &mut Map<String, Value>) {
+        let text = frame.text.trim();
+        let value = if frame.children.is_empty() && frame.attrs.is_empty() {
+            Value::String(text.to_string())
+        } else {
+            let mut object = frame.children;
+            for (key, attr) in frame.attrs {
+                object.insert(key, attr);
+            }
+            if !text.is_empty() {
+                object.insert("#text".to_string(), Value::String(text.to_string()));
+            }
+            Value::Object(object)
+        };
+        insert_child(parent, frame.name, value);
+    }
+
+    let mut reader = Reader::from_str(text);
+    reader.config_mut().trim_text(false);
+
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut root: Option<(String, Value)> = None;
+
+    loop {
+        match reader.read_event() {
+            Err(e) => return Err(ConfigError::Parse(format!("XML 解析失败: {e}"))),
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(e)) => {
+                let name = name_of(&e);
+                let attrs = collect_attrs(&e);
+                stack.push(Frame {
+                    name,
+                    attrs,
+                    children: Map::new(),
+                    text: String::new(),
+                });
+            }
+            Ok(Event::Empty(e)) => {
+                let name = name_of(&e);
+                let attrs = collect_attrs(&e);
+                let value = if attrs.is_empty() {
+                    Value::String(String::new())
+                } else {
+                    Value::Object(attrs)
+                };
+                match stack.last_mut() {
+                    Some(parent) => insert_child(&mut parent.children, name, value),
+                    None => {
+                        if root.is_none() {
+                            root = Some((name, value));
+                        }
+                    }
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if let Some(frame) = stack.last_mut() {
+                    if let Ok(unescaped) = t.unescape() {
+                        frame.text.push_str(&unescaped);
+                    }
+                }
+            }
+            Ok(Event::End(_)) => {
+                let Some(frame) = stack.pop() else { continue };
+                match stack.last_mut() {
+                    Some(parent) => finish_frame(frame, &mut parent.children),
+                    None => {
+                        if root.is_none() {
+                            let name = frame.name.clone();
+                            let mut holder = Map::new();
+                            finish_frame(frame, &mut holder);
+                            root = holder.remove(&name).map(|v| (name, v));
+                        }
+                    }
+                }
+            }
+            Ok(_) => {}
+        }
+    }
+
+    match root {
+        Some((name, value)) => {
+            let mut object = Map::new();
+            object.insert(name, value);
+            Ok(Value::Object(object))
+        }
+        None => Ok(Value::Null),
+    }
+}
+
 fn name_of(e: &quick_xml::events::BytesStart<'_>) -> String {
     String::from_utf8_lossy(e.name().as_ref()).to_string()
 }
@@ -171,5 +304,29 @@ mod tests {
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[0].0, "Debug");
         assert_eq!(parsed[2].1, "http://x/?a=1&b=2");
+    }
+
+    #[test]
+    fn read_nested_xml_to_json_matches_csharp_shape() {
+        let text = r#"<?xml version="1.0" encoding="utf-8"?>
+<StarAgent>
+  <!--调试开关。默认true-->
+  <Debug>true</Debug>
+  <LocalPort>5500</LocalPort>
+  <Services>
+    <ServiceInfo Name="StarServer" FileName="dotnet" Arguments="StarServer.dll" Enable="true" />
+    <ServiceInfo Name="StarWeb" FileName="StarWeb.zip" Arguments="urls=http://*:6680" Enable="true" />
+  </Services>
+</StarAgent>"#;
+
+        let json = read_to_json(text).unwrap();
+        assert_eq!(json["StarAgent"]["Debug"], "true");
+        assert_eq!(json["StarAgent"]["LocalPort"], "5500");
+        let services = json["StarAgent"]["Services"]["ServiceInfo"]
+            .as_array()
+            .expect("重复 ServiceInfo 应提升为数组");
+        assert_eq!(services.len(), 2);
+        assert_eq!(services[0]["Name"], "StarServer");
+        assert_eq!(services[1]["FileName"], "StarWeb.zip");
     }
 }
