@@ -57,6 +57,12 @@ impl ILog for CompositeLog {
             log.set_level(level);
         }
     }
+
+    fn flush(&self) {
+        for log in &self.logs {
+            log.flush();
+        }
+    }
 }
 
 #[cfg(test)]

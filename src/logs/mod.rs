@@ -41,8 +41,8 @@ pub use console_log::ConsoleLog;
 pub use console_setup::enable_windows_console;
 pub use text_file_log::{FileLogOptions, TextFileLog};
 pub use xtrace::{
-    level_from_env, log, null, set_level, set_log, use_console, use_console_options, use_file,
-    write_exception, write_fmt, write_line,
+    flush, level_from_env, log, null, set_level, set_log, use_console, use_console_options,
+    use_file, write_exception, write_fmt, write_line,
 };
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
@@ -273,6 +273,12 @@ pub trait ILog: Send + Sync {
     fn fatal(&self, message: &str) {
         self.write(LogLevel::Fatal, message);
     }
+
+    /// 刷写已排队的日志（同步等待落盘）。
+    ///
+    /// 异步实现（如文件日志）应在进程退出（含升级重启）前调用，
+    /// 避免队列中未落盘的消息丢失（对应 DH.NCore「销毁前把队列日志输出」）。
+    fn flush(&self) {}
 }
 
 /// 空日志实现（对应 DH.NCore `Logger.Null`）：不输出任何日志。

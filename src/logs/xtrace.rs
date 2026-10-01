@@ -50,6 +50,11 @@ pub fn write_line(message: &str) {
     log().info(message);
 }
 
+/// 刷写已排队日志（进程退出/升级重启前调用；异步文件日志依赖此同步落盘）。
+pub fn flush() {
+    log().flush();
+}
+
 /// 写异常日志（对应 `XTrace.WriteException`；Error 级别）
 pub fn write_exception(err: &dyn std::fmt::Display) {
     log().error(&err.to_string());

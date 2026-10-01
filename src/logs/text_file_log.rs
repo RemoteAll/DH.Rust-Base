@@ -160,6 +160,10 @@ impl ILog for TextFileLog {
         }
     }
 
+    fn flush(&self) {
+        TextFileLog::flush(self);
+    }
+
     fn enabled(&self) -> bool {
         self.shared.state.enabled()
     }
