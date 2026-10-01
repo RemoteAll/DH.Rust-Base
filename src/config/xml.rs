@@ -268,6 +268,9 @@ pub fn upsert_root_values(
     let mut writer = Writer::new(Vec::new());
     let write_err = |e: quick_xml::Error| ConfigError::Parse(format!("XML 写入失败: {e}"));
 
+    // 输入文本的根结束标签前是否粘接（缺换行）；重写时统一规范化
+    let needs_nl = needs_trailing_newline(text);
+
     let mut stack: Vec<String> = Vec::new();
     let mut pending: Option<(&str, bool)> = None; // （待替换的键, 是否已写入值）
 
@@ -344,10 +347,12 @@ pub fn upsert_root_values(
 
                 // 根结束前：插入缺失的键
                 if stack.is_empty() {
+                    let mut inserted = false;
                     for (key, value, comment) in items {
                         if seen.contains(key.as_str()) {
                             continue;
                         }
+                        inserted = true;
                         writer
                             .write_event(Event::Text(BytesText::from_escaped("\n  ")))
                             .map_err(write_err)?;
@@ -367,6 +372,13 @@ pub fn upsert_root_values(
                             .map_err(write_err)?;
                         writer
                             .write_event(Event::End(BytesEnd::new(key.as_str())))
+                            .map_err(write_err)?;
+                    }
+                    // 插入内容与根结束标签之间补换行（与元素块收尾一致）；
+                    // 输入本来粘接时也顺带规范化
+                    if inserted || needs_nl {
+                        writer
+                            .write_event(Event::Text(BytesText::from_escaped("\n")))
                             .map_err(write_err)?;
                     }
                 }
@@ -431,6 +443,8 @@ pub fn replace_root_section(text: &str, name: &str, inner: &str) -> Result<Strin
     let mut replaced = false;
     // 最近一个文本事件中最后一个换行后的空白（即下一元素的行首缩进）
     let mut last_indent = String::new();
+    // 输入文本的根结束标签前是否粘接（缺换行）；重写时统一规范化
+    let needs_nl = needs_trailing_newline(text);
 
     loop {
         match reader.read_event() {
@@ -477,13 +491,20 @@ pub fn replace_root_section(text: &str, name: &str, inner: &str) -> Result<Strin
                     continue;
                 }
                 stack.pop();
-                if stack.is_empty() && !replaced {
-                    // 根结束前：插入新节
-                    writer
-                        .write_event(Event::Text(BytesText::from_escaped("\n  ")))
-                        .map_err(write_err)?;
-                    write_section(&mut writer, name, inner, "  ")?;
-                    replaced = true;
+                if stack.is_empty() {
+                    if !replaced {
+                        // 根结束前：插入新节
+                        writer
+                            .write_event(Event::Text(BytesText::from_escaped("\n  ")))
+                            .map_err(write_err)?;
+                        write_section(&mut writer, name, inner, "  ")?;
+                        replaced = true;
+                    } else if needs_nl {
+                        // 输入本来粘接时顺带规范化
+                        writer
+                            .write_event(Event::Text(BytesText::from_escaped("\n")))
+                            .map_err(write_err)?;
+                    }
                 }
                 writer.write_event(Event::End(e)).map_err(write_err)?;
             }
@@ -515,6 +536,14 @@ pub fn replace_root_section(text: &str, name: &str, inner: &str) -> Result<Strin
 
 fn name_of(e: &quick_xml::events::BytesStart<'_>) -> String {
     String::from_utf8_lossy(e.name().as_ref()).to_string()
+}
+
+/// 文本的根结束标签（最后一个 `</`）之前是否缺换行（存在 `...</Key></Root>` 粘接格式）。
+fn needs_trailing_newline(text: &str) -> bool {
+    match text.rfind("</") {
+        Some(i) => !text[..i].trim_end_matches([' ', '\t', '\r']).ends_with('\n'),
+        None => false,
+    }
 }
 
 fn name_of_end(e: &quick_xml::events::BytesEnd<'_>) -> String {
@@ -653,6 +682,30 @@ mod tests {
         assert!(out.contains("<!--面板用户名-->"), "插入应带注释: {out}");
         assert!(out.contains("<WebUserName>admin</WebUserName>"), "{out}");
         assert!(!out.contains("<Debug>true</Debug>"), "旧值应被替换: {out}");
+        assert!(
+            out.contains("</WebUserName>\n</StarAgent>"),
+            "插入内容与根结束标签之间应有换行: {out}"
+        );
+    }
+
+    #[test]
+    fn glued_root_end_gets_normalized() {
+        // 历史文件可能形如 `...</Key></Root>`（根结束标签与上一元素粘接），重写时应补换行
+        let text = "<StarAgent>\n  <LocalPort>5500</LocalPort></StarAgent>";
+        let items = vec![("LocalPort".to_string(), "5600".to_string(), String::new())];
+        let out = upsert_root_values(text, &items).unwrap();
+        assert!(
+            out.contains("<LocalPort>5600</LocalPort>\n</StarAgent>"),
+            "upsert 应补换行: {out}"
+        );
+
+        let text = "<StarAgent>\n  <Services></Services></StarAgent>";
+        let inner = "    <ServiceInfo Name=\"a\" />\n";
+        let out = replace_root_section(text, "Services", inner).unwrap();
+        assert!(
+            out.contains("  </Services>\n</StarAgent>"),
+            "replace 应补换行: {out}"
+        );
     }
 
     #[test]
