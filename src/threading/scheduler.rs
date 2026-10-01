@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -57,6 +58,12 @@ const MIN_PERIOD_MS: i64 = 10;
 
 /// 调度器销毁时等待调度线程退出的最长时间。
 const DISPOSE_WAIT_MS: u64 = 5_000;
+
+/// 异步执行线程的空闲存活时长；超时退出，后续任务到来时按需新建。
+const ASYNC_IDLE_MS: u64 = 30_000;
+
+/// 异步执行任务（调度器 + 定时器）。
+type AsyncJob = (TimerScheduler, Timer);
 
 type TimeSource = Arc<dyn Fn() -> NaiveDateTime + Send + Sync>;
 
@@ -101,6 +108,9 @@ struct SchedulerInner {
     next_id: AtomicI32,
     disposing: AtomicBool,
     time_source: Mutex<Option<TimeSource>>,
+    /// 空闲异步执行线程的发送端队列：优先复用空闲线程，全部繁忙时新建线程，
+    /// 保持“每 tick 一条执行线程”的并行语义，仅在低负载时收敛线程数量。
+    async_idle: Mutex<Vec<Sender<AsyncJob>>>,
 }
 
 struct SchedulerState {
@@ -171,6 +181,7 @@ impl TimerScheduler {
                 next_id: AtomicI32::new(0),
                 disposing: AtomicBool::new(false),
                 time_source: Mutex::new(None),
+                async_idle: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -412,11 +423,7 @@ fn process(inner: Arc<SchedulerInner>) {
             // 必须在主线程设置状态，异步线程还没执行前，主线程不能开启新的一轮调度
             timer.set_calling(true);
             if timer.is_async() {
-                let scheduler = scheduler.clone();
-                let timer = timer.clone();
-                let _ = thread::Builder::new()
-                    .name("timer:Async".to_string())
-                    .spawn(move || execute(&scheduler, &timer));
+                dispatch_async(&inner, scheduler.clone(), timer.clone());
             } else {
                 execute(&scheduler, timer);
             }
@@ -482,6 +489,48 @@ fn check_time(scheduler: &TimerScheduler, timer: &Timer, now: i64) -> bool {
     }
 
     true
+}
+
+/// 派发异步定时器任务：优先复用空闲的异步执行线程，池空则新建线程。
+/// 保持与“每 tick 一线程”相同的并行语义（繁忙任务不排队），仅复用空闲线程。
+fn dispatch_async(inner: &Arc<SchedulerInner>, scheduler: TimerScheduler, timer: Timer) {
+    // 先尝试复用：send 失败说明该线程已退出（空闲超时），丢弃后继续找
+    {
+        let mut idle = inner.async_idle.lock().expect("async idle pool");
+        while let Some(tx) = idle.pop() {
+            if tx.send((scheduler.clone(), timer.clone())).is_ok() {
+                return;
+            }
+        }
+    }
+
+    let (tx, rx) = mpsc::channel::<AsyncJob>();
+    let pool_inner = Arc::clone(inner);
+    let worker_tx = tx.clone();
+    let _ = thread::Builder::new()
+        .name("timer:Async".to_string())
+        .spawn(move || async_worker(pool_inner, worker_tx, rx));
+    let _ = tx.send((scheduler, timer));
+}
+
+/// 异步执行线程主体：循环执行任务；空闲超过 `ASYNC_IDLE_MS` 后退出。
+/// 线程仅在被派发前注册进空闲池（池中线程均为空闲），执行期间不在池中，
+/// 从而“池里取到即复用、池空即新建”，与“每 tick 一线程”的并行度一致。
+fn async_worker(inner: Arc<SchedulerInner>, my_tx: Sender<AsyncJob>, rx: Receiver<AsyncJob>) {
+    loop {
+        // 注册为空闲等待复用；被派发时其 tx 会从池中取出，任务经 channel 送达
+        inner
+            .async_idle
+            .lock()
+            .expect("async idle pool")
+            .push(my_tx.clone());
+
+        match rx.recv_timeout(Duration::from_millis(ASYNC_IDLE_MS)) {
+            Ok((scheduler, timer)) => execute(&scheduler, &timer),
+            // 空闲超时或通道关闭：退出线程（下次派发时按需新建）
+            Err(_) => break,
+        }
+    }
 }
 
 /// 执行一次回调。对应 C# `TimerScheduler.Execute`（含异常隔离与 `OnExecuted`）。
@@ -1101,6 +1150,40 @@ mod tests {
 
         timer.cancel();
         timer2.cancel();
+        scheduler.dispose();
+    }
+
+    #[test]
+    fn async_workers_are_reused_when_idle() {
+        // 线程复用：连续多次异步触发后，空闲执行线程应留在池中等待复用
+        //（旧实现为每 tick 新建线程，空闲池恒为空）
+        let scheduler = TimerScheduler::create("test-async-reuse");
+        let count = Arc::new(AtomicI32::new(0));
+        let c = count.clone();
+        let timer = Timer::with_scheduler(scheduler.clone(), 0, 30, move |_| {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+        timer.set_async(true);
+
+        assert!(
+            wait_until(|| count.load(Ordering::SeqCst) >= 4, 3000),
+            "异步定时器应按时重复触发，count={}",
+            count.load(Ordering::SeqCst)
+        );
+        // 池非空 = 存在空闲执行线程等待复用（复用失效时为每 tick 新建且立即退出）
+        assert!(
+            wait_until(|| !scheduler.inner.async_idle.lock().expect("pool").is_empty(), 2000),
+            "空闲异步执行线程应被复用（池为空说明仍按 tick 新建线程）"
+        );
+        // 多次触发只应留下极少的空闲线程（复用而非线性增长）
+        let idle = scheduler.inner.async_idle.lock().expect("pool").len();
+        assert!(
+            idle <= 4,
+            "空闲线程数应远小于触发次数，实际 {idle}（count={}）",
+            count.load(Ordering::SeqCst)
+        );
+
+        timer.cancel();
         scheduler.dispose();
     }
 
