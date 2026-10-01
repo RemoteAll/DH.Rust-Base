@@ -26,6 +26,8 @@
 //! 依赖矩阵与版本锁定见《AgentRust迁移架构》第 3 节（DHDeploy 仓库 `Doc/`）。
 
 #[cfg(feature = "net")]
+pub mod controller;
+#[cfg(feature = "net")]
 pub mod http;
 #[cfg(feature = "http-client")]
 pub mod http_client;
@@ -35,6 +37,8 @@ pub mod mqtt;
 pub mod router;
 #[cfg(feature = "net")]
 pub mod rpc;
+#[cfg(feature = "net")]
+pub mod static_files;
 #[cfg(feature = "stun")]
 pub mod stun;
 #[cfg(feature = "net-tls")]

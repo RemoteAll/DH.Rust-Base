@@ -41,6 +41,8 @@ pub struct HttpRequest {
     pub headers: Vec<(String, String)>,
     /// 请求体（已按上限收全；单帧请求为引用计数共享的零拷贝字节，带引用计数下为共享分片）
     pub body: Bytes,
+    /// 客户端地址（`IP:Port`；未知来源或测试构造时为 `None`）
+    pub remote_addr: Option<String>,
 }
 
 impl HttpRequest {
@@ -408,16 +410,18 @@ async fn run_connection(
     handler: HttpHandler,
     options: HttpServerOptions,
 ) {
+    // 客户端地址在 TLS 包装前取出（握手后从泛型流上无法再取）
+    let remote = tcp.peer_addr().ok().map(|e| e.to_string());
     #[cfg(feature = "net-tls")]
     if let Some(acceptor) = tls {
         if let Ok(stream) = acceptor.accept(tcp).await {
-            serve_connection(stream, handler, options).await;
+            serve_connection(stream, remote, handler, options).await;
         }
         return;
     }
     #[cfg(not(feature = "net-tls"))]
     let _ = tls;
-    serve_connection(tcp, handler, options).await;
+    serve_connection(tcp, remote, handler, options).await;
 }
 
 /// 单连接服务（hyper HTTP/1.1 + 升级支持）。
@@ -425,8 +429,12 @@ async fn run_connection(
 /// 升级后的 WS 会话由**本任务就地继续驱动**（不 spawn 独立任务）：在
 /// “每连接独立线程”模式下 `block_on` 返回即销毁运行时，会让被 spawn 的会话
 /// 任务被连带取消（曾表现为 101 后连接被 RST）；就地续跑同时少一次任务跳转。
-async fn serve_connection<S>(stream: S, handler: HttpHandler, options: HttpServerOptions)
-where
+async fn serve_connection<S>(
+    stream: S,
+    remote: Option<String>,
+    handler: HttpHandler,
+    options: HttpServerOptions,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let upgrade_slot: Arc<Mutex<Option<(hyper::upgrade::OnUpgrade, WsServerHooks)>>> =
@@ -438,7 +446,8 @@ where
         let handler = handler.clone();
         let options = options.clone();
         let slot = slot.clone();
-        async move { Ok::<_, Infallible>(handle_http(req, handler, options, slot).await) }
+        let remote = remote.clone();
+        async move { Ok::<_, Infallible>(handle_http(req, handler, options, slot, remote).await) }
     });
     // 连接错误（含正常关闭）静默；升级路径由 with_upgrades 支撑
     let _ = http1::Builder::new()
@@ -465,6 +474,7 @@ async fn handle_http(
     handler: HttpHandler,
     options: HttpServerOptions,
     upgrade_slot: Arc<Mutex<Option<(hyper::upgrade::OnUpgrade, WsServerHooks)>>>,
+    remote: Option<String>,
 ) -> Response<Full<Bytes>> {
     // 升级意图必须先登记（handler 返回 WebSocket 时由 hyper 完成移交）
     let ws_candidate = is_ws_candidate(req.headers());
@@ -490,6 +500,7 @@ async fn handle_http(
             .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
             .collect(),
         body: body_bytes,
+        remote_addr: remote,
     };
 
     match (handler)(http_req).await {
