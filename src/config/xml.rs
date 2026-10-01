@@ -113,6 +113,8 @@ pub(crate) fn write_fields(root: &str, fields: &[(&str, &str, String)]) -> Strin
 pub fn read_to_json(text: &str) -> Result<serde_json::Value, ConfigError> {
     use serde_json::{Map, Value};
 
+    let text = text.trim_start_matches('\u{feff}');
+
     struct Frame {
         name: String,
         attrs: Map<String, Value>,
@@ -237,7 +239,285 @@ pub fn read_to_json(text: &str) -> Result<serde_json::Value, ConfigError> {
     }
 }
 
+/// 根下子元素键值 upsert（保留注释/属性/排版）：
+///
+/// - 已存在的元素只替换其文本值（原注释、缩进、其它元素原样保留）；空元素 `<Key/>` 在值非空时展开；
+/// - 缺失的键在根元素结束前插入（形如 `  <!--注释-->` + `  <Key>值</Key>`，注释为空则不插说明行）；
+/// - 未在 `items` 中的元素（如 C# 特有字段）完全不动。
+///
+/// `items` 为（键名, 值, 注释）三元组，用于 NewLife 风格 ` <Key>value</Key> ` 配置的保注释维护。
+pub fn upsert_root_values(
+    text: &str,
+    items: &[(String, String, String)],
+) -> Result<String, ConfigError> {
+    use std::collections::{HashMap, HashSet};
+
+    use quick_xml::events::{BytesEnd, BytesStart, BytesText};
+    use quick_xml::Writer;
+
+    let text = text.trim_start_matches('\u{feff}');
+
+    let lookup: HashMap<&str, (&str, &str)> = items
+        .iter()
+        .map(|(k, v, c)| (k.as_str(), (v.as_str(), c.as_str())))
+        .collect();
+    let mut seen: HashSet<&str> = HashSet::new();
+
+    let mut reader = Reader::from_str(text);
+    reader.config_mut().trim_text(false);
+    let mut writer = Writer::new(Vec::new());
+    let write_err = |e: quick_xml::Error| ConfigError::Parse(format!("XML 写入失败: {e}"));
+
+    let mut stack: Vec<String> = Vec::new();
+    let mut pending: Option<(&str, bool)> = None; // （待替换的键, 是否已写入值）
+
+    loop {
+        match reader.read_event() {
+            Err(e) => return Err(ConfigError::Parse(format!("XML 解析失败: {e}"))),
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(e)) => {
+                let name = name_of(&e);
+                stack.push(name.clone());
+                if stack.len() == 2 {
+                    if let Some((key, _)) = lookup.get_key_value(name.as_str()) {
+                        pending = Some((key, false));
+                        seen.insert(*key);
+                    }
+                }
+                writer.write_event(Event::Start(e)).map_err(write_err)?;
+            }
+            Ok(Event::Empty(e)) => {
+                let name = name_of(&e);
+                if stack.len() == 1 {
+                    if let Some((key, (value, _))) = lookup.get_key_value(name.as_str()) {
+                        seen.insert(*key);
+                        if !value.is_empty() {
+                            writer
+                                .write_event(Event::Start(BytesStart::new(name.as_str())))
+                                .map_err(write_err)?;
+                            writer
+                                .write_event(Event::Text(BytesText::new(value)))
+                                .map_err(write_err)?;
+                            writer
+                                .write_event(Event::End(BytesEnd::new(name.as_str())))
+                                .map_err(write_err)?;
+                            continue;
+                        }
+                    }
+                }
+                writer.write_event(Event::Empty(e)).map_err(write_err)?;
+            }
+            Ok(Event::Text(t)) => {
+                let mut replaced = false;
+                if let Some((key, false)) = pending {
+                    let value = lookup[key].0;
+                    if !value.is_empty() {
+                        writer
+                            .write_event(Event::Text(BytesText::new(value)))
+                            .map_err(write_err)?;
+                        replaced = true;
+                    }
+                }
+                if replaced {
+                    if let Some((_, written)) = pending.as_mut() {
+                        *written = true;
+                    }
+                } else {
+                    writer.write_event(Event::Text(t)).map_err(write_err)?;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = name_of_end(&e);
+                if let Some((key, written)) = pending.take() {
+                    if key == name && !written {
+                        let value = lookup[key].0;
+                        if !value.is_empty() {
+                            writer
+                                .write_event(Event::Text(BytesText::new(value)))
+                                .map_err(write_err)?;
+                        }
+                    } else if key != name {
+                        pending = Some((key, written));
+                    }
+                }
+                stack.pop();
+
+                // 根结束前：插入缺失的键
+                if stack.is_empty() {
+                    for (key, value, comment) in items {
+                        if seen.contains(key.as_str()) {
+                            continue;
+                        }
+                        writer
+                            .write_event(Event::Text(BytesText::from_escaped("\n  ")))
+                            .map_err(write_err)?;
+                        if !comment.is_empty() {
+                            writer
+                                .write_event(Event::Comment(BytesText::new(comment)))
+                                .map_err(write_err)?;
+                            writer
+                                .write_event(Event::Text(BytesText::from_escaped("\n  ")))
+                                .map_err(write_err)?;
+                        }
+                        writer
+                            .write_event(Event::Start(BytesStart::new(key.as_str())))
+                            .map_err(write_err)?;
+                        writer
+                            .write_event(Event::Text(BytesText::new(value)))
+                            .map_err(write_err)?;
+                        writer
+                            .write_event(Event::End(BytesEnd::new(key.as_str())))
+                            .map_err(write_err)?;
+                    }
+                }
+                writer.write_event(Event::End(e)).map_err(write_err)?;
+            }
+            Ok(other) => {
+                writer.write_event(other).map_err(write_err)?;
+            }
+        }
+    }
+
+    String::from_utf8(writer.into_inner())
+        .map_err(|e| ConfigError::Parse(format!("XML 输出编码错误: {e}")))
+}
+
+/// 替换根下指定子元素的整段内容（保留节前注释；节内原内容被替换，结束标签保持原缩进）。
+///
+/// 未找到该节时在根元素结束前插入。`inner` 为节内完整内容（含缩进与行尾换行，
+/// 如 `    <ServiceInfo Name="a" />\n`）；`inner` 为空时输出空元素 `<name></name>`。
+pub fn replace_root_section(text: &str, name: &str, inner: &str) -> Result<String, ConfigError> {
+    use quick_xml::events::{BytesEnd, BytesStart, BytesText};
+    use quick_xml::Writer;
+
+    let text = text.trim_start_matches('\u{feff}');
+
+    let mut reader = Reader::from_str(text);
+    reader.config_mut().trim_text(false);
+    let mut writer = Writer::new(Vec::new());
+    let write_err = |e: quick_xml::Error| ConfigError::Parse(format!("XML 写入失败: {e}"));
+
+    fn write_section(
+        writer: &mut Writer<Vec<u8>>,
+        name: &str,
+        inner: &str,
+        indent: &str,
+    ) -> Result<(), ConfigError> {
+        let err = |e: quick_xml::Error| ConfigError::Parse(format!("XML 写入失败: {e}"));
+        writer
+            .write_event(Event::Start(BytesStart::new(name)))
+            .map_err(err)?;
+        if !inner.is_empty() {
+            writer
+                .write_event(Event::Text(BytesText::from_escaped("\n")))
+                .map_err(err)?;
+            writer
+                .write_event(Event::Text(BytesText::from_escaped(inner)))
+                .map_err(err)?;
+            if !indent.is_empty() {
+                writer
+                    .write_event(Event::Text(BytesText::from_escaped(indent)))
+                    .map_err(err)?;
+            }
+        }
+        writer
+            .write_event(Event::End(BytesEnd::new(name)))
+            .map_err(err)?;
+        Ok(())
+    }
+
+    let mut stack: Vec<String> = Vec::new();
+    let mut skip: Option<usize> = None; // 跳过同名嵌套层级计数
+    let mut replaced = false;
+    // 最近一个文本事件中最后一个换行后的空白（即下一元素的行首缩进）
+    let mut last_indent = String::new();
+
+    loop {
+        match reader.read_event() {
+            Err(e) => return Err(ConfigError::Parse(format!("XML 解析失败: {e}"))),
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(e)) => {
+                let n = name_of(&e);
+                if let Some(level) = &mut skip {
+                    if n == name {
+                        *level += 1;
+                    }
+                    continue;
+                }
+                if stack.len() == 1 && n == name {
+                    write_section(&mut writer, name, inner, &last_indent)?;
+                    replaced = true;
+                    skip = Some(1);
+                    continue;
+                }
+                stack.push(n);
+                writer.write_event(Event::Start(e)).map_err(write_err)?;
+            }
+            Ok(Event::Empty(e)) => {
+                let n = name_of(&e);
+                if skip.is_some() {
+                    continue;
+                }
+                if stack.len() == 1 && n == name {
+                    write_section(&mut writer, name, inner, &last_indent)?;
+                    replaced = true;
+                    continue;
+                }
+                writer.write_event(Event::Empty(e)).map_err(write_err)?;
+            }
+            Ok(Event::End(e)) => {
+                let n = name_of_end(&e);
+                if let Some(level) = &mut skip {
+                    if n == name {
+                        *level -= 1;
+                        if *level == 0 {
+                            skip = None;
+                        }
+                    }
+                    continue;
+                }
+                stack.pop();
+                if stack.is_empty() && !replaced {
+                    // 根结束前：插入新节
+                    writer
+                        .write_event(Event::Text(BytesText::from_escaped("\n  ")))
+                        .map_err(write_err)?;
+                    write_section(&mut writer, name, inner, "  ")?;
+                    replaced = true;
+                }
+                writer.write_event(Event::End(e)).map_err(write_err)?;
+            }
+            Ok(Event::Text(t)) => {
+                if skip.is_none() {
+                    let raw = String::from_utf8_lossy(t.as_ref());
+                    if let Some(pos) = raw.rfind('\n') {
+                        let tail = raw[pos + 1..].to_string();
+                        if tail.chars().all(|c| c == ' ' || c == '\t') {
+                            last_indent = tail;
+                        } else {
+                            last_indent.clear();
+                        }
+                    }
+                    writer.write_event(Event::Text(t)).map_err(write_err)?;
+                }
+            }
+            Ok(other) => {
+                if skip.is_none() {
+                    writer.write_event(other).map_err(write_err)?;
+                }
+            }
+        }
+    }
+
+    String::from_utf8(writer.into_inner())
+        .map_err(|e| ConfigError::Parse(format!("XML 输出编码错误: {e}")))
+}
+
 fn name_of(e: &quick_xml::events::BytesStart<'_>) -> String {
+    String::from_utf8_lossy(e.name().as_ref()).to_string()
+}
+
+fn name_of_end(e: &quick_xml::events::BytesEnd<'_>) -> String {
     String::from_utf8_lossy(e.name().as_ref()).to_string()
 }
 
@@ -328,5 +608,73 @@ mod tests {
         assert_eq!(services.len(), 2);
         assert_eq!(services[0]["Name"], "StarServer");
         assert_eq!(services[1]["FileName"], "StarWeb.zip");
+    }
+
+    #[test]
+    fn read_to_json_strips_utf8_bom() {
+        // C# XmlSerializer 保存的文件带 UTF-8 BOM；读取与重写时都应剥离
+        let text = "\u{feff}<?xml version=\"1.0\"?>\n<StarAgent><LocalPort>5500</LocalPort></StarAgent>";
+        let json = read_to_json(text).unwrap();
+        assert_eq!(json["StarAgent"]["LocalPort"], "5500");
+
+        let items = vec![("LocalPort".to_string(), "5600".to_string(), String::new())];
+        let out = upsert_root_values(text, &items).unwrap();
+        assert!(!out.starts_with('\u{feff}'), "输出不应带 BOM: {out:?}");
+        assert!(out.contains("<LocalPort>5600</LocalPort>"), "{out}");
+
+        let out = replace_root_section(text, "Services", "").unwrap();
+        assert!(!out.starts_with('\u{feff}'), "输出不应带 BOM: {out:?}");
+        assert!(out.contains("<Services></Services>"), "{out}");
+    }
+
+    #[test]
+    fn upsert_root_values_replaces_and_inserts_keeping_comments() {
+        let text = r#"<?xml version="1.0" encoding="utf-8"?>
+<StarAgent>
+  <!--调试开关。默认true-->
+  <Debug>true</Debug>
+  <!--本地端口。默认5500-->
+  <LocalPort>5500</LocalPort>
+</StarAgent>"#;
+        let items = vec![
+            ("Debug".to_string(), "false".to_string(), String::new()),
+            ("LocalPort".to_string(), "5600".to_string(), String::new()),
+            (
+                "WebUserName".to_string(),
+                "admin".to_string(),
+                "面板用户名".to_string(),
+            ),
+        ];
+
+        let out = upsert_root_values(text, &items).unwrap();
+        assert!(out.contains("<Debug>false</Debug>"), "{out}");
+        assert!(out.contains("<LocalPort>5600</LocalPort>"), "{out}");
+        assert!(out.contains("<!--调试开关。默认true-->"), "原注释应保留: {out}");
+        assert!(out.contains("<!--面板用户名-->"), "插入应带注释: {out}");
+        assert!(out.contains("<WebUserName>admin</WebUserName>"), "{out}");
+        assert!(!out.contains("<Debug>true</Debug>"), "旧值应被替换: {out}");
+    }
+
+    #[test]
+    fn replace_root_section_replaces_and_keeps_surroundings() {
+        let text = r#"<StarAgent>
+  <Delay>3000</Delay>
+  <!--应用服务集合-->
+  <Services>
+    <ServiceInfo Name="old" FileName="old.zip" />
+  </Services>
+</StarAgent>"#;
+        let inner = "    <ServiceInfo Name=\"a\" FileName=\"a.zip\" />\n";
+
+        let out = replace_root_section(text, "Services", inner).unwrap();
+        assert!(out.contains("<!--应用服务集合-->"), "节前注释应保留: {out}");
+        assert!(out.contains("Name=\"a\""), "{out}");
+        assert!(!out.contains("Name=\"old\""), "旧内容应被替换: {out}");
+        assert!(out.contains("<Delay>3000</Delay>"), "{out}");
+        assert!(out.contains("  </Services>"), "结束标签应保持原缩进: {out}");
+
+        // 空 inner：输出空元素
+        let out = replace_root_section(text, "Services", "").unwrap();
+        assert!(out.contains("<Services></Services>"), "空节应为空元素: {out}");
     }
 }
