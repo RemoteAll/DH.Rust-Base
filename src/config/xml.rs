@@ -241,7 +241,8 @@ pub fn read_to_json(text: &str) -> Result<serde_json::Value, ConfigError> {
 
 /// 根下子元素键值 upsert（保留注释/属性/排版）：
 ///
-/// - 已存在的元素只替换其文本值（原注释、缩进、其它元素原样保留）；空元素 `<Key/>` 在值非空时展开；
+/// - 已存在的元素只替换其文本值（原注释、缩进、其它元素原样保留）；空元素 `<Key/>` 在值非空时展开，
+///   值为空串时清空元素文本（`<Key></Key>`，支持“清空字段”保存），`<Key/>` 形态保持自闭合；
 /// - 缺失的键在根元素结束前插入（形如 `  <!--注释-->` + `  <Key>值</Key>`，注释为空则不插说明行）；
 /// - 未在 `items` 中的元素（如 C# 特有字段）完全不动。
 ///
@@ -314,12 +315,13 @@ pub fn upsert_root_values(
                 let mut replaced = false;
                 if let Some((key, false)) = pending {
                     let value = lookup[key].0;
+                    // 空值同样视为“已替换”：丢弃旧文本（清空元素），支持“清空字段”保存
                     if !value.is_empty() {
                         writer
                             .write_event(Event::Text(BytesText::new(value)))
                             .map_err(write_err)?;
-                        replaced = true;
                     }
+                    replaced = true;
                 }
                 if replaced {
                     if let Some((_, written)) = pending.as_mut() {
@@ -686,6 +688,29 @@ mod tests {
             out.contains("</WebUserName>\n</StarAgent>"),
             "插入内容与根结束标签之间应有换行: {out}"
         );
+    }
+
+    #[test]
+    fn upsert_root_values_clears_text_with_empty_value() {
+        // 空值应清空元素文本（支持“清空字段”保存，如 WebLogs/PortTrafficPorts）
+        let text = "<StarAgent>\n  <WebLogs>demo=/tmp/a.log</WebLogs>\n  <Server>x</Server>\n</StarAgent>";
+        let items = vec![
+            ("WebLogs".to_string(), String::new(), String::new()),
+            ("Server".to_string(), "y".to_string(), String::new()),
+        ];
+        let out = upsert_root_values(text, &items).unwrap();
+        assert!(
+            out.contains("<WebLogs></WebLogs>"),
+            "空值应清空元素文本: {out}"
+        );
+        assert!(!out.contains("demo="), "旧值应被清除: {out}");
+        assert!(out.contains("<Server>y</Server>"), "非空值正常替换: {out}");
+
+        // 自闭合形态：空值时保持自闭合
+        let text = "<StarAgent>\n  <WebLogs/>\n</StarAgent>";
+        let items = vec![("WebLogs".to_string(), String::new(), String::new())];
+        let out = upsert_root_values(text, &items).unwrap();
+        assert!(out.contains("<WebLogs/>"), "自闭合应保持: {out}");
     }
 
     #[test]
