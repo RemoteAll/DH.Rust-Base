@@ -46,6 +46,10 @@ rustls-pemfile = { version = "2", optional = true }
 # 自签证书生成（Agent HTTPS 监听开箱即用；纯 Rust，ring 后端）
 rcgen = { version = "0.13", optional = true, default-features = false, features = ["pem", "ring"] }
 
+[target.'cfg(windows)'.dependencies]
+# 系统运行时长（日志头 `#SystemStarted`，对齐 C# Environment.TickCount64 → GetTickCount64）
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }
+
 [features]
 # TOML 配置维护管线（tcp-scanner-server 实践沉淀；启用后提供 config::toml 模块）
 toml = ["dep:toml", "dep:toml_edit"]

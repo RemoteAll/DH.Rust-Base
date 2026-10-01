@@ -45,7 +45,7 @@ pub use xtrace::{
     write_exception, write_fmt, write_line,
 };
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 
 /// 日志队列积压上限：超过后丢弃新日志（对齐 DH.NCore——磁盘故障/输出阻塞时防内存无界增长）
 const MAX_QUEUE: usize = 1024;
@@ -296,13 +296,59 @@ impl ILog for NullLog {
 
 // ————— 行格式 —————
 
-/// 构建标准日志行：`yyyy-MM-dd HH:mm:ss.fff [级别] 正文`。
+/// 格式化后的日志行（行文本 + 线程元数据，控制台按线程着色时使用）。
+pub(crate) struct LogLine {
+    /// 完整行文本（不含换行符）
+    pub text: String,
+    /// 线程序号（进程内自增，等价 C# `ManagedThreadId` 的小整数；1 号线程对应灰色）
+    pub thread_id: i32,
+}
+
+/// 线程序号分配。对应 C# `ManagedThreadId`：线程专有且稳定的小整数。
+static NEXT_THREAD_ID: AtomicI32 = AtomicI32::new(1);
+
+thread_local! {
+    static THREAD_ID: i32 = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 当前线程的展示信息：`(线程ID, 类型, 名称)`。
 ///
-/// 文件与控制台共用（对应 DH.NCore `WriteLogEventArgs.ToString` 的默认行格式；
-/// Rust 版在行内带日期——控制台场景没有按天文件名可依赖）。
-pub(crate) fn format_line(level: LogLevel, message: &str) -> String {
-    let now = crate::times::format_datetime_ms(&chrono::Local::now().naive_local());
-    format!("{now} [{}] {message}", level.as_str())
+/// 对齐 DH.NCore `WriteLogEventArgs`：
+/// - 类型：`N` 普通线程 / `Y` 线程池线程（Rust 近似为 tokio 工作线程）/ `W` 网页线程（无此概念，不出现）；
+/// - 名称：线程名；无名与主线程显示 `-`，tokio 工作线程显示 `P`（对齐 C# 线程池线程的 `P` 标记）。
+fn thread_info() -> (i32, char, String) {
+    let thread_id = THREAD_ID.with(|value| *value);
+    let name = std::thread::current().name().map(|s| s.to_string());
+
+    let kind = match name.as_deref() {
+        Some(name) if name.starts_with("tokio") => 'Y',
+        _ => 'N',
+    };
+    let name = match name.as_deref() {
+        None | Some("main") => "-".to_string(),
+        Some("tokio-runtime-worker") => "P".to_string(),
+        Some(name) => name.to_string(),
+    };
+
+    (thread_id, kind, name)
+}
+
+/// 构建标准日志行：`HH:mm:ss.fff 线程ID 类型 名称 正文`。
+///
+/// 与 DH.NCore `WriteLogEventArgs.ToString()` 的默认行格式逐列对齐
+/// （`Setting.LogLineFormat = "Time|ThreadId|Kind|Name|Message"`；默认列不含日志级别）。
+/// 文件与控制台共用。级别参数保留用于后续支持可配置列。
+pub(crate) fn format_line(_level: LogLevel, message: &str) -> LogLine {
+    let time = chrono::Local::now().format("%H:%M:%S%.3f");
+    let (thread_id, kind, name) = thread_info();
+
+    let mut text = format!("{time} {thread_id:02} {kind} {name}");
+    if !message.is_empty() {
+        text.push(' ');
+        text.push_str(message);
+    }
+
+    LogLine { text, thread_id }
 }
 
 // ————— 宏路径导出（`dhrust::logs::info!` 等） —————
@@ -341,8 +387,15 @@ mod tests {
     #[test]
     fn line_format_shape() {
         let line = format_line(LogLevel::Warn, "磁盘空间不足");
-        assert!(line.contains(" [WARN] 磁盘空间不足"), "行格式不符: {line}");
-        // 形如 2026-09-29 12:34:56.789 [WARN] ...
-        assert_eq!(line.as_bytes().get(4), Some(&b'-'));
+        assert!(line.thread_id >= 1, "应分配线程序号");
+
+        // 形如 12:34:56.789 01 N - 磁盘空间不足（列序对齐 DH.NCore 默认 LogLineFormat）
+        let parts: Vec<&str> = line.text.split(' ').collect();
+        assert!(parts.len() >= 5, "列数不足: {}", line.text);
+        assert_eq!(parts[0].len(), 12, "时间列应形如 HH:mm:ss.fff: {}", line.text);
+        assert_eq!(parts[1].len(), 2, "线程ID列应为两位: {}", line.text);
+        assert!(matches!(parts[2], "N" | "Y" | "W"), "类型列: {}", line.text);
+        assert!(!parts[3].is_empty(), "名称列: {}", line.text);
+        assert_eq!(parts[4..].join(" "), "磁盘空间不足");
     }
 }

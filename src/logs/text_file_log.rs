@@ -1,9 +1,11 @@
 //! 文本文件日志（对应 DH.NCore `TextFileLog`）。
 //!
 //! - 异步写入：日志先入队，由专用写线程批量落盘（调用方不阻塞在磁盘 IO 上）；
-//! - 滚动：按天一个文件（默认 `yyyy_MM_dd.log`），单文件超过 10MB 拆分为 `_1`、`_2`…；
-//! - 备份：目录内日志文件超过上限后删除最旧的（默认保留 100 份）；
-//! - 日志头：每个进程首次写入时输出进程/环境信息（对齐 DH.NCore `GetHead`）；
+//! - 滚动：按天一个文件（默认 `yyyy_MM_dd.log`），单文件超过 10MB 拆分为 `_2`、`_3`…；
+//! - 备份：目录内日志文件超过上限后删除最旧的（默认保留 200 份）；
+//! - 日志头：每个进程首次写入时输出进程/环境信息（字段与列序对齐 DH.NCore `GetHead`）；
+//! - 行格式：`HH:mm:ss.fff 线程ID 类型 名称 正文`（对齐 DH.NCore 默认 `LogLineFormat`）；
+//! - 正文换行：Windows CRLF / 其它 LF（对齐 C# `TextWriter.WriteLine` 的 `Environment.NewLine`）；
 //! - 空闲 5 秒自动关闭文件句柄；队列积压超过 1024 条时丢弃新日志（防内存无界）。
 
 use std::collections::HashMap;
@@ -24,13 +26,15 @@ use super::{format_line, ILog, LogLevel, LogOptions, MAX_QUEUE};
 const IDLE_CLOSE: Duration = Duration::from_secs(5);
 /// 文件创建失败的重试阈值（同一目标文件失败 3 次后不再尝试，换文件后重置；对齐 DH.NCore）
 const MAX_OPEN_ERRORS: usize = 3;
+/// 正文换行：对齐 C# `TextWriter.WriteLine` 使用的 `Environment.NewLine`（Windows CRLF / 其它 LF）
+const EOL: &str = if cfg!(windows) { "\r\n" } else { "\n" };
 
 /// 文件日志选项
 #[derive(Debug, Clone)]
 pub struct FileLogOptions {
     /// 单文件大小上限（字节；超过后拆分 `_1`、`_2`…；0 不限制）。默认 10MB（对齐 DH.NCore）
     pub max_bytes: u64,
-    /// 备份个数上限（目录内日志文件超过后删除最旧的；0 不限制）。默认 100
+    /// 备份个数上限（目录内日志文件超过后删除最旧的；0 不限制）。默认 200（对齐 DH.NCore）
     pub backups: usize,
     /// 文件名格式（`{date}` 占位符 = `yyyy_MM_dd`）。默认 `{date}.log`
     pub file_format: String,
@@ -40,7 +44,7 @@ impl Default for FileLogOptions {
     fn default() -> Self {
         Self {
             max_bytes: 10 * 1024 * 1024,
-            backups: 100,
+            backups: 200,
             file_format: "{date}.log".to_owned(),
         }
     }
@@ -148,7 +152,7 @@ impl ILog for TextFileLog {
         if self.shared.queued.load(Ordering::Relaxed) > MAX_QUEUE {
             return;
         }
-        if self.tx.send(Msg::Line(format_line(level, message))).is_ok() {
+        if self.tx.send(Msg::Line(format_line(level, message).text)).is_ok() {
             self.shared.queued.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -214,6 +218,7 @@ fn collect(msg: Msg, shared: &Shared, batch: &mut Vec<String>, acks: &mut Vec<Se
 /// 写入一批日志（确定目标文件；切换文件时清理超量备份）
 fn write_batch(shared: &Shared, writer: &mut WriterState, batch: &[String]) {
     let target = pick_file(shared);
+    let mut removed = Vec::new();
 
     let mut file_guard = shared
         .file
@@ -224,7 +229,7 @@ fn write_batch(shared: &Shared, writer: &mut WriterState, batch: &[String]) {
         *file_guard = None;
         writer.current = Some(target.clone());
         shared.open_errors.store(0, Ordering::Relaxed);
-        prune_backups(shared);
+        removed = prune_backups(shared);
     }
 
     if file_guard.is_none() {
@@ -258,7 +263,20 @@ fn write_batch(shared: &Shared, writer: &mut WriterState, batch: &[String]) {
     if let Some(file) = file_guard.as_mut() {
         for line in batch {
             let _ = file.write_all(line.as_bytes());
-            let _ = file.write_all(b"\n");
+            let _ = file.write_all(EOL.as_bytes());
+        }
+
+        // 对齐 DH.NCore：清理超量备份后补一条提示日志（写入新文件）
+        for (name, size) in removed {
+            let tip = format_line(
+                LogLevel::Info,
+                &format!(
+                    "日志文件达到上限 {}，删除 {}，大小 {}Byte",
+                    shared.options.backups, name, size
+                ),
+            );
+            let _ = file.write_all(tip.text.as_bytes());
+            let _ = file.write_all(EOL.as_bytes());
         }
     }
 }
@@ -296,7 +314,7 @@ fn pick_file(shared: &Shared) -> PathBuf {
         return path;
     }
 
-    // 找到第一个未达到大小上限的文件（原名、_1、_2…，最多尝试 1024 个）
+    // 找到第一个未达到上限的文件（原名、_2、_3…，最多尝试 1024 个；对齐 DH.NCore）
     let (stem, ext) = match name.rsplit_once('.') {
         Some((stem, ext)) => (stem.to_owned(), format!(".{ext}")),
         None => (name.clone(), String::new()),
@@ -305,7 +323,7 @@ fn pick_file(shared: &Shared) -> PathBuf {
         let candidate = if i == 0 {
             path.clone()
         } else {
-            shared.dir.join(format!("{stem}_{i}{ext}"))
+            shared.dir.join(format!("{stem}_{}{ext}", i + 1))
         };
         let Ok(meta) = std::fs::metadata(&candidate) else {
             return candidate; // 文件不存在：直接使用
@@ -317,16 +335,20 @@ fn pick_file(shared: &Shared) -> PathBuf {
     path
 }
 
-/// 清理超量备份（对齐 DH.NCore：先删 `*.del` 残留，再把最旧的日志文件删到上限）
-fn prune_backups(shared: &Shared) {
+/// 清理超量备份。返回被删除的文件 `(名称, 大小)`，供调用方补提示日志（对齐 DH.NCore）。
+///
+/// 对齐 DH.NCore：先删 `*.del` 残留，再把最旧的日志文件删到上限；
+/// 排序优先使用创建时间（`Metadata::created`，不可用时回退修改时间）。
+fn prune_backups(shared: &Shared) -> Vec<(String, u64)> {
+    let mut removed = Vec::new();
     if shared.options.backups == 0 {
-        return;
+        return removed;
     }
     let Ok(entries) = std::fs::read_dir(&shared.dir) else {
-        return;
+        return removed;
     };
 
-    let mut logs: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    let mut logs: Vec<(PathBuf, std::time::SystemTime, u64)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name();
@@ -339,72 +361,245 @@ fn prune_backups(shared: &Shared) {
         if !name.ends_with(".log") || !path.is_file() {
             continue;
         }
-        let modified = entry
-            .metadata()
-            .and_then(|meta| meta.modified())
+        let Ok(meta) = entry.metadata() else { continue };
+        let time = meta
+            .created()
+            .or_else(|_| meta.modified())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        logs.push((path, modified));
+        logs.push((path, time, meta.len()));
     }
 
     if logs.len() <= shared.options.backups {
-        return;
+        return removed;
     }
-    logs.sort_by_key(|(_, time)| *time);
+    logs.sort_by_key(|(_, time, _)| *time);
     let remove_count = logs.len() - shared.options.backups;
-    for (path, _) in logs.into_iter().take(remove_count) {
+    for (path, _, size) in logs.into_iter().take(remove_count) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         if std::fs::remove_file(&path).is_err() {
             // 删除失败（文件被占用）：改名 .del 供下次清理（对齐 DH.NCore）
             let _ = std::fs::rename(&path, path.with_extension("log.del"));
         }
+        removed.push((name, size));
     }
+
+    removed
 }
 
-/// 进程/环境信息日志头（对齐 DH.NCore `GetHead`；每进程首次写入时输出一次）
+/// 进程/环境信息日志头（对齐 DH.NCore `Logger.GetHead`；每进程首次写入时输出一次）。
+///
+/// 与 C# 的已知近似：`#Software/#AppDomain` 取程序名（C# 取程序集标题/AppDomain 名）；
+/// `#CLR` 固定为 `Rust`（无 CLR 概念，保留字段名）；`#GC/#ThreadPool/#Memory` 等
+/// 运行时专属信息不输出（等价 C# 未注册 MachineInfo 的场景）。
 fn process_head() -> String {
     let mut head = String::new();
 
     let exe = std::env::current_exe().ok();
-    let name = exe
+    let exe_path = exe
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let software = exe
         .as_ref()
         .and_then(|path| path.file_stem())
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let _ = write!(head, "#Software: {name}\r\n");
+
+    let _ = write!(head, "#Software: {software}\r\n");
     let _ = write!(head, "#ProcessID: {}", std::process::id());
     if cfg!(target_pointer_width = "64") {
         let _ = write!(head, " x64");
     }
     head.push_str("\r\n");
-    if let Some(exe) = &exe {
-        let _ = write!(head, "#FileName: {}\r\n", exe.display());
-        if let Some(dir) = exe.parent() {
-            let _ = write!(head, "#BaseDirectory: {}\r\n", dir.display());
-        }
+    // Rust 无 AppDomain，用程序名近似（C# 的 FriendlyName 通常即程序集名）
+    let _ = write!(head, "#AppDomain: {software}\r\n");
+    if !exe_path.is_empty() {
+        let _ = write!(head, "#FileName: {exe_path}\r\n");
+    }
+
+    let base_dir = exe
+        .as_ref()
+        .and_then(|path| path.parent())
+        .map(with_trailing_sep);
+    if let Some(base_dir) = &base_dir {
+        let _ = write!(head, "#BaseDirectory: {base_dir}\r\n");
     }
     if let Ok(cwd) = std::env::current_dir() {
-        let _ = write!(head, "#CurrentDirectory: {}\r\n", cwd.display());
-    }
-    let _ = write!(head, "#TempPath: {}\r\n", std::env::temp_dir().display());
-    let args: Vec<String> = std::env::args().collect();
-    if !args.is_empty() {
-        let _ = write!(head, "#CommandLine: {}\r\n", args.join(" "));
+        let cwd_text = cwd.display().to_string();
+        // 对齐 C#：当前目录与基准目录一致时不输出
+        let same = base_dir
+            .as_deref()
+            .map(|base| normalize_dir(base) == normalize_dir(&cwd_text))
+            .unwrap_or(false);
+        if !same {
+            let _ = write!(head, "#CurrentDirectory: {cwd_text}\r\n");
+        }
     }
     let _ = write!(
         head,
-        "#OS: {}, {}\r\n",
-        std::env::consts::OS,
-        std::env::consts::ARCH
+        "#TempPath: {}\r\n",
+        with_trailing_sep(&std::env::temp_dir())
+    );
+
+    let args: Vec<String> = std::env::args().collect();
+    if !args.is_empty() {
+        // 对齐 C# Environment.CommandLine：程序路径含空格时加引号
+        let mut parts = Vec::with_capacity(args.len());
+        for (i, arg) in args.iter().enumerate() {
+            if i == 0 && arg.contains(' ') {
+                parts.push(format!("\"{arg}\""));
+            } else {
+                parts.push(arg.clone());
+            }
+        }
+        let _ = write!(head, "#CommandLine: {}\r\n", parts.join(" "));
+    }
+
+    let _ = write!(head, "#ApplicationType: {}\r\n", application_type());
+    let _ = write!(head, "#CLR: Rust\r\n");
+    let _ = write!(
+        head,
+        "#OS: {}, {}/{}\r\n",
+        os_description(),
+        machine_name(),
+        user_name()
     );
     let cpu = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
     let _ = write!(head, "#CPU: {cpu}\r\n");
+    if let Some(started) = system_started() {
+        let _ = write!(head, "#SystemStarted: {started}\r\n");
+    }
+    let _ = write!(head, "#Date: {}\r\n", Local::now().format("%Y-%m-%d"));
+    let _ = write!(head, "#详解：https://newlifex.com/core/log\r\n");
     let _ = write!(
         head,
-        "#Time: {}\r\n",
-        crate::times::format_datetime_ms(&Local::now().naive_local())
+        "#字段: 时间 线程ID 线程池Y/网页W/普通N 线程名/任务ID/定时T/线程池P/长任务L 消息内容\r\n"
     );
+    let _ = write!(head, "#Fields: Time ThreadId Kind Name Message\r\n");
+
     head
+}
+
+/// 目录文本 + 平台尾分隔符（对齐 C# `AppDomain.BaseDirectory` / `Path.GetTempPath()` 的形态）。
+fn with_trailing_sep(dir: &Path) -> String {
+    let mut text = dir.display().to_string();
+    let sep = std::path::MAIN_SEPARATOR;
+    if !text.ends_with(sep) {
+        text.push(sep);
+    }
+    text
+}
+
+/// 目录归一化（忽略大小写与尾分隔符；用于 `#CurrentDirectory` 是否输出）。
+fn normalize_dir(text: &str) -> String {
+    text.trim_end_matches(['/', '\\']).to_ascii_lowercase()
+}
+
+/// 应用类型（对齐 C# `#ApplicationType`）：任一标准流是终端视为控制台，否则按服务处理。
+fn application_type() -> &'static str {
+    use std::io::IsTerminal;
+
+    if std::io::stdout().is_terminal()
+        || std::io::stderr().is_terminal()
+        || std::io::stdin().is_terminal()
+    {
+        "Console"
+    } else {
+        "Service"
+    }
+}
+
+/// 操作系统描述（对齐 C# `#OS` 第一段：尽量给出名称与版本）。
+fn os_description() -> String {
+    if cfg!(target_os = "linux") {
+        if let Ok(text) = std::fs::read_to_string("/etc/os-release") {
+            for line in text.lines() {
+                if let Some(value) = line.strip_prefix("PRETTY_NAME=") {
+                    return value.trim().trim_matches('"').to_string();
+                }
+            }
+        }
+        "Linux".to_string()
+    } else if cfg!(windows) {
+        std::env::var("OS").unwrap_or_else(|_| "Windows".to_string())
+    } else if cfg!(target_os = "macos") {
+        "macOS".to_string()
+    } else {
+        std::env::consts::OS.to_string()
+    }
+}
+
+/// 机器名（对齐 C# `#OS` 第二段前半）。
+fn machine_name() -> String {
+    if let Ok(name) = std::env::var("COMPUTERNAME") {
+        if !name.trim().is_empty() {
+            return name;
+        }
+    }
+    if let Ok(name) = std::env::var("HOSTNAME") {
+        if !name.trim().is_empty() {
+            return name;
+        }
+    }
+    std::fs::read_to_string("/etc/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// 用户名（对齐 C# `#OS` 第二段后半）。
+fn user_name() -> String {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_default()
+}
+
+/// 系统启动至今的时长文本（对齐 C# `#SystemStarted: {TimeSpan}`，如 `4.20:09:04.8750000`）。
+///
+/// Linux 读 `/proc/uptime`，Windows 调 `GetTickCount64`（对齐 `Environment.TickCount64`）；
+/// macOS 暂缺实现（不输出该行）。
+fn system_started() -> Option<String> {
+    let millis = system_uptime_millis()?;
+    let days = millis / 86_400_000;
+    let rem = millis % 86_400_000;
+    let hh = rem / 3_600_000;
+    let mm = (rem % 3_600_000) / 60_000;
+    let ss = (rem % 60_000) / 1000;
+    let ms = rem % 1000;
+
+    // TimeSpan.ToString()：天数为 0 时省略 `d.` 段；小数秒固定 7 位
+    if days > 0 {
+        Some(format!("{days}.{hh:02}:{mm:02}:{ss:02}.{ms:03}0000"))
+    } else {
+        Some(format!("{hh:02}:{mm:02}:{ss:02}.{ms:03}0000"))
+    }
+}
+
+/// 系统启动至今的毫秒数。
+#[cfg(target_os = "linux")]
+fn system_uptime_millis() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/uptime").ok()?;
+    let secs: f64 = text.split_whitespace().next()?.parse().ok()?;
+    Some((secs * 1000.0) as u64)
+}
+
+/// 系统启动至今的毫秒数。
+#[cfg(windows)]
+fn system_uptime_millis() -> Option<u64> {
+    // GetTickCount64：系统启动以来的毫秒数（对齐 C# Environment.TickCount64）
+    let millis = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+    Some(millis)
+}
+
+/// 系统启动至今的毫秒数（其它平台暂缺）。
+#[cfg(not(any(target_os = "linux", windows)))]
+fn system_uptime_millis() -> Option<u64> {
+    None
 }
 
 #[cfg(test)]
@@ -450,9 +645,35 @@ mod tests {
 
         let file = dir.join(format!("{}.log", Local::now().format("%Y_%m_%d")));
         let text = read_file(&file);
-        assert!(text.contains("#Software: "), "应写日志头: {text}");
-        assert!(text.contains("#ProcessID: "), "日志头应含进程号: {text}");
-        assert!(text.contains("[INFO] 你好 hello"), "应含日志行: {text}");
+
+        // 日志头字段与列序对齐 DH.NCore GetHead
+        for field in [
+            "#Software: ",
+            "#ProcessID: ",
+            "#FileName: ",
+            "#TempPath: ",
+            "#CommandLine: ",
+            "#ApplicationType: ",
+            "#CLR: ",
+            "#OS: ",
+            "#CPU: ",
+            "#Date: ",
+            "#Fields: Time ThreadId Kind Name Message",
+        ] {
+            assert!(text.contains(field), "日志头应含 {field}: {text}");
+        }
+
+        // 行格式：HH:mm:ss.fff 线程ID 类型 名称 正文（对齐 DH.NCore 默认 LogLineFormat）
+        let line = text
+            .lines()
+            .find(|line| line.ends_with(" 你好 hello"))
+            .expect("应含日志行");
+        let parts: Vec<&str> = line.split(' ').collect();
+        assert!(parts.len() >= 5, "列数不足: {line}");
+        assert_eq!(parts[0].len(), 12, "时间列应形如 HH:mm:ss.fff: {line}");
+        assert_eq!(parts[1].len(), 2, "线程ID列应为两位: {line}");
+        assert_eq!(parts[2], "N", "测试线程应为普通线程: {line}");
+        assert!(!text.contains("[INFO]"), "行格式不应包含级别标记: {text}");
         assert!(!text.contains("调试不应出现"), "低于级别的日志不应出现: {text}");
     }
 
@@ -477,11 +698,14 @@ mod tests {
 
         let date = Local::now().format("%Y_%m_%d").to_string();
         let first = dir.join(format!("{date}.log"));
-        let second = dir.join(format!("{date}_1.log"));
-        let third = dir.join(format!("{date}_2.log"));
-        assert!(third.exists(), "第三条应拆分到 _2 文件");
+        let second = dir.join(format!("{date}_2.log"));
+        let third = dir.join(format!("{date}_3.log"));
+        assert!(
+            third.exists(),
+            "第三条应拆分到 _3 文件（对齐 DH.NCore：满后 _2、_3…）"
+        );
         // backups = 1：除最新文件外应已被清理
-        assert!(second.exists(), "_1 文件应保留（最新备份）");
+        assert!(second.exists(), "_2 文件应保留（最新备份）");
         assert!(!first.exists(), "最旧文件应被清理");
     }
 }
