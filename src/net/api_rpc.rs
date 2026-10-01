@@ -112,7 +112,7 @@ fn reply_json(reply: &ApiReply) -> String {
     let mut s = String::from("{");
     let mut first = true;
 
-    let mut push_kv = |s: &mut String, first: &mut bool, key: &str, value: &str, raw: bool| {
+    let push_kv = |s: &mut String, first: &mut bool, key: &str, value: &str, raw: bool| {
         if !*first {
             s.push(',');
         }
