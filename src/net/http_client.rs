@@ -204,6 +204,23 @@ pub fn validate_method(method: &str) -> Result<(), HttpClientError> {
     parse_method(method).map(|_| ())
 }
 
+/// GET 请求（同步版；内部创建临时 tokio 运行时）。
+///
+/// 供阻塞上下文低频调用（健康检查、菜单本地控制接口等）；异步上下文请直接用 [`get`]。
+pub fn blocking_get_text(url: &str, timeout: Duration) -> Result<String, HttpClientError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| HttpClientError::new(format!("创建 tokio 运行时失败: {e}")))?;
+
+    let options = HttpClientOptions {
+        timeout,
+        ..Default::default()
+    };
+    let rsp = rt.block_on(get(url, &[], &options))?;
+    Ok(rsp.body_text())
+}
+
 /// 解析 HTTP 方法名（`GET`/`POST`/`PUT` 等，含自定义扩展方法）。
 fn parse_method(method: &str) -> Result<Method, HttpClientError> {
     Method::from_bytes(method.trim().as_bytes())
@@ -586,6 +603,34 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoCertificateV
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocking_get_text_roundtrip() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let body = "hello";
+                let rsp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(rsp.as_bytes());
+            }
+        });
+
+        let text =
+            blocking_get_text(&format!("http://{addr}/ping"), Duration::from_secs(3)).unwrap();
+        assert_eq!(text, "hello");
+        let _ = handle.join();
+
+        // 不可达：返回错误而非 panic
+        assert!(blocking_get_text("http://127.0.0.1:1/", Duration::from_millis(300)).is_err());
+    }
 
     #[test]
     fn parse_url_variants() {

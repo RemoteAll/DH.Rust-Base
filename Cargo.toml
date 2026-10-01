@@ -13,6 +13,11 @@ chrono = "0.4"
 md-5 = "0.10"
 rand = "0.8.5"
 sha1 = "0.10.5"
+# SHA-256 / HMAC-SHA256（Agent 令牌校验与签名；RustCrypto 同族，与 md-5/sha1 一致）
+sha2 = "0.10"
+hmac = "0.12"
+# Base64 编解码（标准与 URL 安全；令牌/签名/传输场景）
+base64 = "0.22"
 # 配置序列化（JSON 配置读写，与 C# JsonConfigProvider 对应）
 serde = { version = "1", features = ["derive"] }
 # preserve_order：保持字段声明顺序，生成与 C# 一致的配置文件

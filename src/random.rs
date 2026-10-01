@@ -4,6 +4,8 @@
 
 use rand::RngCore;
 
+use crate::sign::base64_url_no_pad;
+
 /// 生成 `len` 字节安全随机数据。
 pub fn bytes(len: usize) -> Vec<u8> {
     let mut buf = vec![0u8; len];
@@ -29,27 +31,6 @@ pub fn hex(len: usize) -> String {
     for byte in data {
         out.push(TABLE[(byte >> 4) as usize] as char);
         out.push(TABLE[(byte & 0x0F) as usize] as char);
-    }
-    out
-}
-
-/// base64url 编码（无填充；`+`→`-`、`/`→`_`）。
-fn base64_url_no_pad(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[((n >> 18) & 63) as usize] as char);
-        out.push(TABLE[((n >> 12) & 63) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[((n >> 6) & 63) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(n & 63) as usize] as char);
-        }
     }
     out
 }

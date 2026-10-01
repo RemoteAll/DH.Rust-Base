@@ -51,6 +51,9 @@ pub mod ws;
 /// 字节流分帧（终结符切分 + 保活串剥除 + 超长保护 + 空闲结算；tcp-scanner-server 实践沉淀收编）。
 pub mod framing;
 
+/// NewLife ApiClient 二进制 RPC（UDP；客户端与服务端同源，对齐 C# StarAgent 本地 RPC）。
+pub mod api_rpc;
+
 /// 获取本机首选的局域网 IPv4 地址（对应 DH.NCore `NetHelper.MyIP()`）。
 ///
 /// 原理：向外部地址发起 UDP connect（不产生实际报文），由系统路由表选出出口网卡；

@@ -13,6 +13,137 @@ pub fn write_all_text<P: AsRef<Path>>(path: P, text: &str) -> io::Result<()> {
     fs::write(path, text)
 }
 
+/// 原子写文本文件：先写 `.tmp` 再改名替换，避免中途失败留下半截内容。
+///
+/// 目标被占用等导致改名失败时降级为直接写入（尽力而为），并清理临时文件。
+pub fn write_all_text_atomic<P: AsRef<Path>>(path: P, text: &str) -> io::Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
+    fs::write(&tmp, text)?;
+
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // 目标被占用时降级为直接写入（尽力而为），并清理临时文件
+            let rs = fs::write(path, text);
+            let _ = fs::remove_file(&tmp);
+            rs
+        }
+    }
+}
+
+/// 简单通配匹配：`*`（任意串）与 `?`（单字符），大小写不敏感。
+pub fn wildcard_match(pattern: &str, text: &str) -> bool {
+    fn matches(p: &[char], t: &[char]) -> bool {
+        if p.is_empty() {
+            return t.is_empty();
+        }
+
+        match p[0] {
+            '*' => (0..=t.len()).any(|i| matches(&p[1..], &t[i..])),
+            '?' => !t.is_empty() && matches(&p[1..], &t[1..]),
+            c => {
+                !t.is_empty()
+                    && c.eq_ignore_ascii_case(&t[0])
+                    && matches(&p[1..], &t[1..])
+            }
+        }
+    }
+
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    matches(&p, &t)
+}
+
+/// 拆分命令行参数字符串（支持双引号包裹；与 C# ProcessStartInfo 的常见用法对齐）。
+///
+/// 例：`urls=http://*:8080 "a b" c` → `["urls=http://*:8080", "a b", "c"]`
+pub fn split_args(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut has_token = false;
+
+    for c in text.chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                has_token = true;
+            }
+            ' ' | '\t' if !in_quotes => {
+                if has_token {
+                    out.push(std::mem::take(&mut cur));
+                    has_token = false;
+                }
+            }
+            _ => {
+                cur.push(c);
+                has_token = true;
+            }
+        }
+    }
+
+    if has_token {
+        out.push(cur);
+    }
+
+    out
+}
+
+/// 解析 `k=v;k2=v2` 形式的环境变量串（C# `ServiceInfo.Environments` 语义）。
+pub fn parse_environments(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for item in text.split(';') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if let Some(p) = item.find('=') {
+            let key = item[..p].trim();
+            let value = item[p + 1..].trim();
+            if !key.is_empty() {
+                out.push((key.to_string(), value.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// 读取文件尾部若干行（整文件读入；日志文件规模下可接受）。
+pub fn read_tail<P: AsRef<Path>>(path: P, count: usize) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(count);
+    lines[start..].iter().map(|s| s.to_string()).collect()
+}
+
+/// 目录下指定扩展名（不区分大小写）中文件名最大的文件（日志/快照等“找最新”场景）。
+pub fn latest_file_by_ext<P: AsRef<Path>>(dir: P, extension: &str) -> Option<std::path::PathBuf> {
+    let ext = extension.to_ascii_lowercase();
+    let mut best: Option<(String, std::path::PathBuf)> = None;
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.to_ascii_lowercase().ends_with(&ext) {
+            continue;
+        }
+        if best.as_ref().map(|(b, _)| name > *b).unwrap_or(true) {
+            best = Some((name, path));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -32,6 +163,59 @@ mod tests {
         bytes.extend_from_slice("<?xml version=\"1.0\"?>".as_bytes());
         fs::write(&file, bytes).unwrap();
         assert_eq!(read_all_text(&file).unwrap(), "<?xml version=\"1.0\"?>");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wildcard_and_split_args() {
+        assert!(wildcard_match("*.zip", "a.zip"));
+        assert!(wildcard_match("*.ZIP", "a.zip")); // 大小写不敏感
+        assert!(wildcard_match("a?c", "abc"));
+        assert!(!wildcard_match("a?c", "abbc"));
+        assert!(wildcard_match("*", ""));
+
+        let args = split_args(r#"urls=http://*:8080 "a b" c"#);
+        assert_eq!(args, vec!["urls=http://*:8080", "a b", "c"]);
+        assert!(split_args("   ").is_empty());
+    }
+
+    #[test]
+    fn environments_parse() {
+        let envs = parse_environments("A=1; B=2 ;C=x=y;");
+        assert_eq!(
+            envs,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string()),
+                ("C".to_string(), "x=y".to_string()),
+            ]
+        );
+        assert!(parse_environments("").is_empty());
+    }
+
+    #[test]
+    fn atomic_write_tail_and_latest() {
+        let dir = std::env::temp_dir().join(format!("dhrust-ioutil-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let file = dir.join("a.log");
+        write_all_text_atomic(&file, "l1\nl2\n").unwrap();
+        write_all_text_atomic(&file, "l1\nl2\nl3\nl4\n").unwrap(); // 覆盖写
+        assert_eq!(fs::read_to_string(&file).unwrap(), "l1\nl2\nl3\nl4\n");
+        assert!(!dir.join("a.log.tmp").exists(), "临时文件应被清理");
+
+        let tail = read_tail(&file, 2);
+        assert_eq!(tail, vec!["l3".to_string(), "l4".to_string()]);
+        assert!(read_tail(dir.join("missing.log"), 2).is_empty());
+
+        // latest 场景：移除 a.log（'a' 的字母序大于日期文件名，避免干扰比较）
+        fs::remove_file(&file).unwrap();
+        write_all_text_atomic(&dir.join("2026_10_01.log"), "x").unwrap();
+        write_all_text_atomic(&dir.join("2026_10_02.log"), "y").unwrap();
+        write_all_text_atomic(&dir.join("readme.txt"), "z").unwrap();
+        let latest = latest_file_by_ext(&dir, ".log").unwrap();
+        assert!(latest.ends_with("2026_10_02.log"), "{latest:?}");
 
         let _ = fs::remove_dir_all(&dir);
     }

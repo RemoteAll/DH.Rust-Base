@@ -85,6 +85,66 @@ pub fn parse_datetime(text: &str) -> Option<NaiveDateTime> {
         .and_then(|d| d.and_hms_opt(0, 0, 0))
 }
 
+/// 现在（UTC 朴素时间）。
+pub fn now_utc() -> NaiveDateTime {
+    chrono::Utc::now().naive_utc()
+}
+
+/// 现在（UTC）→ `yyyy-MM-dd HH:mm:ss`（对齐 C# `DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss")`）。
+pub fn now_utc_str() -> String {
+    format_datetime_with_digits(&now_utc(), 0)
+}
+
+/// 时间 → System.Text.Json 形态文本（`yyyy-MM-ddTHH:mm:ss`，100ns 精度内尾零裁剪）。
+///
+/// 对齐 C# `System.Text.Json` 序列化 `DateTime`（本地）的输出：
+/// `2026-10-01T12:33:04.12`（小数尾零裁剪）；无小数时不输出小数点。
+pub fn format_datetime_stj(value: &NaiveDateTime) -> String {
+    use chrono::{Datelike, Timelike};
+
+    let mut s = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        value.year(),
+        value.month(),
+        value.day(),
+        value.hour(),
+        value.minute(),
+        value.second()
+    );
+
+    let frac = value.and_utc().timestamp_subsec_nanos() / 100;
+    if frac != 0 {
+        let mut f = format!("{frac:07}");
+        while f.ends_with('0') {
+            f.pop();
+        }
+        s.push('.');
+        s.push_str(&f);
+    }
+    s
+}
+
+/// Unix 时间戳（秒+纳秒）→ 本地时间 → System.Text.Json 形态文本。
+pub fn format_timestamp_stj(secs: i64, nanos: u32) -> String {
+    let dt = chrono::DateTime::from_timestamp(secs, nanos)
+        .map(|d| d.with_timezone(&chrono::Local))
+        .unwrap_or_else(chrono::Local::now);
+    format_datetime_stj(&dt.naive_local())
+}
+
+/// 系统时间 → 本地时间 → System.Text.Json 形态文本。
+pub fn format_system_time_stj(t: SystemTime) -> String {
+    let (secs, nanos) = match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
+        Err(e) => {
+            // 早于纪元（罕见）：按负偏移换算
+            let d = e.duration();
+            (-(d.as_secs() as i64), d.subsec_nanos())
+        }
+    };
+    format_timestamp_stj(secs, nanos)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +177,36 @@ mod tests {
         assert!(parse_datetime("2026-09-26").is_some());
         assert!(parse_datetime("").is_none());
         assert!(parse_datetime("不是时间").is_none());
+    }
+
+    #[test]
+    fn stj_format_matches_dotnet() {
+        // 毫秒尾零裁剪（120ms → ".12"）
+        let dt = chrono::NaiveDate::from_ymd_opt(2026, 10, 1)
+            .unwrap()
+            .and_hms_milli_opt(12, 33, 4, 120)
+            .unwrap();
+        assert_eq!(format_datetime_stj(&dt), "2026-10-01T12:33:04.12");
+
+        // 无小数时不输出小数点
+        let dt = chrono::NaiveDate::from_ymd_opt(2026, 10, 1)
+            .unwrap()
+            .and_hms_opt(12, 33, 4)
+            .unwrap();
+        assert_eq!(format_datetime_stj(&dt), "2026-10-01T12:33:04");
+
+        // now_utc_str 形状
+        assert_eq!(now_utc_str().len(), 19);
+
+        // 系统时间路径与 chrono 本地换算一致（时区无关断言）
+        let secs = 1_700_000_000i64;
+        let expected = chrono::DateTime::from_timestamp(secs, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        let st = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64);
+        assert_eq!(format_system_time_stj(st), expected);
+        assert_eq!(format_timestamp_stj(secs, 0), expected);
     }
 }
