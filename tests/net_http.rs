@@ -9,7 +9,10 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use dhrust::net::http::{json_escape, state, DGResult, HttpOutcome, HttpResponse, HttpServer};
+use dhrust::net::http::{
+    handler, json_escape, state, DGResult, HttpOutcome, HttpRequest, HttpResponse, HttpServer,
+    HttpServerOptions,
+};
 use dhrust::net::router::{middleware, route, Ctx, Next, Router};
 use dhrust::net::ws::{WsClient, WsClientOptions, WsHooks, WsServerHooks};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -125,6 +128,47 @@ async fn custom_fallback() {
     let addr = start(r).await;
     let (s, _h, b) = http_call(addr, "GET", "/whatever", &[], b"").await;
     assert_eq!((s, b.as_str()), (200, "fallback:/whatever"));
+}
+
+/// 优雅停机：`serve_with_shutdown` 触发后 accept 循环退出、监听端口释放（可立即重绑）——
+/// “热重绑监听地址/免重启切换绑定”的基础能力。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serve_with_shutdown_releases_port() {
+    let server = HttpServer::bind("127.0.0.1:0").await.unwrap();
+    let addr = server.local_addr().unwrap();
+    let svc = handler(|_req: HttpRequest| async move {
+        HttpOutcome::Response(HttpResponse::text(200, "alive"))
+    });
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let join = tokio::spawn(async move {
+        server
+            .serve_with_shutdown(
+                svc,
+                HttpServerOptions::default(),
+                async move {
+                    let _ = stop_rx.await;
+                },
+            )
+            .await
+            .unwrap();
+    });
+
+    // 停机前正常服务
+    let (s, _h, b) = http_call(addr, "GET", "/", &[], b"").await;
+    assert_eq!((s, b.as_str()), (200, "alive"));
+
+    // 触发停机 → 服务循环退出、端口释放
+    stop_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("停机超时：accept 循环未退出")
+        .unwrap();
+
+    // 同一端口可立即重新绑定
+    let rebind = HttpServer::bind(addr)
+        .await
+        .expect("停机后应能重新绑定同一端口");
+    assert_eq!(rebind.local_addr().unwrap(), addr);
 }
 
 /// 参数绑定：urlencoded 表单（中文/数值/布尔）、查询串、请求头。

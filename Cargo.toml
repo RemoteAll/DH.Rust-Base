@@ -18,6 +18,8 @@ sha2 = "0.10"
 hmac = "0.12"
 # Base64 编解码（标准与 URL 安全；令牌/签名/传输场景）
 base64 = "0.22"
+# 可逆加密（AES-256-GCM；feature `secret`）——RustCrypto 同族，纯 Rust、可 zig 交叉编 musl
+aes-gcm = { version = "0.10", optional = true }
 # 配置序列化（JSON 配置读写，与 C# JsonConfigProvider 对应）
 serde = { version = "1", features = ["derive"] }
 # preserve_order：保持字段声明顺序，生成与 C# 一致的配置文件
@@ -81,6 +83,8 @@ windows-sys = { version = "0.59", features = [
 toml = ["dep:toml", "dep:toml_edit"]
 # Razor 子集模板引擎（方案 C，零新依赖；规约见 Doc/Razor子集模板引擎架构.md）
 razor = []
+# 可逆加密（AES-256-GCM；配置中敏感值“防直读”存储，如登录密码——HlkProductTool 实践沉淀）
+secret = ["dep:aes-gcm"]
 # STUN 服务（RFC 5389 Binding；UDP，仅依赖 tokio；net 特性自动包含）
 stun = ["dep:tokio"]
 # MQTT 客户端（MQTT 3.1.1：连接认证 / QoS0·1 发布 / 保活 / 断线重连；

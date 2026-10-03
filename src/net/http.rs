@@ -267,12 +267,33 @@ impl HttpServer {
         self.serve_with(handler, HttpServerOptions::default()).await
     }
 
-    /// 运行服务循环（自定义配置）。
+    /// 运行服务循环（自定义配置，永不返回除非 accept 失败）。
     pub async fn serve_with(
         self,
         handler: HttpHandler,
         options: HttpServerOptions,
     ) -> std::io::Result<()> {
+        self.serve_with_shutdown(handler, options, std::future::pending::<()>())
+            .await
+    }
+
+    /// 运行服务循环（自定义配置 + 优雅停机）。
+    ///
+    /// 与 [`serve_with`] 相同，额外接受 `shutdown` 信号 future：其完成后
+    /// accept 循环退出（返回 `Ok(())`）并**释放监听端口**——供运行期
+    /// “热重绑”监听地址（免进程重启）或可控停机使用。
+    ///
+    /// 已接受的连接不受影响：每连接线程模式（`thread_per_connection`）下
+    /// 连接线程自行收尾；默认任务模式下连接任务随本运行时结束而取消。
+    pub async fn serve_with_shutdown<F>(
+        self,
+        handler: HttpHandler,
+        options: HttpServerOptions,
+        shutdown: F,
+    ) -> std::io::Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send,
+    {
         // 分片线程池（可选）：每片一个 current_thread 运行时承载多连接
         let shards = if options.conn_shards > 0 && !options.thread_per_connection {
             Some(ShardPool::start(
@@ -285,8 +306,12 @@ impl HttpServer {
             None
         };
         let mut rr: usize = 0;
+        tokio::pin!(shutdown);
         loop {
-            let (tcp, _peer) = self.listener.accept().await?;
+            let (tcp, _peer) = tokio::select! {
+                _ = &mut shutdown => break,
+                accepted = self.listener.accept() => accepted?,
+            };
             let _ = tcp.set_nodelay(true);
             let handler = handler.clone();
             let options = options.clone();
@@ -334,6 +359,7 @@ impl HttpServer {
                 tokio::spawn(run_connection(tcp, tls, handler, options));
             }
         }
+        Ok(())
     }
 }
 

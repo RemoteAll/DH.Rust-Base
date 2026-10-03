@@ -3,6 +3,8 @@ pub mod io; // 加了pub之后为公共模块可以为外部调用
 pub mod logs;
 pub mod random; // 安全随机（OS 熵；令牌/密钥等安全凭证）
 pub mod sign;
+#[cfg(feature = "secret")]
+pub mod secret; // 可逆加密（AES-256-GCM；敏感值“防直读”存储；配置密码/凭据场景，见模块文档）
 pub mod threading; // 线程与定时调度（对应 DH.NCore Threading）
 pub mod times;
 pub mod web; // Web 辅助（URL 编码 / JSON 转义；对应 DH.NCore NewLife.Web 系列）
