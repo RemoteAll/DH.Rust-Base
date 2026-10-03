@@ -45,6 +45,25 @@ pub use xtrace::{
     use_file, write_exception, write_fmt, write_line,
 };
 
+/// 初始化全局日志（组合式）：可选彩色控制台 + 按日文件。
+///
+/// - Windows 下自动启用 UTF-8 控制台（中文菜单/日志正常）；
+/// - 行格式与文件头由 [`TextFileLog`] 实现（对齐 DH.NCore）；
+/// - 收编自 Pek.RAgent / DHDeploy.Agent.Rust / HlkProductTool 三处同款初始化（2026-10-03）。
+pub fn init_console_and_file(dir: impl AsRef<std::path::Path>, use_console: bool, level: LogLevel) {
+    #[cfg(windows)]
+    enable_windows_console();
+
+    let mut logs: Vec<std::sync::Arc<dyn ILog>> = Vec::new();
+    if use_console {
+        logs.push(std::sync::Arc::new(ConsoleLog::with_color(true)));
+    }
+    logs.push(TextFileLog::create(dir.as_ref()) as std::sync::Arc<dyn ILog>);
+
+    set_log(std::sync::Arc::new(CompositeLog::new(logs)));
+    set_level(level);
+}
+
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 
 /// 日志队列积压上限：超过后丢弃新日志（对齐 DH.NCore——磁盘故障/输出阻塞时防内存无界增长）

@@ -34,6 +34,8 @@ pub mod http_client;
 #[cfg(feature = "mqtt")]
 pub mod mqtt;
 #[cfg(feature = "net")]
+pub mod panel_auth;
+#[cfg(feature = "net")]
 pub mod router;
 #[cfg(feature = "net")]
 pub mod rpc;

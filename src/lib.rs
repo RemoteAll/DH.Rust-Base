@@ -5,6 +5,8 @@ pub mod random; // 安全随机（OS 熵；令牌/密钥等安全凭证）
 pub mod sign;
 #[cfg(feature = "secret")]
 pub mod secret; // 可逆加密（AES-256-GCM；敏感值“防直读”存储；配置密码/凭据场景，见模块文档）
+#[cfg(feature = "service")]
+pub mod service; // 跨平台服务管理（Windows SCM / systemd / procd / SysV / launchd；Pek.RAgent 下沉）
 pub mod threading; // 线程与定时调度（对应 DH.NCore Threading）
 pub mod times;
 pub mod web; // Web 辅助（URL 编码 / JSON 转义；对应 DH.NCore NewLife.Web 系列）

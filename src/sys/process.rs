@@ -446,3 +446,144 @@ mod tests {
         let _ = child.wait();
     }
 }
+
+// ————— 系统命令执行（2026-10-03 收拢：Pek.RAgent service 各平台 / DHDeploy execute_shell）—————
+
+/// 执行程序并捕获输出：返回 `(退出码, 标准输出, 标准错误)`（UTF-8 lossy；启动失败为 `-1`）。
+///
+/// 适用于 `sc.exe` / `systemctl` / `launchctl` 等系统命令的简单调用；
+/// 需要 shell 语义（管道/重定向/引号）或超时控制时用 [`run_shell`]。
+pub fn run(program: &str, args: &[&str]) -> (i32, String, String) {
+    match Command::new(program).args(args).output() {
+        Ok(out) => (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        ),
+        Err(e) => (-1, String::new(), e.to_string()),
+    }
+}
+
+/// shell 命令执行结果（对齐 DHDeploy `CommandResult`）。
+#[derive(Debug, Clone)]
+pub struct ShellResult {
+    /// 退出码（超时被强杀为 -1）
+    pub exit_code: i32,
+    /// 标准输出
+    pub output: String,
+    /// 标准错误
+    pub error: String,
+    /// 是否超时被强杀
+    pub timed_out: bool,
+    /// 工作目录
+    pub working_directory: String,
+}
+
+/// shell 命令执行超时上限（秒）。
+pub const MAX_SHELL_TIMEOUT_SECONDS: u64 = 300;
+
+/// 执行 shell 命令（Windows `cmd.exe /c`；Unix `/bin/bash -lc`），分离捕获 stdout/stderr，超时强杀。
+///
+/// 关键实现细节（防御性知识，来自 DHDeploy 实战）：
+/// - Windows 必须用 `raw_arg` 原样传命令行：`Command::arg` 会把内嵌双引号转义为 `\"`，
+///   而 cmd.exe 不识别反斜杠转义（`-w "%{http_code}"` 等参数会失真）；
+/// - Unix 不能把命令整体再包一层双引号：bash 会把整串当单个命令名执行（127）；
+/// - 管道由独立线程读取，避免子进程写满缓冲区阻塞。
+pub fn run_shell(command_line: &str, cwd: &Path, timeout_seconds: u64) -> ShellResult {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let timeout = timeout_seconds.clamp(1, MAX_SHELL_TIMEOUT_SECONDS);
+    let mut cmd;
+    #[cfg(windows)]
+    {
+        // 关键：必须用 raw_arg 原样传入命令行（理由见函数文档）
+        use std::os::windows::process::CommandExt;
+        cmd = Command::new("cmd.exe");
+        cmd.raw_arg("/c ");
+        cmd.raw_arg(command_line);
+    }
+    #[cfg(not(windows))]
+    {
+        // 对齐 C# `BuildCommandProcessInfo`：/bin/bash -lc <原始命令行>（理由见函数文档）
+        cmd = Command::new("/bin/bash");
+        cmd.arg("-lc").arg(command_line);
+    }
+    cmd.current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return ShellResult {
+                exit_code: -1,
+                output: String::new(),
+                error: format!("命令启动失败: {e}"),
+                timed_out: false,
+                working_directory: cwd.to_string_lossy().to_string(),
+            }
+        }
+    };
+
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+
+    // 独立线程读取管道，避免子进程写满缓冲区阻塞
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(s) = stdout.as_mut() {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(s) = stderr.as_mut() {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(timeout);
+    let mut timed_out = false;
+    let exit_code;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_code = status.code().unwrap_or(-1);
+                break;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    timed_out = true;
+                    exit_code = -1;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            Err(e) => {
+                return ShellResult {
+                    exit_code: -1,
+                    output: String::new(),
+                    error: format!("等待命令失败: {e}"),
+                    timed_out: false,
+                    working_directory: cwd.to_string_lossy().to_string(),
+                }
+            }
+        }
+    }
+
+    let out_bytes = out_handle.join().unwrap_or_default();
+    let err_bytes = err_handle.join().unwrap_or_default();
+
+    ShellResult {
+        exit_code,
+        output: String::from_utf8_lossy(&out_bytes).to_string(),
+        error: String::from_utf8_lossy(&err_bytes).to_string(),
+        timed_out,
+        working_directory: cwd.to_string_lossy().to_string(),
+    }
+}

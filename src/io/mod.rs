@@ -259,3 +259,123 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+/// 程序基础目录：环境变量（按序探测；非空优先，词法归一）→ 可执行文件目录 → 当前目录。
+///
+/// 收编自 Pek.RAgent（`PEK_RAGENT_BASE`）与 HlkProductTool（`HLK_TOOL_BASE`）的同款实现（2026-10-03）。
+pub fn base_dir(env_names: &[&str]) -> PathBuf {
+    for name in env_names {
+        if let Ok(dir) = std::env::var(name) {
+            let dir = dir.trim();
+            if !dir.is_empty() {
+                return lexical_normalize(Path::new(dir));
+            }
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            return parent.to_path_buf();
+        }
+    }
+
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+// ————— 安全替换（2026-10-03 下沉：Pek.RAgent deploy 的“运行中文件替换”语义）—————
+
+/// 安全替换文件。
+///
+/// 1. 原子改名（Unix 可直接覆盖；Windows 目标未占用时亦可）；
+/// 2. 目标被占用（运行中）时，把目标改名为 `*.del` 再写入新文件（Windows 允许重命名运行中的文件）；
+///    `*.del` 删除失败不报错，待应用停止后由调用方的清理逻辑处理。
+pub fn safe_replace_file(src: &Path, dst: &Path) -> io::Result<()> {
+    if !dst.exists() {
+        return fs::rename(src, dst).or_else(|_| {
+            fs::copy(src, dst)?;
+            let _ = fs::remove_file(src);
+            Ok(())
+        });
+    }
+
+    match fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let bak = del_path(dst);
+            fs::rename(dst, &bak)?;
+            match fs::rename(src, dst) {
+                Ok(()) => {
+                    // 运行中的文件删除会失败，留给后续清理
+                    let _ = fs::remove_file(&bak);
+                    Ok(())
+                }
+                Err(e) => {
+                    // 回滚
+                    let _ = fs::rename(&bak, dst);
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
+/// 生成唯一的 `*.del` 路径。
+fn del_path(dst: &Path) -> PathBuf {
+    let base = PathBuf::from(format!("{}.del", dst.display()));
+    if !base.exists() {
+        return base;
+    }
+
+    for i in 1..10_000 {
+        let candidate = PathBuf::from(format!("{}.{}.del", dst.display(), i));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    base
+}
+
+#[cfg(test)]
+mod base_dir_tests {
+    use super::*;
+
+    #[test]
+    fn base_dir_falls_back_to_exe_parent() {
+        // 环境变量未设置（用不可能存在的名字）→ 回退到可执行文件目录
+        let dir = base_dir(&["DHRUST_TEST_BASE_DIR_NOT_SET_XYZ"]);
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(dir, exe.parent().unwrap().to_path_buf());
+        assert!(dir.is_absolute());
+    }
+}
+
+#[cfg(test)]
+mod safe_replace_tests {
+    use super::*;
+
+    #[test]
+    fn safe_replace_overwrites_and_creates() {
+        let dir = std::env::temp_dir().join(format!("dhrust-saferp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // 目标存在：覆盖
+        let src = dir.join("new.txt");
+        let dst = dir.join("old.txt");
+        fs::write(&src, b"new").unwrap();
+        fs::write(&dst, b"old").unwrap();
+        safe_replace_file(&src, &dst).unwrap();
+        assert_eq!(fs::read(&dst).unwrap(), b"new");
+        assert!(!src.exists());
+
+        // 目标不存在：创建
+        let src2 = dir.join("fresh.txt");
+        let dst2 = dir.join("missing.txt");
+        fs::write(&src2, b"fresh").unwrap();
+        safe_replace_file(&src2, &dst2).unwrap();
+        assert_eq!(fs::read(&dst2).unwrap(), b"fresh");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

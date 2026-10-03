@@ -644,3 +644,101 @@ mod tests {
         format!("{n:08x}")
     }
 }
+
+// ————— ZIP 解压（feature `zip-extract`；2026-10-03 下沉：Pek.RAgent deploy / DHDeploy.Agent 共用）—————
+
+/// 解压 zip 到目标目录（防目录穿越；占用文件安全替换；保留可执行位；返回写入文件数）。
+///
+/// - 目录穿越条目（`enclosed_name()` 为 None）直接跳过；
+/// - 每个文件先写 `{path}.{pid}.{i}.tmp` 再经 [`crate::io::safe_replace_file`] 替换，
+///   运行中的目标文件在 Windows 上也会被改名让位（详见该函数文档）；
+/// - Unix 下保留可执行位（`mode & 0o111` 时 `| 0o755`）。
+#[cfg(feature = "zip-extract")]
+pub fn extract_zip(zip_path: &std::path::Path, target: &std::path::Path) -> Result<usize, String> {
+    let file = std::fs::File::open(zip_path)
+        .map_err(|e| format!("打开压缩包失败 {}：{}", zip_path.display(), e))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("读取压缩包失败：{}", e))?;
+
+    std::fs::create_dir_all(target).map_err(|e| format!("创建目录失败：{}", e))?;
+
+    let mut count = 0usize;
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("读取压缩包条目失败：{}", e))?;
+
+        let Some(rel) = entry.enclosed_name() else {
+            continue; // 目录穿越条目，跳过
+        };
+        let out_path = target.join(rel);
+
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path).map_err(|e| format!("创建目录失败：{}", e))?;
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{}", e))?;
+        }
+
+        let mut data = Vec::with_capacity(entry.size() as usize);
+        std::io::copy(&mut entry, &mut data).map_err(|e| format!("解压数据失败：{}", e))?;
+
+        let tmp = std::path::PathBuf::from(format!(
+            "{}.{}.{}.tmp",
+            out_path.display(),
+            std::process::id(),
+            i
+        ));
+        std::fs::write(&tmp, &data).map_err(|e| format!("写入临时文件失败：{}", e))?;
+        crate::io::safe_replace_file(&tmp, &out_path)
+            .map_err(|e| format!("替换文件失败 {}：{}", out_path.display(), e))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(mode) = entry.unix_mode() {
+                if mode & 0o111 != 0 {
+                    let _ = std::fs::set_permissions(
+                        &out_path,
+                        std::fs::Permissions::from_mode(mode | 0o755),
+                    );
+                }
+            }
+        }
+
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+#[cfg(all(test, feature = "zip-extract"))]
+mod extract_tests {
+    use super::*;
+
+    #[test]
+    fn extract_zip_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("dhrust-zipx-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let zip_path = dir.join("a.zip");
+
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("sub/hello.txt", options).unwrap();
+            use std::io::Write;
+            writer.write_all(b"hello").unwrap();
+            writer.finish().unwrap();
+        }
+
+        let out = dir.join("out");
+        let n = extract_zip(&zip_path, &out).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(std::fs::read(out.join("sub/hello.txt")).unwrap(), b"hello");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
