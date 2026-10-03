@@ -51,11 +51,26 @@ rustls-pemfile = { version = "2", optional = true }
 # 自签证书生成（Agent HTTPS 监听开箱即用；纯 Rust，ring 后端）
 rcgen = { version = "0.13", optional = true, default-features = false, features = ["pem", "ring"] }
 
+[target.'cfg(unix)'.dependencies]
+# 进程管理/系统采集：signal、sysconf、statvfs、malloc_trim、clock_settime 等
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 # 系统运行时长（日志头 `#SystemStarted`，对齐 C# Environment.TickCount64 → GetTickCount64）
 # 网卡累计流量（sys::net::net_totals → GetIfTable2；IpHelper + Ndis + WinSock）
+# 进程管理/指标采集（sys::process / sys::monitor）：Threading、ProcessStatus、ToolHelp
+# 机器事实（sys::machine）：Registry（CPU 型号/MachineGuid）、Storage_FileSystem（磁盘）
+# Security/IO（校时特权、磁盘 IOCTL；CreateFileW 依赖 Security）
 windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
     "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Registry",
+    "Win32_System_IO",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",

@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>dhrust SPA 示例</title>
+  <link rel="stylesheet" href="/assets/app-4f2a1c.css" />
+</head>
+<body>
+  <h1>SPA 首页（嵌入自 dist/index.html）</h1>
+  <p>当前路径：<code id="path"></code></p>
+  <p>history 路由回退演示：直接访问 /dashboard、/user/42 也会回到本页。</p>
+  <p>对比入口：<a href="/home/index">MVC 页面（服务端渲染）</a> ·
+    <a href="/api/ping">API（JSON）</a> ·
+    <a href="/api/unknown">未知道路（JSON 404）</a></p>
+  <script src="/assets/app-4f2a1c.js"></script>
+</body>
+</html>

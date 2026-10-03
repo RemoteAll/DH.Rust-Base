@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 /// 读取文本文件全文（UTF-8；自动去除 BOM，对齐 C# `File.ReadAllText` 行为）。
 pub fn read_all_text<P: AsRef<Path>>(path: P) -> io::Result<String> {
@@ -113,6 +113,32 @@ pub fn parse_environments(text: &str) -> Vec<(String, String)> {
     out
 }
 
+/// 词法归一化路径（不访问文件系统，可处理尚不存在的路径）：消除 `.` 与 `..`。
+///
+/// 前导 `..` 会保留（如 `../apps/x`）；空路径返回 `.`。
+/// 来源：Pek.RAgent 服务注册路径归属校验/影子目录计算（2026-10-03 下沉）。
+pub fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                _ => out.push(".."),
+            },
+            other => out.push(other.as_os_str()),
+        }
+    }
+
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
 /// 读取文件尾部若干行（整文件读入；日志文件规模下可接受）。
 pub fn read_tail<P: AsRef<Path>>(path: P, count: usize) -> Vec<String> {
     let Ok(text) = fs::read_to_string(path) else {
@@ -192,6 +218,19 @@ mod tests {
             ]
         );
         assert!(parse_environments("").is_empty());
+    }
+
+    #[test]
+    fn lexical_normalize_handles_parent() {
+        assert_eq!(
+            lexical_normalize(Path::new("a/b/../c")),
+            PathBuf::from("a/c")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("../apps/x")),
+            PathBuf::from("../apps/x")
+        );
+        assert_eq!(lexical_normalize(Path::new("")), PathBuf::from("."));
     }
 
     #[test]

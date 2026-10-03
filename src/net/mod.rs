@@ -69,6 +69,38 @@ pub fn my_ip() -> Option<std::net::Ipv4Addr> {
     }
 }
 
+/// TCP 连通检查（连接成功即返回 `Ok`；探活/端口检查场景）。
+///
+/// - 仅建立并立即关闭连接，不发送任何数据；
+/// - 解析失败/连接失败返回中文错误消息（来源：Pek.RAgent 健康检查收编）。
+pub fn tcp_check(host: &str, port: u16, timeout: std::time::Duration) -> Result<(), String> {
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let addr_text = format!("{host}:{port}");
+    let addr = addr_text
+        .to_socket_addrs()
+        .map_err(|e| format!("解析地址 {addr_text} 失败：{e}"))?
+        .next()
+        .ok_or_else(|| format!("无法解析地址 {addr_text}"))?;
+
+    TcpStream::connect_timeout(&addr, timeout)
+        .map(|_| ())
+        .map_err(|e| format!("连接 {addr_text} 失败：{e}"))
+}
+
+/// 拆分 `host:port` 文本（按最后一个 `:` 切分；端口非法或缺省时回退 `default_port`）。
+///
+/// IPv6 字面量请使用 `[::1]:80` 形式（与 URL 惯例一致）。
+pub fn split_host_port(text: &str, default_port: u16) -> (String, u16) {
+    match text.rfind(':') {
+        Some(i) => {
+            let port = text[i + 1..].parse::<u16>().unwrap_or(default_port);
+            (text[..i].to_string(), port)
+        }
+        None => (text.to_string(), default_port),
+    }
+}
+
 // ———— N001 依赖闸门（防 feature 空转：编译期验证依赖版本 API 形态）————
 
 /// 编译期自检：hyper 服务端连接构造器 API 形态（http1 + server 特性）。
@@ -97,5 +129,31 @@ mod tests {
     fn my_ip_never_panics() {
         // 结果依赖运行环境（可能有网卡也可能没有），这里只验证不崩溃
         let _ = my_ip();
+    }
+
+    #[test]
+    fn split_host_port_variants() {
+        assert_eq!(
+            split_host_port("127.0.0.1:5500", 0),
+            ("127.0.0.1".to_string(), 5500)
+        );
+        assert_eq!(
+            split_host_port("127.0.0.1", 5500),
+            ("127.0.0.1".to_string(), 5500)
+        );
+        // 非法端口回退默认值
+        assert_eq!(split_host_port("host:abc", 80), ("host".to_string(), 80));
+        // IPv6 字面量：按最后一个冒号切分（`[::1]:80`）
+        assert_eq!(split_host_port("[::1]:80", 0), ("[::1]".to_string(), 80));
+    }
+
+    #[test]
+    fn tcp_check_local_listener() {
+        // 本机监听随机端口 → 连通成功；关闭后 → 连接失败
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(tcp_check("127.0.0.1", port, std::time::Duration::from_millis(1000)).is_ok());
+        drop(listener);
+        assert!(tcp_check("127.0.0.1", port, std::time::Duration::from_millis(500)).is_err());
     }
 }

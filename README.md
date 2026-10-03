@@ -16,7 +16,8 @@ Pek 生态的 Rust 基础库，对应 C# 的 **DH.NCore**：为 Rust 项目提�
 | `config` | 核心设置 `Setting`，读写 `Config/Core.config`（XML）/ `Core.json` | `NewLife.Setting` / `Configuration` |
 | `logs` | 分级日志：控制台/文本文件/复合输出、全局门面与 `info!` 等宏 | `NewLife.Log`（`XTrace`/`ILog`/`TextFileLog`/`ConsoleLog`/`CompositeLog`） |
 | `zip` | 极简 ZIP 打包器（store 法；内存 + 流式落盘） | — |
-| `net` | 网络内核：HTTP 服务端/客户端、WebSocket（文本/二进制、可选服务端 Ping 保活与慢消费者断开）、RPC、**HTTP 控制器（MVC 风格动作分发 + 视图约定）与静态文件服务**（feature `net`） | `Http` / `Net` / `Remoting`（部分）/ `MapController` / `MapEmbedded` |
+| `sys` | 系统信息与进程管理：磁盘过滤/网卡流量（第一批）；进程管理/指标采集/机器事实（第二批，[`process`/`monitor`/`machine`]） | — |
+| `net` | 网络内核：HTTP 服务端/客户端、WebSocket（文本/二进制、可选服务端 Ping 保活与慢消费者断开）、RPC、**HTTP 控制器（MVC 风格动作分发 + 视图约定）与静态文件服务（目录/嵌入/SPA 回退）**、TCP 探活（`tcp_check`/`split_host_port`，零依赖）（feature `net`） | `Http` / `Net` / `Remoting`（部分）/ `MapController` / `MapEmbedded` |
 | `stun` | STUN 服务（RFC 5389 Binding；feature `stun`，`net` 自动包含） | — |
 | `wecom` | 企业微信机器人（Webhook 推送：文本/Markdown/Markdown V2 + 响应解析；feature `http-client`，https 需 `http-tls`） | `Pek.WebHook`（`WeChatWorkRobot`） |
 | `razor` | Razor 子集模板引擎（feature `razor`） | — |
@@ -27,7 +28,8 @@ Pek 生态的 Rust 基础库，对应 C# 的 **DH.NCore**：为 Rust 项目提�
 
 ```rust
 use dhrust::net::controller::{arg, json_result, Controller};
-use dhrust::net::router::Router;
+use dhrust::net::http::{HttpOutcome, HttpResponse};
+use dhrust::net::router::{route, Router};
 use dhrust::net::static_files::StaticFiles;
 
 let mut router = Router::new();
@@ -44,13 +46,18 @@ Controller::new("api")
 // 视图约定（feature `razor`）：Views/{Controller}/{Action}.cshtml，`view(model)` 渲染 HTML
 // Controller::new("home").get("index", |_ctx| view(model)).mount(&mut router);
 
-// 静态文件：默认 `wwwroot` 目录 + 编译期嵌入资源（嵌入优先命中，单文件部署稳定）
+// 静态文件 + SPA 一体化：嵌入构建产物（embed_many，嵌入优先→wwwroot 兜底）→
+// 深链接回退 index.html（history 路由）；/api 前缀排除于回退之外（保持 JSON 404）
 let statics = StaticFiles::default()
-    .embed("/index.html", include_bytes!("web/index.html"), "text/html; charset=utf-8");
+    .embed_many(&[("index.html", include_bytes!("web/dist/index.html"))]) // 真实项目由 build.rs 生成整表
+    .spa_fallback(true)
+    .spa_excludes(&["/api"]);
 router.fallback(route(move |ctx| {
     let statics = statics.clone();
     async move {
-        if let Some(response) = statics.try_serve(&ctx.req.path) {
+        if let Some(response) =
+            statics.try_serve_with_accept(&ctx.req.path, ctx.req.header("accept"))
+        {
             return HttpOutcome::Response(response);
         }
         HttpOutcome::Response(HttpResponse::text(404, "Not Found"))
@@ -60,7 +67,29 @@ router.fallback(route(move |ctx| {
 
 - 统一 JSON 信封：`json_result(code, message, data)` / `json_error(code, message)`（空 `message` 与 `None` data 自动省略）；
 - 动作参数绑定顺序对齐 C#：路由参数 → 查询串 → 表单 → JSON body 字段（大小写不敏感）；路径穿越防护内置于静态文件服务；
-- `HttpRequest.remote_addr`：客户端地址（`IP:Port`，未知为 `None`），可用于登录限流、审计等场景。
+- `HttpRequest.remote_addr`：客户端地址（`IP:Port`，未知为 `None`），可用于登录限流、审计等场景；
+- **SPA 与 MVC 一体化**（对标 ASP.NET Core `UseStaticFiles` + `MapControllers` + `MapFallbackToFile`）：
+  批量嵌入（`build.rs` 扫描前端 `dist` 生成表，零新依赖）、深链接/浏览器导航回退 `index.html`、
+  后端前缀排除、非 GET/HEAD 仅服务真实文件；完整指南（含 build.rs 模板与开发/生产工作流）见
+  [Doc/SPA与MVC一体化.md](Doc/SPA与MVC一体化.md)，可运行示例 `cargo run --features "net,razor" --example spa_server`。
+
+## 系统信息与进程管理（sys）
+
+跨平台（Windows / Linux，macOS 尽力而为），由 Pek.RAgent / DHDeploy.Agent.Rust 实践沉淀
+（第二批下沉 2026-10-03）：
+
+- `sys::process`：`spawn`（分离会话/日志重定向）、`is_alive`（Windows 僵尸进程安全判定）、
+  `stop_process`（先温和后强制）、`process_name` / `memory_mb`、`set_oom_score_adjust` /
+  `raise_priority` / `empty_working_set`、`Handle` / `SpawnRequest`；
+- `sys::monitor`：`system_cpu_rate`（请求间差分，psutil/宝塔口径）、`load_average`、
+  `tcp_counts`、`disk_io`（Linux `/proc/diskstats` / Windows `IOCTL_DISK_PERFORMANCE`）、
+  `process_stats` / `process_cpu_seconds` / `top_processes`；
+- `sys::machine`：`hostname` / `os_description` / `cpu_model` / `machine_guid` / `user_name`、
+  `memory_info`（宝塔口径：free+buffers+cached）、`network_interfaces`（含累计收发）、
+  `disks` / `disk_usages`、`set_system_time`（校时；Windows 自动启用特权，Unix 需 root）。
+
+`net::tcp_check(host, port, timeout)`：TCP 探活（连接成功即 `Ok`）；`net::split_host_port` 解析 `host:port`。
+`io::lexical_normalize`：词法路径归一化（不访问文件系统）。
 
 ## 定时与 Cron（threading）
 
