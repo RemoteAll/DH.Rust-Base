@@ -31,6 +31,8 @@ pub mod controller;
 pub mod http;
 #[cfg(feature = "http-client")]
 pub mod http_client;
+#[cfg(feature = "http-client")]
+pub mod openai;
 #[cfg(feature = "mqtt")]
 pub mod mqtt;
 #[cfg(feature = "net")]

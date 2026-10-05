@@ -7,6 +7,10 @@ pub mod sign;
 pub mod secret; // 可逆加密（AES-256-GCM；敏感值“防直读”存储；配置密码/凭据场景，见模块文档）
 #[cfg(feature = "service")]
 pub mod service; // 跨平台服务管理（Windows SCM / systemd / procd / SysV / launchd；Pek.RAgent 下沉）
+#[cfg(feature = "term")]
+pub mod term; // 真 PTY 会话引擎（ConPTY/openpty；在线终端等服务端能力共用）
+#[cfg(feature = "plugin")]
+pub mod plugin; // 插件包格式 + 插件源目录签名（Ed25519；Pek.RAgent 与 Pek.RPanlServer 共用）
 pub mod threading; // 线程与定时调度（对应 DH.NCore Threading）
 pub mod times;
 pub mod web; // Web 辅助（URL 编码 / JSON 转义；对应 DH.NCore NewLife.Web 系列）

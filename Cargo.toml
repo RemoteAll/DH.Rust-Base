@@ -27,6 +27,9 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # XML 配置读取（与 C# XmlConfigProvider 生成的文件互通）
 quick-xml = "0.36"
 
+# ———— feature `plugin`（插件包格式 + 插件源目录 Ed25519 签名；Pek.RAgent ↔ Pek.RPanlServer 共用）————
+ed25519-dalek = { version = "2", optional = true }
+
 # ———— feature `toml`（TOML 配置维护管线：保注释补齐/类型修正回写/未知项识别/备份写入）————
 toml = { version = "1", optional = true }
 toml_edit = { version = "0.25", optional = true }
@@ -59,8 +62,12 @@ rcgen = { version = "0.13", optional = true, default-features = false, features 
 [target.'cfg(unix)'.dependencies]
 # 进程管理/系统采集：signal、sysconf、statvfs、malloc_trim、clock_settime 等
 libc = "0.2"
+# 真 PTY（term 特性；openpty；0.9 的 nix 0.28 支持 loongarch64 等全架构交叉编译）
+portable-pty = { version = "0.9", optional = true }
 
 [target.'cfg(windows)'.dependencies]
+# 真 PTY（term 特性；ConPTY）——0.8：实测可用（0.9 的 PSUEDOCONSOLE_INHERIT_CURSOR 标志下无输出）
+portable-pty = { version = "0.8", optional = true }
 # 系统运行时长（日志头 `#SystemStarted`，对齐 C# Environment.TickCount64 → GetTickCount64）
 # 网卡累计流量（sys::net::net_totals → GetIfTable2；IpHelper + Ndis + WinSock）
 # 进程管理/指标采集（sys::process / sys::monitor）：Threading、ProcessStatus、ToolHelp
@@ -95,6 +102,10 @@ secret = ["dep:aes-gcm"]
 service = ["dep:windows-service"]
 # ZIP 解压（防目录穿越/占用文件安全替换；Pek.RAgent 与 DHDeploy.Agent 共用）
 zip-extract = ["dep:zip"]
+# 插件包格式 + 插件源目录签名（Ed25519；含 zip-extract）——Pek.RAgent（安装/发布）与 Pek.RPanlServer（平台）共用
+plugin = ["zip-extract", "dep:ed25519-dalek"]
+# 真 PTY 会话引擎（Windows ConPTY / Unix openpty；在线终端等服务端能力共用）
+term = ["dep:portable-pty"]
 # STUN 服务（RFC 5389 Binding；UDP，仅依赖 tokio；net 特性自动包含）
 stun = ["dep:tokio"]
 # MQTT 客户端（MQTT 3.1.1：连接认证 / QoS0·1 发布 / 保活 / 断线重连；
