@@ -36,6 +36,8 @@ pub mod openai;
 #[cfg(feature = "mqtt")]
 pub mod mqtt;
 #[cfg(feature = "net")]
+pub mod listener;
+#[cfg(feature = "net")]
 pub mod panel_auth;
 #[cfg(feature = "net")]
 pub mod router;

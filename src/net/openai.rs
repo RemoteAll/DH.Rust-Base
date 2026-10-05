@@ -89,26 +89,16 @@ pub fn chat_blocking(opts: &OpenAiOptions, messages: &[Json]) -> Result<ChatRepl
     let auth = format!("Bearer {}", opts.api_key.trim());
     let timeout = opts.timeout;
 
-    // 独立线程执行（HTTP 服务端处理器运行于 tokio 运行时线程，
-    // 直接调用 blocking_request 会因“运行时内 block_on”而 panic）
-    let handle = std::thread::Builder::new()
-        .name("openai-chat".to_string())
-        .spawn(move || {
-            http_client::blocking_request(
-                "POST",
-                &url,
-                &[("Authorization", auth.as_str())],
-                Some("application/json"),
-                body,
-                timeout,
-            )
-        })
-        .map_err(|e| format!("创建请求线程失败：{e}"))?;
-    let resp = match handle.join() {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => return Err(format!("调用 AI 接口失败：{}", e.0)),
-        Err(_) => return Err("AI 请求线程异常退出".to_string()),
-    };
+    // 运行时内安全（库内独立线程 + join，见 `blocking_request_offthread`）
+    let resp = http_client::blocking_request_offthread(
+        "POST",
+        &url,
+        &[("Authorization", auth.as_str())],
+        Some("application/json"),
+        body,
+        timeout,
+    )
+    .map_err(|e| format!("调用 AI 接口失败：{}", e.0))?;
     finish(resp)
 }
 

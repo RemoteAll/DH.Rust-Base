@@ -242,7 +242,7 @@ pub fn blocking_get(url: &str, timeout: Duration) -> Result<HttpResponse, HttpCl
 ///
 /// 供阻塞上下文低频调用（AI 对话、外部 API 上报等；任意方法/请求头/请求体）；
 /// 异步上下文请直接用 [`request`]。注意：在已有 tokio 运行时线程内调用会因
-/// “运行时内 block_on”而 panic，必须先派发到独立线程（参见各消费方的包装函数）。
+/// “运行时内 block_on”而 panic——那种场景请用 [`blocking_request_offthread`]。
 pub fn blocking_request(
     method: &str,
     url: &str,
@@ -261,6 +261,42 @@ pub fn blocking_request(
         ..Default::default()
     };
     rt.block_on(request(method, url, headers, content_type, body, &options))
+}
+
+/// 通用请求（同步版，**可在 tokio 运行时线程内安全调用**）：
+/// 在独立线程执行 [`blocking_request`] 后 join。
+///
+/// 背景：多个消费方（Pek.RAgent 插件源/控制探测等）曾各自实现
+/// “spawn 线程 + join” 包装；本函数把这层收敛到库内（历史三次踩坑沉淀）。
+pub fn blocking_request_offthread(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    content_type: Option<&str>,
+    body: Vec<u8>,
+    timeout: Duration,
+) -> Result<HttpResponse, HttpClientError> {
+    let method = method.to_string();
+    let url = url.to_string();
+    let headers: Vec<(String, String)> = headers
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let content_type = content_type.map(|s| s.to_string());
+    let handle = std::thread::Builder::new()
+        .name("dhrust-http-sync".to_string())
+        .spawn(move || {
+            let refs: Vec<(&str, &str)> = headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            blocking_request(&method, &url, &refs, content_type.as_deref(), body, timeout)
+        })
+        .map_err(|e| HttpClientError::new(format!("创建 HTTP 线程失败: {e}")))?;
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err(HttpClientError::new("HTTP 线程异常退出".to_string())),
+    }
 }
 
 /// 解析 HTTP 方法名（`GET`/`POST`/`PUT` 等，含自定义扩展方法）。
