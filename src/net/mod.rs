@@ -98,6 +98,31 @@ pub fn tcp_check(host: &str, port: u16, timeout: std::time::Duration) -> Result<
         .map_err(|e| format!("连接 {addr_text} 失败：{e}"))
 }
 
+/// 端口可用性预检（绑定通配地址时同时探测回环；纯标准库、无条件可用）。
+///
+/// Windows 下 `0.0.0.0` 与 `127.0.0.1` 允许并存绑定：当其它进程已占用
+/// `127.0.0.1:port` 时，直接绑 `0.0.0.0:port` 会“成功”但流量归属混乱
+/// （来源：Pek.RPanlServer 保存监听配置前的预检收编；产测工具热重绑同款护栏）。
+/// - `host` 为空或 `0.0.0.0`：回环与通配分别探测，都空闲才算可用；
+/// - 其它地址：仅探测该地址本身。
+///
+/// 注意：预检与真正绑定之间存在竞态，仅用于“提前拒绝明显被占用的配置”；
+/// 绑定失败的兜底路径（重试/回滚）仍需保留。
+pub fn port_available(host: &str, port: u16) -> bool {
+    let host = host.trim();
+    if host.is_empty() || host == "0.0.0.0" {
+        return probe_port("127.0.0.1", port) && probe_port("0.0.0.0", port);
+    }
+    probe_port(host, port)
+}
+
+/// 单地址绑定探测（立即释放）。
+fn probe_port(host: &str, port: u16) -> bool {
+    std::net::TcpListener::bind(format!("{host}:{port}"))
+        .map(drop)
+        .is_ok()
+}
+
 /// 拆分 `host:port` 文本（按最后一个 `:` 切分；端口非法或缺省时回退 `default_port`）。
 ///
 /// IPv6 字面量请使用 `[::1]:80` 形式（与 URL 惯例一致）。
@@ -165,5 +190,29 @@ mod tests {
         assert!(tcp_check("127.0.0.1", port, std::time::Duration::from_millis(1000)).is_ok());
         drop(listener);
         assert!(tcp_check("127.0.0.1", port, std::time::Duration::from_millis(500)).is_err());
+    }
+
+    #[test]
+    fn port_available_probes_loopback_and_wildcard() {
+        // 空闲端口：回环 / 通配 / 空主机 均可用
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let free = probe.local_addr().unwrap().port();
+        drop(probe);
+        assert!(port_available("127.0.0.1", free));
+        assert!(port_available("0.0.0.0", free));
+        assert!(port_available("", free));
+
+        // 回环被占用：通配预检也必须报不可用（Windows 并存绑定问题的护栏核心）
+        let hold = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy = hold.local_addr().unwrap().port();
+        assert!(!port_available("127.0.0.1", busy));
+        assert!(!port_available("0.0.0.0", busy));
+        drop(hold);
+
+        // 通配被占用：通配预检不可用
+        let hold2 = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let busy2 = hold2.local_addr().unwrap().port();
+        assert!(!port_available("0.0.0.0", busy2));
+        drop(hold2);
     }
 }

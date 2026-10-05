@@ -81,6 +81,15 @@ pub fn sha256_hex(data: &[u8]) -> String {
     to_hex_lower(&sha256_bytes(data))
 }
 
+/// 面板账号密码哈希：`SHA-256(salt:password)` hex（不可逆）。
+///
+/// Pek.RAgent / DHDeploy / Pek.RPanlServer 面板账号统一口径（2026-10-06 收编）；
+/// 盐值由调用方生成并与账号一同存储（如 `random::hex(16)`），本函数保证拼接
+/// 格式一致、避免各面板自行实现导致哈希口径漂移。
+pub fn salted_sha256_hex(salt: &str, password: &str) -> String {
+    sha256_hex(format!("{salt}:{password}").as_bytes())
+}
+
 /// HMAC-SHA256（对齐 C# `new HMACSHA256(key).ComputeHash(data)`）。
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC 接受任意长度密钥");
@@ -186,6 +195,15 @@ mod tests {
         let sign = create_signature("123".into(), "7".into(), "key".into());
         assert_eq!(sign.len(), 40);
         assert_eq!(getrand(12).chars().count(), 12);
+    }
+
+    #[test]
+    fn salted_sha256_matches_format_and_salt() {
+        // 面板账号口径：SHA-256(salt:password)
+        assert_eq!(salted_sha256_hex("s", "p"), sha256_hex(b"s:p"));
+        assert_ne!(salted_sha256_hex("s", "p"), salted_sha256_hex("s2", "p"));
+        assert_ne!(salted_sha256_hex("s", "p"), salted_sha256_hex("s", "p2"));
+        assert_eq!(salted_sha256_hex("s", "p").len(), 64);
     }
 
     #[test]
