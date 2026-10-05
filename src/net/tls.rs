@@ -154,4 +154,53 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[tokio::test]
+    async fn self_signed_https_with_custom_ca_pem() {
+        use crate::net::http::{handler, HttpOutcome, HttpRequest, HttpResponse, HttpServer};
+        use crate::net::http_client::{get, HttpClientOptions};
+
+        let dir = std::env::temp_dir().join(format!("tls-ca-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("c.pem");
+        let key_path = dir.join("c.key");
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+        ensure_self_signed_cert(&cert_path, &key_path, &[]).unwrap();
+        let (cert, key) = load_pem(&cert_path, &key_path).unwrap();
+        let ca_pem = std::fs::read(&cert_path).unwrap();
+
+        let server = HttpServer::bind_tls("127.0.0.1:0", &cert, &key)
+            .await
+            .unwrap();
+        let port = server.local_addr().unwrap().port();
+        tokio::spawn(server.serve(handler(|_req: HttpRequest| async move {
+            HttpOutcome::Response(HttpResponse::text(200, "ca-ok"))
+        })));
+
+        // ① 提供自定义根证书（ca_pem）→ 正常校验通过（无需 insecure_tls）
+        let resp = get(
+            &format!("https://127.0.0.1:{port}/ping"),
+            &[],
+            &HttpClientOptions {
+                ca_pem: Some(ca_pem.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body_text(), "ca-ok");
+
+        // ② 不提供（默认系统/内置根）→ 自签证书应校验失败
+        let err = get(
+            &format!("https://127.0.0.1:{port}/ping"),
+            &[],
+            &HttpClientOptions::default(),
+        )
+        .await;
+        assert!(err.is_err(), "自签证书不在默认根中应失败：{err:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

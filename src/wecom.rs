@@ -138,6 +138,7 @@ impl WeComBot {
         let options = HttpClientOptions {
             timeout: self.timeout,
             insecure_tls: self.insecure_tls,
+            ca_pem: None,
         };
         let resp = http_client::request(
             "POST",

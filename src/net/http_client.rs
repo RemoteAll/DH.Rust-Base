@@ -45,6 +45,9 @@ pub struct HttpClientOptions {
     pub timeout: Duration,
     /// 忽略服务器证书校验（对齐 C# `ServerCertificateCustomValidationCallback => true`）。
     pub insecure_tls: bool,
+    /// 自定义根证书（PEM 内容，可含多张）——**追加**到系统/内置根之后（自签/内网 CA 的
+    /// https 服务端场景，无需 `insecure_tls` 全跳过校验）；`insecure_tls` 为 true 时忽略本项。
+    pub ca_pem: Option<Vec<u8>>,
 }
 
 impl Default for HttpClientOptions {
@@ -52,6 +55,7 @@ impl Default for HttpClientOptions {
         Self {
             timeout: Duration::from_secs(30),
             insecure_tls: false,
+            ca_pem: None,
         }
     }
 }
@@ -251,16 +255,37 @@ pub fn blocking_request(
     body: Vec<u8>,
     timeout: Duration,
 ) -> Result<HttpResponse, HttpClientError> {
+    blocking_request_with(
+        method,
+        url,
+        headers,
+        content_type,
+        body,
+        &HttpClientOptions {
+            timeout,
+            ..Default::default()
+        },
+    )
+}
+
+/// 通用请求（同步版，**自定义选项**：`timeout` / `insecure_tls` / `ca_pem` 均生效）。
+///
+/// `ca_pem`：自定义根证书（PEM 可多张）**追加**到系统/内置根——自签/内网 CA 的
+/// https 服务端场景（无需 `insecure_tls` 全跳过校验）。
+pub fn blocking_request_with(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    content_type: Option<&str>,
+    body: Vec<u8>,
+    options: &HttpClientOptions,
+) -> Result<HttpResponse, HttpClientError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| HttpClientError::new(format!("创建 tokio 运行时失败: {e}")))?;
 
-    let options = HttpClientOptions {
-        timeout,
-        ..Default::default()
-    };
-    rt.block_on(request(method, url, headers, content_type, body, &options))
+    rt.block_on(request(method, url, headers, content_type, body, options))
 }
 
 /// 通用请求（同步版，**可在 tokio 运行时线程内安全调用**）：
@@ -276,22 +301,61 @@ pub fn blocking_request_offthread(
     body: Vec<u8>,
     timeout: Duration,
 ) -> Result<HttpResponse, HttpClientError> {
-    let method = method.to_string();
-    let url = url.to_string();
-    let headers: Vec<(String, String)> = headers
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    let content_type = content_type.map(|s| s.to_string());
+    let (method, url, headers, content_type) = own_request_args(method, url, headers, content_type);
+    offthread(move || {
+        let refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        blocking_request(&method, &url, &refs, content_type.as_deref(), body, timeout)
+    })
+}
+
+/// 通用请求（offthread 版，**自定义选项**：`timeout` / `insecure_tls` / `ca_pem` 均生效）。
+pub fn blocking_request_offthread_with(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    content_type: Option<&str>,
+    body: Vec<u8>,
+    options: HttpClientOptions,
+) -> Result<HttpResponse, HttpClientError> {
+    let (method, url, headers, content_type) = own_request_args(method, url, headers, content_type);
+    offthread(move || {
+        let refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        blocking_request_with(&method, &url, &refs, content_type.as_deref(), body, &options)
+    })
+}
+
+/// 请求参数转为 `'static`（offthread 线程包装用）。
+fn own_request_args(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    content_type: Option<&str>,
+) -> (String, String, Vec<(String, String)>, Option<String>) {
+    (
+        method.to_string(),
+        url.to_string(),
+        headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        content_type.map(|s| s.to_string()),
+    )
+}
+
+/// 在独立线程执行请求闭包后 join（offthread 家族共用）。
+fn offthread<F>(f: F) -> Result<HttpResponse, HttpClientError>
+where
+    F: FnOnce() -> Result<HttpResponse, HttpClientError> + Send + 'static,
+{
     let handle = std::thread::Builder::new()
         .name("dhrust-http-sync".to_string())
-        .spawn(move || {
-            let refs: Vec<(&str, &str)> = headers
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
-            blocking_request(&method, &url, &refs, content_type.as_deref(), body, timeout)
-        })
+        .spawn(f)
         .map_err(|e| HttpClientError::new(format!("创建 HTTP 线程失败: {e}")))?;
     match handle.join() {
         Ok(result) => result,
@@ -523,7 +587,7 @@ async fn send_request(
 
     #[cfg(feature = "http-tls")]
     let stream: BoxStream = if target.tls {
-        wrap_tls(&target.host, tcp, options.insecure_tls).await?
+        wrap_tls(&target.host, tcp, options).await?
     } else {
         Box::new(tcp)
     };
@@ -576,7 +640,7 @@ async fn send_request(
 async fn wrap_tls(
     host: &str,
     tcp: TcpStream,
-    insecure: bool,
+    options: &HttpClientOptions,
 ) -> Result<BoxStream, HttpClientError> {
     use std::sync::Arc;
 
@@ -584,7 +648,7 @@ async fn wrap_tls(
     use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
     let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
-    let config = if insecure {
+    let config = if options.insecure_tls {
         // 忽略证书校验：对齐 C# `ServerCertificateCustomValidationCallback => true`（服务器间自签场景）
         ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
@@ -601,6 +665,16 @@ async fn wrap_tls(
         if roots.is_empty() {
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
+        // 自定义根证书（PEM 可多张）追加信任：自签/内网 CA 的 https 服务端
+        if let Some(pem) = &options.ca_pem {
+            let added = add_pem_roots(&mut roots, pem)
+                .map_err(|e| HttpClientError::new(format!("根证书 PEM 解析失败: {e}")))?;
+            if added == 0 {
+                return Err(HttpClientError::new(
+                    "根证书 PEM 未包含证书块".to_string(),
+                ));
+            }
+        }
         ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .map_err(|e| HttpClientError::new(format!("TLS 配置失败: {e}")))?
@@ -616,6 +690,21 @@ async fn wrap_tls(
         .await
         .map_err(|e| HttpClientError::new(format!("TLS 握手失败: {e}")))?;
     Ok(Box::new(stream))
+}
+
+/// 解析 PEM 证书块并追加到根存储（返回解析成功的张数）。
+#[cfg(feature = "http-tls")]
+fn add_pem_roots(
+    roots: &mut tokio_rustls::rustls::RootCertStore,
+    pem: &[u8],
+) -> Result<usize, String> {
+    let mut count = 0;
+    for item in rustls_pemfile::certs(&mut &pem[..]) {
+        let cert = item.map_err(|e| format!("读取证书: {e}"))?;
+        roots.add(cert).map_err(|e| format!("证书无效: {e}"))?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 /// 忽略服务器证书校验的验证器（`insecure_tls` 专用；签名校验仍走 provider 算法）。
