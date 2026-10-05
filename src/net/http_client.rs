@@ -238,6 +238,31 @@ pub fn blocking_get(url: &str, timeout: Duration) -> Result<HttpResponse, HttpCl
     rt.block_on(get(url, &[], &options))
 }
 
+/// 通用请求（同步版，全量响应；内部创建临时 tokio 运行时）。
+///
+/// 供阻塞上下文低频调用（AI 对话、外部 API 上报等；任意方法/请求头/请求体）；
+/// 异步上下文请直接用 [`request`]。注意：在已有 tokio 运行时线程内调用会因
+/// “运行时内 block_on”而 panic，必须先派发到独立线程（参见各消费方的包装函数）。
+pub fn blocking_request(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    content_type: Option<&str>,
+    body: Vec<u8>,
+    timeout: Duration,
+) -> Result<HttpResponse, HttpClientError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| HttpClientError::new(format!("创建 tokio 运行时失败: {e}")))?;
+
+    let options = HttpClientOptions {
+        timeout,
+        ..Default::default()
+    };
+    rt.block_on(request(method, url, headers, content_type, body, &options))
+}
+
 /// 解析 HTTP 方法名（`GET`/`POST`/`PUT` 等，含自定义扩展方法）。
 fn parse_method(method: &str) -> Result<Method, HttpClientError> {
     Method::from_bytes(method.trim().as_bytes())
