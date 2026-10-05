@@ -146,7 +146,7 @@ impl Listener {
                     let server = match bound {
                         Ok(s) => s,
                         Err(e) => {
-                            let _ = ready_tx.send(Err(format!("监听绑定失败：{e}")));
+                            let _ = ready_tx.send(Err(format!("监听绑定失败 {addr_text}：{e}")));
                             return;
                         }
                     };

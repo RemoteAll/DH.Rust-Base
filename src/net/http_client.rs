@@ -683,6 +683,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn offthread_request_is_safe_inside_tokio_runtime() {
+        use std::io::Write as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // 单次响应后线程自然结束（不 join：请求失败时避免测试卡死）
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                use std::io::Read as _;
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        });
+
+        // 关键：在 tokio 运行时线程内调用（直接 blocking_request 会 panic）
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let resp = rt
+            .block_on(async {
+                blocking_request_offthread(
+                    "GET",
+                    &format!("http://{addr}/"),
+                    &[],
+                    None,
+                    Vec::new(),
+                    Duration::from_secs(5),
+                )
+            })
+            .expect("运行时线程内 offthread 请求应成功");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"ok");
+    }
+
+    #[test]
     fn blocking_get_text_roundtrip() {
         use std::io::{Read as _, Write as _};
 
