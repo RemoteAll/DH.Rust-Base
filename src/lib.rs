@@ -11,6 +11,7 @@ pub mod service; // 跨平台服务管理（Windows SCM / systemd / procd / SysV
 pub mod term; // 真 PTY 会话引擎（ConPTY/openpty；在线终端等服务端能力共用）
 #[cfg(feature = "plugin")]
 pub mod plugin; // 插件包格式 + 插件源目录签名（Ed25519；Pek.RAgent 与 Pek.RPanlServer 共用）
+pub mod staragent; // 星尘（StarAgent）配置注册：影子模式条目的 upsert/移除（Pek.RPanlServer 与 HlktechIoT MQTT 共用）
 pub mod threading; // 线程与定时调度（对应 DH.NCore Threading）
 pub mod times;
 pub mod web; // Web 辅助（URL 编码 / JSON 转义；对应 DH.NCore NewLife.Web 系列）

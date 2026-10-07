@@ -104,6 +104,80 @@ pub fn unescape_mount(s: &str) -> String {
     out
 }
 
+/// 解析 `/proc/mounts`（Linux；其他平台返回空）：`(设备, 挂载点(原始未转义), 文件系统)`。
+/// 调用方通常还需 [`unescape_mount`] 还原八进制转义再做过滤。
+/// （2026-10-07 自 dhrust `sys::machine::disks` 与 DHDeploy 磁盘采集的重复解析下沉）
+pub fn list_mounts() -> Vec<(String, String, String)> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut out = Vec::new();
+        let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+            return out;
+        };
+        for line in mounts.lines() {
+            let mut cols = line.split_whitespace();
+            let (Some(dev), Some(mp), Some(fs)) = (cols.next(), cols.next(), cols.next()) else {
+                continue;
+            };
+            out.push((dev.to_string(), mp.to_string(), fs.to_string()));
+        }
+        out
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+}
+
+/// 挂载点容量（`statvfs`）：`(总字节, 可用字节)`（块大小 `f_frsize` 回退 `f_bsize`，
+/// 可用取非特权用户口径 `f_bavail`，与 df 一致）；失败（未挂载/无权限）返回 None。
+/// 非 Unix 平台恒为 None。
+pub fn usage_bytes(mount: &str) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        let path = std::ffi::CString::new(mount).ok()?;
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+            return None;
+        }
+        let block = if stat.f_frsize > 0 {
+            stat.f_frsize
+        } else {
+            stat.f_bsize
+        } as u64;
+        let total = (stat.f_blocks as u64).saturating_mul(block);
+        let avail = (stat.f_bavail as u64).saturating_mul(block);
+        Some((total, avail))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mount;
+        None
+    }
+}
+
+#[cfg(test)]
+mod mount_prims_tests {
+    use super::*;
+
+    #[test]
+    fn list_mounts_platform_shape() {
+        let mounts = list_mounts();
+        #[cfg(target_os = "linux")]
+        assert!(
+            mounts.iter().any(|(d, _, _)| d.starts_with("/dev/")),
+            "Linux 应至少枚举到一个 /dev 挂载"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert!(mounts.is_empty(), "非 Linux 平台返回空列表");
+    }
+
+    #[test]
+    fn usage_bytes_invalid_mount_is_none() {
+        assert!(usage_bytes("/definitely/not/a/dir/pek-rpanl").is_none());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

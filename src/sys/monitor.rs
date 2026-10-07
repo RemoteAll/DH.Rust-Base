@@ -409,6 +409,129 @@ pub fn process_cpu_seconds() -> (f64, f64, f64) {
     process_cpu_split(std::process::id()).unwrap_or((0.0, 0.0, 0.0))
 }
 
+/// 进程 CPU 占用百分比（占整机口径：CPU 时间 / 经过时间 / 逻辑核数 × 100，钳制 0~100）。
+///
+/// `elapsed_secs` ≤ 0 或 `cores` 为 0 时返回 0（Pek.RAgent 采样器与 Pek.RPanlServer
+/// 概览页共用；2026-10-07 自两处重复实现下沉）。
+pub fn process_cpu_percent(cpu_seconds: f64, elapsed_secs: f64, cores: usize) -> f64 {
+    if elapsed_secs <= 0.0 || cores == 0 {
+        return 0.0;
+    }
+    ((cpu_seconds / elapsed_secs) / cores as f64 * 100.0).clamp(0.0, 100.0)
+}
+
+/// 进程 CPU 采样器（请求间差分：取两次调用的间隔为采样窗口；面板关闭时零开销）。
+///
+/// 使用：进程内放一个 `static` 实例，每次请求/采样周期调用一次：
+/// ```ignore
+/// static METER: ProcessCpuMeter = ProcessCpuMeter::new();
+/// let rate = METER.sample_since(std::time::Instant::now()); // 首帧为“平均占用”，之后为窗口差值
+/// ```
+pub struct ProcessCpuMeter {
+    last: std::sync::Mutex<Option<(std::time::Instant, f64)>>,
+}
+
+impl Default for ProcessCpuMeter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProcessCpuMeter {
+    /// 创建空采样器（进程内静态量场景用 `const` 构造）。
+    pub const fn new() -> Self {
+        Self {
+            last: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// 采样一次（窗口 = 与上次采样的间隔）。
+    ///
+    /// - 首帧（无基线）返回 `None`；
+    /// - 间隔 < 50ms 时返回 `None`（窗口过小无意义），但仍刷新基线。
+    pub fn sample(&self) -> Option<f64> {
+        let total = process_cpu_seconds().0;
+        let now = std::time::Instant::now();
+        let mut slot = self.last.lock().ok()?;
+        let rate = match *slot {
+            Some((t0, c0)) => {
+                let dt = now.duration_since(t0).as_secs_f64();
+                if dt >= 0.05 {
+                    Some(process_cpu_percent((total - c0).max(0.0), dt, cpu_count()))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        *slot = Some((now, total));
+        rate
+    }
+
+    /// 采样一次；无基线（首帧）时以 `start` 为起点计算平均占用（窗口至少按 0.5 秒，
+    /// 便于启动初期也能给出近似值——Pek.RAgent 采样器语义）。始终返回数值。
+    pub fn sample_since(&self, start: std::time::Instant) -> f64 {
+        let total = process_cpu_seconds().0;
+        let now = std::time::Instant::now();
+        let cores = cpu_count();
+        let mut slot = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let rate = match *slot {
+            Some((t0, c0)) => process_cpu_percent(
+                (total - c0).max(0.0),
+                now.duration_since(t0).as_secs_f64(),
+                cores,
+            ),
+            None => process_cpu_percent(
+                total,
+                now.duration_since(start).as_secs_f64().max(0.5),
+                cores,
+            ),
+        };
+        *slot = Some((now, total));
+        rate
+    }
+}
+
+/// 逻辑核数（获取失败按 1）。
+fn cpu_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+#[cfg(test)]
+mod process_cpu_meter_tests {
+    use super::*;
+
+    #[test]
+    fn process_cpu_percent_clamps_to_range() {
+        assert_eq!(process_cpu_percent(0.5, 1.0, 4), 12.5);
+        assert_eq!(process_cpu_percent(-1.0, 1.0, 4), 0.0);
+        assert_eq!(process_cpu_percent(100.0, 1.0, 4), 100.0, "整机口径钳制到 100");
+        assert_eq!(process_cpu_percent(0.5, 0.0, 4), 0.0, "零窗口返回 0");
+        assert_eq!(process_cpu_percent(0.5, 1.0, 0), 0.0, "零核数返回 0");
+    }
+
+    #[test]
+    fn meter_first_frame_none_then_value() {
+        let meter = ProcessCpuMeter::new();
+        assert!(meter.sample().is_none(), "首帧无基线");
+        // 忙等约 60ms 制造窗口（保证 ≥50ms）
+        let t = std::time::Instant::now();
+        while t.elapsed().as_millis() < 60 {}
+        let rate = meter.sample().expect("次帧应有值");
+        assert!(rate >= 0.0 && rate <= 100.0, "{rate}");
+    }
+
+    #[test]
+    fn meter_sample_since_first_frame_value() {
+        let meter = ProcessCpuMeter::new();
+        let start = std::time::Instant::now();
+        let rate = meter.sample_since(start);
+        assert!(rate >= 0.0 && rate <= 100.0, "{rate}");
+    }
+}
+
 /// 指定进程 CPU 时间（总秒、内核秒、用户秒）。
 #[cfg(windows)]
 pub fn process_cpu_split(pid: u32) -> Option<(f64, f64, f64)> {

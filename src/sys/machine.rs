@@ -864,37 +864,23 @@ pub fn disks() -> Vec<DiskItem> {
     #[cfg(target_os = "linux")]
     {
         let mut out = Vec::new();
-        let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
-            return out;
-        };
-        for line in mounts.lines() {
-            let mut cols = line.split_whitespace();
-            let (Some(dev), Some(mp), Some(fs)) = (cols.next(), cols.next(), cols.next()) else {
-                continue;
-            };
+        for (dev, mp, fs) in super::disk::list_mounts() {
             if !dev.starts_with("/dev/") {
                 continue;
             }
             // 八进制转义还原（\040 等）；过滤引导分区与系统虚拟文件系统（对齐 DHDeploy `IsTemporaryVolume`）
-            let mount = super::disk::unescape_mount(mp);
-            if super::disk::is_temporary_mount(&mount, Some(fs)) {
+            let mount = super::disk::unescape_mount(&mp);
+            if super::disk::is_temporary_mount(&mount, Some(&fs)) {
                 continue;
             }
-            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-            let Ok(path) = std::ffi::CString::new(mount.as_str()) else {
-                continue;
-            };
-            let ok = unsafe { libc::statvfs(path.as_ptr(), &mut stat) } == 0;
-            let (total, free) = if ok {
-                let block = stat.f_frsize as u64;
-                (stat.f_blocks as u64 * block, stat.f_bavail as u64 * block)
-            } else {
-                (0, 0)
+            let (total, free, ok) = match super::disk::usage_bytes(&mount) {
+                Some((t, a)) => (t, a, true),
+                None => (0, 0, false),
             };
             out.push(DiskItem {
-                name: mount.clone(),
+                name: mount,
                 kind: "固定".to_string(),
-                format: fs.to_string(),
+                format: fs,
                 label: String::new(),
                 total,
                 free,

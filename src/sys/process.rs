@@ -224,6 +224,74 @@ pub fn stop_process(pid: u32, timeout_ms: u64) -> bool {
     !is_alive(pid)
 }
 
+// ————— 进程启动时刻 / 运行时长（2026-10-07 自 Pek.RPanlServer 与 Pek.RAgent 下沉）—————
+
+static PROC_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+static PROC_START_WALL: std::sync::OnceLock<chrono::DateTime<chrono::Local>> =
+    std::sync::OnceLock::new();
+
+/// 记录进程启动时刻（`main()` 启动时调用一次；未调用时以首次查询为基准）。
+pub fn mark_started() {
+    let _ = PROC_START.set(Instant::now());
+    let _ = PROC_START_WALL.set(chrono::Local::now());
+}
+
+/// 进程启动时刻（单调时钟；未打点时以首次调用为基准并打点）。
+pub fn started_instant() -> Instant {
+    *PROC_START.get_or_init(Instant::now)
+}
+
+/// 进程运行时长（自 [`mark_started`] 起）。
+pub fn uptime() -> Duration {
+    started_instant().elapsed()
+}
+
+/// 进程启动时刻（本地时区墙钟；未打点时以首次调用为基准）。
+pub fn start_time_local() -> chrono::DateTime<chrono::Local> {
+    *PROC_START_WALL.get_or_init(chrono::Local::now)
+}
+
+/// 运行时长格式化（`d.hh:mm:ss`，与 C# 星尘面板 / Pek.RAgent 一致）。
+pub fn format_uptime(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    format!(
+        "{}.{:02}:{:02}:{:02}",
+        secs / 86400,
+        (secs % 86400) / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
+#[cfg(test)]
+mod uptime_tests {
+    use super::*;
+
+    #[test]
+    fn format_uptime_d_hh_mm_ss() {
+        assert_eq!(format_uptime(Duration::from_secs(0)), "0.00:00:00");
+        assert_eq!(format_uptime(Duration::from_secs(59)), "0.00:00:59");
+        assert_eq!(
+            format_uptime(Duration::from_secs(60 * 60 + 60 + 1)),
+            "0.01:01:01"
+        );
+        assert_eq!(
+            format_uptime(Duration::from_secs(86400 * 2 + 3600 * 3 + 60 * 4 + 5)),
+            "2.03:04:05"
+        );
+    }
+
+    #[test]
+    fn uptime_positive_after_mark() {
+        mark_started();
+        let first = started_instant();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(uptime().as_millis() >= 5);
+        assert_eq!(started_instant(), first, "重复调用不改变基准");
+        let _ = start_time_local();
+    }
+}
+
 /// 进程名（含扩展名，如 `app.exe`/`dotnet`）。尽力而为，取不到返回 None。
 #[cfg(windows)]
 pub fn process_name(pid: u32) -> Option<String> {
