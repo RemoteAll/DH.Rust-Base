@@ -5,7 +5,10 @@
 //!
 //! 设计要点：
 //! - 启动的子进程默认重定向到空设备，避免服务模式无控制台时输出异常；
-//! - 停止先温和（Unix SIGTERM / Windows taskkill），超时后强制（SIGKILL / taskkill /F）；
+//! - 停止先温和（Unix SIGTERM / Windows taskkill /T），超时后强制（SIGKILL / taskkill /T /F）；
+//!   **默认覆盖进程树**：Windows 带 `/T`；Unix 对进程组长按进程组发送（本库 `spawn` 的子进程
+//!   经 `setsid` 自成组长，应用派生的后代默认同组）——避免只杀启动器、真正干活的后代进程
+//!   变孤儿残留（端口仍被占用、服务“停不掉”）；
 //! - 内存读取：Linux `/proc/{pid}/statm`、Windows `GetProcessMemoryInfo`、macOS `ps`；
 //! - **Windows `is_alive` 必须查 `GetExitCodeProcess != STILL_ACTIVE`**：已终止但句柄
 //!   未关闭的“僵尸”进程 `OpenProcess` 依然成功，只看句柄会误判存活
@@ -152,7 +155,11 @@ pub fn is_alive(pid: u32) -> bool {
     }
 }
 
-/// 发送温和停止信号（Unix SIGTERM / Windows taskkill）。
+/// 发送温和停止信号（Unix SIGTERM / Windows taskkill），并覆盖子进程树。
+///
+/// Windows 带 `/T` 一并作用于子进程树；Unix 当目标为自身所在组的组长时按进程组
+/// 发送（[`spawn`] 的子进程经 `setsid` 自成组长，后代默认同组），非组长（如接管
+/// 的外部进程）回退为单进程信号。
 pub fn signal_graceful(pid: u32) {
     if pid == 0 {
         return;
@@ -160,20 +167,28 @@ pub fn signal_graceful(pid: u32) {
 
     #[cfg(unix)]
     unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        let pgid = libc::getpgid(pid as libc::pid_t);
+        if pgid > 0 && pgid == pid as libc::pid_t {
+            libc::kill(-pgid, libc::SIGTERM);
+        } else {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
     }
 
     #[cfg(windows)]
     {
         let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string()])
+            .args(["/PID", &pid.to_string(), "/T"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
     }
 }
 
-/// 强制结束进程（Unix SIGKILL / Windows taskkill /F）。
+/// 强制结束进程（Unix SIGKILL / Windows taskkill /T /F），并覆盖子进程树。
+///
+/// 进程树覆盖语义与 [`signal_graceful`] 一致（Windows `/T`；Unix 组长按组杀、
+/// 非组长回退单进程）。
 pub fn signal_force(pid: u32) {
     if pid == 0 {
         return;
@@ -181,13 +196,18 @@ pub fn signal_force(pid: u32) {
 
     #[cfg(unix)]
     unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        let pgid = libc::getpgid(pid as libc::pid_t);
+        if pgid > 0 && pgid == pid as libc::pid_t {
+            libc::kill(-pgid, libc::SIGKILL);
+        } else {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
     }
 
     #[cfg(windows)]
     {
         let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -512,6 +532,110 @@ mod tests {
         let pid = child.id();
         assert!(!is_alive(pid), "僵尸进程被误判为存活");
         let _ = child.wait();
+    }
+
+    /// 强杀应覆盖子进程树（Windows `taskkill /T`）：父 cmd 拉起的子 ping 必须一并消失，
+    /// 否则只杀启动器、真正干活的子进程变孤儿残留（端口仍被占用、服务“停不掉”）。
+    #[cfg(windows)]
+    #[test]
+    fn force_stop_kills_child_tree() {
+        fn count_ping() -> usize {
+            let out = std::process::Command::new("tasklist")
+                .args(["/FI", "IMAGENAME eq PING.EXE", "/NH"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| l.contains("PING.EXE"))
+                .count()
+        }
+
+        let before = count_ping();
+
+        // 父：cmd 前台等待；子：ping（两层进程树）
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 300 127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+
+        // 等待子 ping 起来（≤3 秒）
+        let mut spawned = false;
+        for _ in 0..15 {
+            std::thread::sleep(Duration::from_millis(200));
+            if count_ping() > before {
+                spawned = true;
+                break;
+            }
+        }
+        assert!(spawned, "测试前置失败：子 ping 未启动");
+
+        signal_force(pid);
+        let _ = child.wait();
+
+        // 等待进程树清空（≤3 秒）
+        let mut left: i32 = 1;
+        for _ in 0..15 {
+            std::thread::sleep(Duration::from_millis(200));
+            left = count_ping() as i32 - before as i32;
+            if left <= 0 {
+                break;
+            }
+        }
+        assert!(left <= 0, "子进程残留：signal_force 未覆盖进程树");
+    }
+
+    /// 强杀应覆盖进程组（Unix）：本库 [`spawn`] 的子进程经 `setsid` 自成组长，
+    /// `sh -c 'sleep 300 & sleep 300'` 的父 sh 与两个后台 sleep 同组，强杀后应全部消失。
+    #[cfg(unix)]
+    #[test]
+    fn force_stop_kills_process_group() {
+        let req = SpawnRequest {
+            program: "sh",
+            args: &["-c".to_string(), "sleep 300 & sleep 300".to_string()],
+            cwd: std::path::Path::new("."),
+            envs: &[],
+            log_file: None,
+            detached: false,
+        };
+        let mut child = spawn(&req).unwrap();
+        let pid = child.id();
+
+        // 组内进程数（pgrep 按进程组）
+        let group_count = || -> usize {
+            let out = std::process::Command::new("sh")
+                .args(["-c", &format!("pgrep -g {} | wc -l", pid)])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
+        };
+
+        let mut ready = false;
+        for _ in 0..15 {
+            std::thread::sleep(Duration::from_millis(200));
+            if group_count() >= 3 {
+                // sh + 2×sleep
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "测试前置失败：进程组未就绪");
+
+        signal_force(pid);
+        let _ = child.wait();
+
+        let mut left = usize::MAX;
+        for _ in 0..15 {
+            std::thread::sleep(Duration::from_millis(200));
+            left = group_count();
+            if left == 0 {
+                break;
+            }
+        }
+        assert_eq!(left, 0, "进程组残留：signal_force 未覆盖后代进程");
     }
 }
 
