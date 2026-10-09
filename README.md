@@ -47,7 +47,8 @@ Controller::new("api")
 // Controller::new("home").get("index", |_ctx| view(model)).mount(&mut router);
 
 // 静态文件 + SPA 一体化：嵌入构建产物（embed_many，嵌入优先→wwwroot 兜底）→
-// 深链接回退 index.html（history 路由）；/api 前缀排除于回退之外（保持 JSON 404）
+// 深链接回退 index.html（history 路由）；/api 前缀排除于回退之外（保持 JSON 404）；
+// try_serve_request 自带 ETag/304 条件请求（重复打开零正文），响应自动 gzip 协商
 let statics = StaticFiles::default()
     .embed_many(&[("index.html", include_bytes!("web/dist/index.html"))]) // 真实项目由 build.rs 生成整表
     .spa_fallback(true)
@@ -55,9 +56,7 @@ let statics = StaticFiles::default()
 router.fallback(route(move |ctx| {
     let statics = statics.clone();
     async move {
-        if let Some(response) =
-            statics.try_serve_with_accept(&ctx.req.path, ctx.req.header("accept"))
-        {
+        if let Some(response) = statics.try_serve_request(&ctx.req) {
             return HttpOutcome::Response(response);
         }
         HttpOutcome::Response(HttpResponse::text(404, "Not Found"))

@@ -36,7 +36,7 @@ flowchart LR
     S -->|带扩展名未命中 / 排除前缀| H4[JSON 404]
 ```
 
-规则（`try_serve_with_accept`）：
+规则（`try_serve_request`）：
 
 1. **文件优先**：嵌入资源 → 磁盘目录（`wwwroot/`），路径穿越等危险路径直接拒绝（且不触发回退）；
 2. **SPA 回退条件**（启用 `spa_fallback` 且未落在 `spa_excludes` 前缀内，任一即可）：
@@ -69,7 +69,7 @@ router.fallback(route(move |ctx| {
         let method_ok = ctx.req.method.eq_ignore_ascii_case("GET")
             || ctx.req.method.eq_ignore_ascii_case("HEAD");
         let served = if method_ok {
-            statics.try_serve_with_accept(&ctx.req.path, ctx.req.header("accept"))
+            statics.try_serve_request(&ctx.req)
         } else {
             statics.try_serve_file(&ctx.req.path)
         };
@@ -223,10 +223,10 @@ cargo run --features "net,razor" --example spa_server -- 8080
 - **安全检查先于回退**：`../`、`\`、`:`、`%` 等危险路径一律拒绝，且**不会**被回退成 index.html；
 - **方法限制**：非 GET/HEAD 用 `try_serve_file`（只服务真实文件），未知路径由业务回 JSON 404；
 - **默认文档**：`/` 与目录结尾命中 `index.html`（与 SPA 回退共用同一文档）；
-- **可选缓存头**（哈希资源强缓存、index 不缓存）：
+- **缓存头（内置）**：静态响应自带 `ETag` + `Cache-Control: no-cache`（`If-None-Match` 未变 → `304`，重复打开零正文）；哈希文件名资源可再追加强缓存：
 
 ```rust
-let mut resp = statics.try_serve_with_accept(&ctx.req.path, ctx.req.header("accept"))?;
+let mut resp = statics.try_serve_request(&ctx.req)?;
 if ctx.req.path.starts_with("/assets/") {
     resp = resp.with_header("Cache-Control", "public, max-age=31536000, immutable");
 }
@@ -237,7 +237,7 @@ if ctx.req.path.starts_with("/assets/") {
 | 问题 | 说明 |
 |---|---|
 | 前端构建后 Rust 全量重编？ | build.rs 重跑 + `include_bytes!` 依赖变化必然触发重编；release（LTO）链接较慢属预期，开发期用目录模式规避 |
-| 二进制变大？ | dist 原样进二进制（压缩后进 tar/zip 会小很多）；如需更小可后续做构建期 br/gz 预压缩 |
+| 二进制变大？ | dist 原样进二进制（压缩后进 tar/zip 会小很多）；HTTP 响应已内建 gzip 协商（`net` 特性，面板 HTML/JSON 出网流量约 -70%/-45%） |
 | hash 路由（`#/x`）还需要回退吗？ | 不需要，但开启无副作用；建议直接开，将来换 history 路由零改动 |
 | 多个后端命名空间？ | `spa_excludes(&["/api", "/star", "/internal"])` 一次列全 |
 | 嵌入资源与 wwwroot 同时存在？ | 嵌入优先（部署稳定），磁盘作开发期覆盖/兜底 |

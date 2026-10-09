@@ -26,6 +26,9 @@ use super::ws::{self, WsServerHooks, WsServerOptions};
 /// 请求体读取上限默认值（64MB；超出返回 413）。
 pub const DEFAULT_MAX_BODY_SIZE: usize = 64 * 1024 * 1024;
 
+/// 响应 gzip 压缩的最小体积（字节；小于该值不压缩——小报文压缩后反而变大）。
+pub const DEFAULT_GZIP_MIN_SIZE: usize = 256;
+
 // ————— 请求 / 响应（自有类型）—————
 
 /// HTTP 请求（语义层类型；不暴露 hyper 泛型）。
@@ -184,6 +187,11 @@ pub struct HttpServerOptions {
     /// “每连接一线程”少一个量级，CPU 开销与尾时延同时占优
     /// （基准实测；与 `thread_per_connection` 同时开启时后者优先）
     pub conn_shards: usize,
+    /// 响应自动 gzip 压缩（默认开启）：按 `Accept-Encoding` 协商，仅文本/JSON 类
+    /// 且达到 [`Self::gzip_min_size`] 时压缩——面板 HTML/轮询 JSON 的出网流量削减
+    pub gzip: bool,
+    /// gzip 压缩的最小响应体长度（默认 [`DEFAULT_GZIP_MIN_SIZE`]）
+    pub gzip_min_size: usize,
 }
 
 impl Default for HttpServerOptions {
@@ -193,6 +201,8 @@ impl Default for HttpServerOptions {
             ws: WsServerOptions::default(),
             thread_per_connection: false,
             conn_shards: 0,
+            gzip: true,
+            gzip_min_size: DEFAULT_GZIP_MIN_SIZE,
         }
     }
 }
@@ -529,8 +539,14 @@ async fn handle_http(
         remote_addr: remote,
     };
 
+    // 内容协商：在把请求交给处理器之前提取 gzip 接受性（用于响应收尾）
+    let accept_gzip = http_req
+        .header("accept-encoding")
+        .map(|v| v.to_ascii_lowercase().contains("gzip"))
+        .unwrap_or(false);
+
     match (handler)(http_req).await {
-        HttpOutcome::Response(r) => r.into_hyper(),
+        HttpOutcome::Response(r) => finalize_http_response(r, accept_gzip, &options).into_hyper(),
         HttpOutcome::WebSocket(hooks) => {
             // 合法性校验（对端可能伪造 Upgrade 头或版本不符）
             let (Some(on_upgrade), Some(key)) = (
@@ -565,6 +581,87 @@ async fn handle_http(
                 .into_hyper()
         }
     }
+}
+
+/// 响应收尾：按 `Accept-Encoding` 协商做 gzip（文本类 + 达到阈值；已编码/小报文跳过）。
+///
+/// 压缩为响应级特性：静态页面（面板单文件 HTML）与 JSON 轮询接口均受益；
+/// 图片/zip/字体等已压缩格式与 WebSocket 升级路径不受影响。
+fn finalize_http_response(
+    mut resp: HttpResponse,
+    accept_gzip: bool,
+    options: &HttpServerOptions,
+) -> HttpResponse {
+    if !options.gzip {
+        return resp;
+    }
+    let Some(content_type) = resp
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.clone())
+    else {
+        return resp;
+    };
+    if !is_compressible_type(&content_type) {
+        return resp;
+    }
+    // 内容协商语义：同 URL 的表示随 Accept-Encoding 变化（代理/缓存必备）
+    if !resp
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("vary"))
+    {
+        resp.headers
+            .push(("Vary".to_string(), "Accept-Encoding".to_string()));
+    }
+    if !accept_gzip
+        || resp.body.len() < options.gzip_min_size
+        || resp
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+    {
+        return resp;
+    }
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(
+        Vec::with_capacity(resp.body.len() / 3 + 64),
+        flate2::Compression::default(),
+    );
+    if encoder.write_all(&resp.body).is_err() {
+        return resp;
+    }
+    let Ok(compressed) = encoder.finish() else {
+        return resp;
+    };
+    if compressed.len() >= resp.body.len() {
+        return resp;
+    }
+    resp.body = Bytes::from(compressed);
+    resp.headers
+        .push(("Content-Encoding".to_string(), "gzip".to_string()));
+    resp
+}
+
+/// 可压缩 `Content-Type` 判定（文本与 JSON/JS/XML/SVG；已压缩格式明确排除）。
+fn is_compressible_type(content_type: &str) -> bool {
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    ct.starts_with("text/")
+        || matches!(
+            ct.as_str(),
+            "application/json"
+                | "application/javascript"
+                | "application/xml"
+                | "application/xhtml+xml"
+                | "application/manifest+json"
+                | "image/svg+xml"
+        )
 }
 
 /// 升级候选判定（hyper 头映射版）。

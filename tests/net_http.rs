@@ -21,11 +21,15 @@ use tokio::net::TcpStream;
 // ————— 工具 —————
 
 async fn start(router: Router) -> SocketAddr {
+    start_with(router, HttpServerOptions::default()).await
+}
+
+async fn start_with(router: Router, options: HttpServerOptions) -> SocketAddr {
     let server = HttpServer::bind("127.0.0.1:0").await.unwrap();
     let addr = server.local_addr().unwrap();
     let svc = router.into_handler();
     tokio::spawn(async move {
-        let _ = server.serve(svc).await;
+        let _ = server.serve_with(svc, options).await;
     });
     addr
 }
@@ -59,6 +63,40 @@ async fn http_call(
         Some((head, body)) => (status, head.to_string(), body.to_string()),
         None => (status, text, String::new()),
     }
+}
+
+/// 裸 TCP 请求（原样返回响应体字节；用于二进制/压缩场景断言）。
+async fn http_call_raw(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> (u16, String, Vec<u8>) {
+    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    tcp.write_all(req.as_bytes()).await.unwrap();
+    tcp.write_all(body).await.unwrap();
+
+    let mut buf: Vec<u8> = Vec::new();
+    tcp.read_to_end(&mut buf).await.unwrap();
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(buf.len());
+    let head = String::from_utf8_lossy(&buf[..split]).into_owned();
+    let body_raw = buf[split..].to_vec();
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    (status, head, body_raw)
 }
 
 async fn wait_until(mut cond: impl FnMut() -> bool, timeout_ms: u64) -> bool {
@@ -378,4 +416,119 @@ async fn router_ws_endpoint() {
         .unwrap();
     assert_eq!(got, "echo:hi");
     client.close();
+}
+
+/// gzip 内容协商：文本类达到阈值才压缩（可解压还原）；未协商/过小 → 原样。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gzip_negotiation_and_threshold() {
+    let mut r = Router::new();
+    r.map_get(
+        "/big",
+        route(|_ctx: Ctx| async move {
+            HttpOutcome::Response(HttpResponse::text(200, "A".repeat(4096)))
+        }),
+    );
+    r.map_get(
+        "/small",
+        route(|_ctx: Ctx| async move { HttpOutcome::Response(HttpResponse::text(200, "tiny")) }),
+    );
+    let addr = start(r).await;
+
+    // 协商 gzip → 带 Content-Encoding/Vary，且可解压还原
+    let (s, head, body) = http_call_raw(
+        addr,
+        "GET",
+        "/big",
+        &[("Accept-Encoding", "gzip, deflate")],
+        b"",
+    )
+    .await;
+    assert_eq!(s, 200);
+    assert!(
+        head.to_ascii_lowercase().contains("content-encoding: gzip"),
+        "应协商为 gzip: {head}"
+    );
+    assert!(
+        head.to_ascii_lowercase().contains("vary: accept-encoding"),
+        "应带 Vary: {head}"
+    );
+    assert!(body.len() < 4096, "压缩后应显著变小: {}", body.len());
+    let mut decoder = flate2::read::GzDecoder::new(body.as_slice());
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut decoder, &mut text).unwrap();
+    assert_eq!(text.len(), 4096, "解压后应与原文一致");
+
+    // 未协商 → 原样
+    let (s, head, body) = http_call_raw(addr, "GET", "/big", &[], b"").await;
+    assert_eq!(s, 200);
+    assert!(!head.to_ascii_lowercase().contains("content-encoding"));
+    assert_eq!(body.len(), 4096);
+
+    // 小响应（< 阈值）→ 不压缩
+    let (s, head, body) = http_call_raw(
+        addr,
+        "GET",
+        "/small",
+        &[("Accept-Encoding", "gzip")],
+        b"",
+    )
+    .await;
+    assert_eq!(s, 200);
+    assert!(!head.to_ascii_lowercase().contains("content-encoding"));
+    assert_eq!(body, b"tiny");
+}
+
+/// gzip 可关闭；已带 Content-Encoding 的响应不二次压缩。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gzip_can_be_disabled_and_skips_encoded() {
+    // 关闭：即使协商也不压缩
+    let mut r = Router::new();
+    r.map_get(
+        "/big",
+        route(|_ctx: Ctx| async move {
+            HttpOutcome::Response(HttpResponse::text(200, "B".repeat(4096)))
+        }),
+    );
+    let addr = start_with(
+        r,
+        HttpServerOptions {
+            gzip: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    let (s, head, body) = http_call_raw(
+        addr,
+        "GET",
+        "/big",
+        &[("Accept-Encoding", "gzip")],
+        b"",
+    )
+    .await;
+    assert_eq!(s, 200);
+    assert!(!head.to_ascii_lowercase().contains("content-encoding"));
+    assert_eq!(body.len(), 4096);
+
+    // 处理器已自行编码（如预压缩资源）：原样透传
+    let mut r2 = Router::new();
+    r2.map_get(
+        "/preencoded",
+        route(|_ctx: Ctx| async move {
+            HttpOutcome::Response(
+                HttpResponse::bytes(200, "text/plain; charset=utf-8", vec![1u8; 4096])
+                    .with_header("Content-Encoding", "gzip"),
+            )
+        }),
+    );
+    let addr2 = start(r2).await;
+    let (s, _head, body) = http_call_raw(
+        addr2,
+        "GET",
+        "/preencoded",
+        &[("Accept-Encoding", "gzip")],
+        b"",
+    )
+    .await;
+    assert_eq!(s, 200);
+    assert_eq!(body.len(), 4096, "已编码响应不应二次压缩");
 }

@@ -99,11 +99,11 @@ async fn main() {
     router.fallback(route(move |ctx| {
         let statics = statics.clone();
         async move {
-            // GET/HEAD：真实文件 → SPA 回退；其他方法只允许命中真实文件
+            // GET/HEAD：真实文件 → SPA 回退（带 ETag/条件请求）；其他方法只允许命中真实文件
             let method_ok = ctx.req.method.eq_ignore_ascii_case("GET")
                 || ctx.req.method.eq_ignore_ascii_case("HEAD");
             let served = if method_ok {
-                statics.try_serve_with_accept(&ctx.req.path, ctx.req.header("accept"))
+                statics.try_serve_request(&ctx.req)
             } else {
                 statics.try_serve_file(&ctx.req.path)
             };

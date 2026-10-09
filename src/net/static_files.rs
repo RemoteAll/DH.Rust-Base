@@ -9,6 +9,9 @@
 //! - **SPA 回退**：[`StaticFiles::spa_fallback`] 启用后，未命中的“前端路由”路径回退
 //!   `index.html`（对齐 ASP.NET Core `MapFallbackToFile("index.html")`）；后端前缀
 //!   （如 `/api`）用 [`StaticFiles::spa_excludes`] 排除，保持 JSON 404；
+//! - **条件请求**：静态响应携带 `ETag` 与 `Cache-Control: no-cache`；
+//!   [`StaticFiles::try_serve_request`] 在命中后处理 `If-None-Match`（未变 → `304` 空体），
+//!   面板/资源重复打开与刷新零正文流量（嵌入资源强 ETag；磁盘文件长度+修改时间弱 ETag）；
 //! - **约定**：路径 `/` 或目录尾斜杠命中 `index.html` 默认文档；
 //!   `..`/反斜杠/盘符/空段等危险路径直接拒绝（防目录穿越）；
 //! - **用法**：通常挂到路由 fallback——命中返回文件，未命中 `None` 由调用方决定 404：
@@ -29,7 +32,7 @@
 //!     let statics = statics.clone();
 //!     async move {
 //!         statics
-//!             .try_serve_with_accept(&ctx.req.path, ctx.req.header("accept"))
+//!             .try_serve_request(&ctx.req)
 //!             .map(HttpOutcome::Response)
 //!             .unwrap_or_else(|| {
 //!                 HttpOutcome::Response(HttpResponse::text(404, "Not Found"))
@@ -41,19 +44,40 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use super::http::HttpResponse;
+use super::http::{HttpRequest, HttpResponse};
 
 /// 静态文件服务（目录 + 嵌入资源；`Clone` 可共享进闭包）。
 #[derive(Clone)]
 pub struct StaticFiles {
     /// 磁盘根目录（`None` = 仅嵌入资源）
     root: Option<PathBuf>,
-    /// 嵌入资源（相对路径 → 数据 + Content-Type）
-    embedded: HashMap<String, (&'static [u8], &'static str)>,
+    /// 嵌入资源（相对路径 → 数据 + Content-Type + 预计算 ETag）
+    embedded: HashMap<String, EmbeddedAsset>,
     /// SPA 回退：未命中的“前端路由”路径回退 index 文档（history 路由）
     spa: bool,
     /// SPA 排除前缀（已归一化：小写、前导 `/`、无尾 `/`）
     spa_excludes: Vec<String>,
+}
+
+/// 嵌入资源条目（注册期预计算强 ETag：条件请求 304 命中零计算成本）。
+#[derive(Clone)]
+struct EmbeddedAsset {
+    /// 编译期数据（`include_bytes!`/`include_str!`）
+    data: &'static [u8],
+    /// 响应 Content-Type
+    content_type: &'static str,
+    /// 强 ETag（`"长度-内容哈希"`）
+    etag: String,
+}
+
+impl EmbeddedAsset {
+    fn new(data: &'static [u8], content_type: &'static str) -> EmbeddedAsset {
+        EmbeddedAsset {
+            data,
+            content_type,
+            etag: format!("\"{:x}-{:x}\"", data.len(), fnv1a64(data)),
+        }
+    }
 }
 
 impl StaticFiles {
@@ -77,7 +101,7 @@ impl StaticFiles {
         content_type: &'static str,
     ) -> StaticFiles {
         self.embedded
-            .insert(normalize_key(path), (data, content_type));
+            .insert(normalize_key(path), EmbeddedAsset::new(data, content_type));
         self
     }
 
@@ -93,7 +117,7 @@ impl StaticFiles {
     pub fn embed_many(mut self, files: &[(&'static str, &'static [u8])]) -> StaticFiles {
         for (path, data) in files {
             self.embedded
-                .insert(normalize_key(path), (*data, mime_type(path)));
+                .insert(normalize_key(path), EmbeddedAsset::new(data, mime_type(path)));
         }
         self
     }
@@ -137,7 +161,21 @@ impl StaticFiles {
 
     /// 尝试服务（带 `Accept` 头）：文件优先；已启用 SPA 回退且路径“像前端路由”时
     /// 返回 `index.html`（浏览器导航由 `Accept: text/html` 精确识别）。
+    ///
+    /// 不做条件请求处理（兼容入口）；推荐改用 [`StaticFiles::try_serve_request`]。
     pub fn try_serve_with_accept(&self, path: &str, accept: Option<&str>) -> Option<HttpResponse> {
+        self.resolve(path, accept)
+    }
+
+    /// 按请求服务（推荐入口）：命中后继续处理 `If-None-Match`——ETag 未变化时
+    /// 返回 `304 Not Modified`（空体），浏览器重复打开/刷新面板零正文流量。
+    pub fn try_serve_request(&self, req: &HttpRequest) -> Option<HttpResponse> {
+        let response = self.resolve(&req.path, req.header("accept"))?;
+        Some(apply_conditional(response, req.header("if-none-match")))
+    }
+
+    /// 命中解析：真实文件（含默认文档/嵌入资源）优先；SPA 回退条件满足时回退 `index.html`。
+    fn resolve(&self, path: &str, accept: Option<&str>) -> Option<HttpResponse> {
         let relative = safe_relative(path)?;
         if let Some(response) = self.fetch(&relative) {
             return Some(response);
@@ -148,10 +186,14 @@ impl StaticFiles {
         self.fetch("index.html")
     }
 
-    /// 查嵌入资源（优先）→ 磁盘文件。
+    /// 查嵌入资源（优先）→ 磁盘文件；响应携带 `ETag` 与 `Cache-Control: no-cache`。
     fn fetch(&self, relative: &str) -> Option<HttpResponse> {
-        if let Some((data, content_type)) = self.embedded.get(relative) {
-            return Some(HttpResponse::bytes(200, content_type, *data));
+        if let Some(asset) = self.embedded.get(relative) {
+            return Some(
+                HttpResponse::bytes(200, asset.content_type, asset.data)
+                    .with_header("ETag", &asset.etag)
+                    .with_header("Cache-Control", "no-cache"),
+            );
         }
 
         let root = self.root.as_ref()?;
@@ -161,7 +203,12 @@ impl StaticFiles {
             return None;
         }
         let data = std::fs::read(&full).ok()?;
-        Some(HttpResponse::bytes(200, mime_type(relative), data))
+        let etag = disk_etag(&meta, &data);
+        Some(
+            HttpResponse::bytes(200, mime_type(relative), data)
+                .with_header("ETag", &etag)
+                .with_header("Cache-Control", "no-cache"),
+        )
     }
 
     /// 路径是否落在 SPA 排除前缀内（段边界匹配，大小写不敏感）。
@@ -175,6 +222,58 @@ impl StaticFiles {
             .iter()
             .any(|prefix| plain == *prefix || plain.starts_with(&format!("{prefix}/")))
     }
+}
+
+/// 条件请求处理：`If-None-Match` 命中当前 ETag → `304`（无正文，保留校验头）。
+fn apply_conditional(response: HttpResponse, if_none_match: Option<&str>) -> HttpResponse {
+    let Some(inm) = if_none_match else {
+        return response;
+    };
+    let Some(etag) = response
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
+        .map(|(_, v)| v.clone())
+    else {
+        return response;
+    };
+    if !etag_matches(inm, &etag) {
+        return response;
+    }
+    HttpResponse::empty(304)
+        .with_header("ETag", &etag)
+        .with_header("Cache-Control", "no-cache")
+}
+
+/// `If-None-Match` 匹配（弱比较：忽略 `W/` 前缀；支持 `*` 与逗号分隔列表）。
+fn etag_matches(if_none_match: &str, etag: &str) -> bool {
+    let target = etag.trim().trim_start_matches("W/").trim();
+    if_none_match.split(',').any(|part| {
+        let candidate = part.trim();
+        candidate == "*" || candidate.trim_start_matches("W/").trim() == target
+    })
+}
+
+/// 磁盘文件弱 ETag：长度 + 最后修改时间（纳秒）；修改时间不可用时回退内容哈希。
+fn disk_etag(meta: &std::fs::Metadata, data: &[u8]) -> String {
+    match meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+    {
+        Some(modified) => format!("W/\"{:x}-{:x}\"", meta.len(), modified.as_nanos()),
+        None => format!("W/\"{:x}-{:x}\"", data.len(), fnv1a64(data)),
+    }
+}
+
+/// FNV-1a 64 位内容指纹（嵌入资源 ETag；非加密用途，启动期注册计算一次）。
+fn fnv1a64(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in data {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 impl Default for StaticFiles {
@@ -467,5 +566,74 @@ mod tests {
         assert!(statics.try_serve("/assets/missing.js").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn etag_and_not_modified() {
+        use crate::net::http::HttpRequest;
+
+        let statics = StaticFiles::new("不存在的目录")
+            .embed("/index.html", b"<html>panel</html>", "text/html; charset=utf-8")
+            .spa_fallback(true);
+
+        // 静态响应带强 ETag 与 no-cache
+        let resp = statics.try_serve("/").expect("应命中嵌入 index");
+        let header = |name: &str| {
+            resp.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+        };
+        let etag = header("etag").expect("应带 ETag");
+        assert!(etag.starts_with('"'), "嵌入资源应为强 ETag：{etag}");
+        assert_eq!(header("cache-control").as_deref(), Some("no-cache"));
+
+        let make_req = |path: &str, inm: Option<&str>| HttpRequest {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            query: String::new(),
+            headers: inm
+                .map(|v| vec![("If-None-Match".to_string(), v.to_string())])
+                .unwrap_or_default(),
+            body: hyper::body::Bytes::new(),
+            remote_addr: None,
+        };
+
+        // 条件命中 → 304 空体（重复打开面板零正文）
+        let not_modified = statics
+            .try_serve_request(&make_req("/", Some(&etag)))
+            .expect("条件请求应命中");
+        assert_eq!(not_modified.status, 304);
+        assert!(not_modified.body.is_empty());
+
+        // 通配 `*` 与弱前缀 `W/` 同样命中；SPA 回退路径亦条件化
+        assert_eq!(
+            statics.try_serve_request(&make_req("/", Some("*"))).unwrap().status,
+            304
+        );
+        assert_eq!(
+            statics
+                .try_serve_request(&make_req("/", Some(&format!("W/{etag}"))))
+                .unwrap()
+                .status,
+            304
+        );
+        assert_eq!(
+            statics
+                .try_serve_request(&make_req("/dashboard", Some(&etag)))
+                .unwrap()
+                .status,
+            304
+        );
+
+        // 不匹配 / 无 If-None-Match → 200 全量
+        assert_eq!(
+            statics
+                .try_serve_request(&make_req("/", Some("\"other\"")))
+                .unwrap()
+                .status,
+            200
+        );
+        assert_eq!(statics.try_serve_request(&make_req("/", None)).unwrap().status, 200);
     }
 }

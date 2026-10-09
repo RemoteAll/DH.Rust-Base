@@ -49,6 +49,9 @@ hyper = { version = "1", features = ["http1", "server", "client"], optional = tr
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 # 响应体工具
 http-body-util = { version = "0.1", optional = true }
+# 响应压缩（gzip；net 特性内建——面板 HTML/JSON 轮询出网流量削减；
+# 纯 Rust 后端（miniz_oxide），可全平台 zig 交叉编译）
+flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
 # WebSocket 帧层（Apache-2.0，小体量可 fork；会话/心跳/重连语义在 dhrust::net::ws 自研）
 # unstable-split：读写半部分离（客户端读任务/写任务结构，见 src/net/ws.rs）
 fastwebsockets = { version = "0.8", optional = true, features = ["unstable-split"] }
@@ -129,7 +132,7 @@ http-tls = [
     "dep:rustls-pemfile",
 ]
 # 网络内核（DHDeploy.Agent Rust 迁移；选型与红线见 DHDeploy 仓库 Doc/网络层选型复核.md）
-net = ["http-client", "dep:fastwebsockets", "stun"]
+net = ["http-client", "dep:fastwebsockets", "stun", "dep:flate2"]
 # wss/TLS（在 net 之上追加；含 HTTPS 客户端与服务端证书能力）
 net-tls = [
     "net",
