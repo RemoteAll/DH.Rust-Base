@@ -9,6 +9,7 @@ pub mod secret; // 可逆加密（AES-256-GCM；敏感值“防直读”存储�
 pub mod service; // 跨平台服务管理（Windows SCM / systemd / procd / SysV / launchd；Pek.RAgent 下沉）
 #[cfg(feature = "term")]
 pub mod term; // 真 PTY 会话引擎（ConPTY/openpty；在线终端等服务端能力共用）
+pub mod text; // 通用文本小工具（按字符截断等；多消费方收编）
 #[cfg(feature = "plugin")]
 pub mod plugin; // 插件包格式 + 插件源目录签名（Ed25519；Pek.RAgent 与 Pek.RPanlServer 共用）
 pub mod staragent; // 星尘（StarAgent）配置注册：影子模式条目的 upsert/移除（Pek.RPanlServer 与 HlktechIoT MQTT 共用）

@@ -108,24 +108,29 @@ pub fn allows(ctx: &Ctx, level: AuthLevel, token_ok: impl Fn(&str) -> bool) -> b
     }
 }
 
-/// 面板令牌表（内存态；token → 到期毫秒）。
+/// 面板令牌表（内存态；token → (到期毫秒, 附加数据)）。
 ///
-/// 收编自 Pek.RAgent 与 HlkProductTool 两处同款实现：签发时顺带清理过期令牌；
-/// 校验时过期即清除；吊销用于「退出面板」等主动失效。
-pub struct TokenStore {
+/// 泛型 `T` 承载会话主体（用户/权限快照等；默认 `()` 即纯令牌表，
+/// 覆盖“只关心 token 是否有效”的场景）。单表合一后：过期/吊销即绑定数据失效，
+/// 不会出现「主体表残留」的双表同步问题。
+///
+/// 收编自 Pek.RAgent 与 HlkProductTool 两处同款实现（2026-10-03）；
+/// 2026-10-09 泛型化，会话主体随令牌表合并（Pek.RAgent / HlkProductTool /
+/// Pek.RPanlServer 三处「令牌表 + 会话表」双表模式收编）。
+pub struct TokenStore<T = ()> {
     /// 有效期（毫秒）
     ttl_ms: i64,
-    /// 令牌表（token → 到期毫秒）
-    tokens: Mutex<HashMap<String, i64>>,
+    /// 令牌表（token → (到期毫秒, 附加数据)）
+    tokens: Mutex<HashMap<String, (i64, T)>>,
 }
 
-impl Default for TokenStore {
+impl<T> Default for TokenStore<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl TokenStore {
+impl<T> TokenStore<T> {
     /// 默认有效期 24 小时。
     pub fn new() -> Self {
         Self::with_ttl_ms(24 * 3_600_000)
@@ -139,13 +144,13 @@ impl TokenStore {
         }
     }
 
-    /// 签发令牌（安全随机；顺带清理过期令牌）。
-    pub fn issue(&self) -> String {
+    /// 签发令牌并绑定数据（安全随机；顺带清理过期令牌）。
+    pub fn issue_with(&self, value: T) -> String {
         let token = crate::random::token();
         let now = crate::times::getmilltimestamp() as i64;
         let mut tokens = self.tokens.lock().unwrap();
-        tokens.retain(|_, expire| *expire > now);
-        tokens.insert(token.clone(), now + self.ttl_ms);
+        tokens.retain(|_, (expire, _)| *expire > now);
+        tokens.insert(token.clone(), (now + self.ttl_ms, value));
         token
     }
 
@@ -158,7 +163,7 @@ impl TokenStore {
         let now = crate::times::getmilltimestamp() as i64;
         let mut tokens = self.tokens.lock().unwrap();
         match tokens.get(token) {
-            Some(expire) if *expire > now => true,
+            Some((expire, _)) if *expire > now => true,
             Some(_) => {
                 tokens.remove(token);
                 false
@@ -167,11 +172,86 @@ impl TokenStore {
         }
     }
 
-    /// 吊销令牌。
+    /// 吊销令牌（含绑定数据）。
     pub fn revoke(&self, token: &str) {
         if !token.is_empty() {
             self.tokens.lock().unwrap().remove(token);
         }
+    }
+
+    /// 就地更新令牌绑定数据（存在且未过期才执行；返回是否命中）。
+    pub fn update(&self, token: &str, f: impl FnOnce(&mut T)) -> bool {
+        if token.is_empty() {
+            return false;
+        }
+        let now = crate::times::getmilltimestamp() as i64;
+        let mut tokens = self.tokens.lock().unwrap();
+        match tokens.get_mut(token) {
+            Some((expire, value)) if *expire > now => {
+                f(value);
+                true
+            }
+            Some(_) => {
+                tokens.remove(token);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// 遍历刷新全部令牌绑定数据：回调返回 `Some` 换新值、`None` 移除（被踢）；
+    /// 返回被移除的数量（过期项一并清理，不计入）。
+    pub fn refresh_all(&self, mut f: impl FnMut(&T) -> Option<T>) -> usize {
+        let now = crate::times::getmilltimestamp() as i64;
+        let mut tokens = self.tokens.lock().unwrap();
+        let before = tokens.len();
+        tokens.retain(|_, (expire, value)| {
+            if *expire <= now {
+                return false;
+            }
+            match f(value) {
+                Some(fresh) => {
+                    *value = fresh;
+                    true
+                }
+                None => false,
+            }
+        });
+        before - tokens.len()
+    }
+
+    /// 条件吊销：回调为 `true` 的令牌移除；返回被移除的数量。
+    pub fn revoke_where(&self, mut f: impl FnMut(&T) -> bool) -> usize {
+        let mut tokens = self.tokens.lock().unwrap();
+        let before = tokens.len();
+        tokens.retain(|_, (_, value)| !f(value));
+        before - tokens.len()
+    }
+}
+
+impl<T: Clone> TokenStore<T> {
+    /// 取令牌绑定数据（过期即清除；`None` = 无效）。
+    pub fn get(&self, token: &str) -> Option<T> {
+        if token.is_empty() {
+            return None;
+        }
+        let now = crate::times::getmilltimestamp() as i64;
+        let mut tokens = self.tokens.lock().unwrap();
+        match tokens.get(token) {
+            Some((expire, value)) if *expire > now => Some(value.clone()),
+            Some(_) => {
+                tokens.remove(token);
+                None
+            }
+            None => None,
+        }
+    }
+}
+
+impl<T: Default> TokenStore<T> {
+    /// 签发令牌（无绑定数据场景；`T` 取默认值）。
+    pub fn issue(&self) -> String {
+        self.issue_with(T::default())
     }
 }
 
@@ -233,5 +313,36 @@ mod tests {
         let token = store.issue();
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert!(!store.validate(&token), "过期令牌应失效");
+    }
+
+    #[test]
+    fn token_store_binds_value() {
+        let store: TokenStore<String> = TokenStore::new();
+        let token = store.issue_with("alice".to_string());
+        assert_eq!(store.get(&token), Some("alice".to_string()));
+        assert_eq!(store.get(""), None);
+        assert!(store.update(&token, |v| *v = "bob".to_string()));
+        assert_eq!(store.get(&token), Some("bob".to_string()));
+        assert!(!store.update("not-a-token", |v| *v = "x".to_string()));
+        store.revoke(&token);
+        assert_eq!(store.get(&token), None);
+    }
+
+    #[test]
+    fn token_store_refresh_and_revoke_where() {
+        let store: TokenStore<i32> = TokenStore::new();
+        let a = store.issue_with(1);
+        let b = store.issue_with(2);
+        // refresh_all：1 → 刷新为 10；2 → 移除（None）
+        let removed = store.refresh_all(|v| if *v == 1 { Some(10) } else { None });
+        assert_eq!(removed, 1);
+        assert_eq!(store.get(&a), Some(10));
+        assert_eq!(store.get(&b), None, "被移除的令牌应失效");
+        // revoke_where：移除值 = 10 的令牌
+        let c = store.issue_with(2);
+        let removed = store.revoke_where(|v| *v == 2);
+        assert_eq!(removed, 1);
+        assert_eq!(store.get(&c), None);
+        assert_eq!(store.get(&a), Some(10), "不匹配的令牌保留");
     }
 }

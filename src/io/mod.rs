@@ -282,14 +282,18 @@ pub fn base_dir(env_names: &[&str]) -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-// ————— 安全替换（2026-10-03 下沉：Pek.RAgent deploy 的“运行中文件替换”语义）—————
+// ————— 安全替换（2026-10-03 下沉：Pek.RAgent deploy 的“运行中文件替换”语义；2026-10-09 收编三处消费方统一）—————
 
-/// 安全替换文件。
+/// 替换文件（可处理“目标被占用（运行中）”场景）。
 ///
-/// 1. 原子改名（Unix 可直接覆盖；Windows 目标未占用时亦可）；
-/// 2. 目标被占用（运行中）时，把目标改名为 `*.del` 再写入新文件（Windows 允许重命名运行中的文件）；
-///    `*.del` 删除失败不报错，待应用停止后由调用方的清理逻辑处理。
-pub fn safe_replace_file(src: &Path, dst: &Path) -> io::Result<()> {
+/// 1. 目标不存在：直接改名就位（跨设备时退化为 copy + 删除源）；
+/// 2. 先原地改名（Unix 覆盖运行中文件合法；Windows 目标未占用时亦可）；
+/// 3. 失败（目标被占用）时把目标让位改名为 `backup` 后再就位；失败自动回滚。
+///
+/// 成功后 `backup` 为让位下来的旧文件（被占用时删除会失败，由调用方决定清理或留待
+/// 下次替换/启动时处理）；固定 `backup` 名（如 `{exe}.old`）会在让位前先清掉上一次
+/// 遗留的同名备份。
+pub fn replace_file(src: &Path, dst: &Path, backup: &Path) -> io::Result<()> {
     if !dst.exists() {
         return fs::rename(src, dst).or_else(|_| {
             fs::copy(src, dst)?;
@@ -298,25 +302,33 @@ pub fn safe_replace_file(src: &Path, dst: &Path) -> io::Result<()> {
         });
     }
 
+    if fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+
+    // 目标被占用：让位（先清掉可能遗留的同名备份）后再就位；失败回滚
+    let _ = fs::remove_file(backup);
+    fs::rename(dst, backup)?;
     match fs::rename(src, dst) {
         Ok(()) => Ok(()),
-        Err(_) => {
-            let bak = del_path(dst);
-            fs::rename(dst, &bak)?;
-            match fs::rename(src, dst) {
-                Ok(()) => {
-                    // 运行中的文件删除会失败，留给后续清理
-                    let _ = fs::remove_file(&bak);
-                    Ok(())
-                }
-                Err(e) => {
-                    // 回滚
-                    let _ = fs::rename(&bak, dst);
-                    Err(e)
-                }
-            }
+        Err(e) => {
+            let _ = fs::rename(backup, dst);
+            Err(e)
         }
     }
+}
+
+/// 安全替换文件（[`replace_file`] 的便捷封装：让位备份用唯一 `*.del` 名，成功后尽力清理）。
+///
+/// 1. 原子改名（Unix 可直接覆盖；Windows 目标未占用时亦可）；
+/// 2. 目标被占用（运行中）时，把目标改名为 `*.del` 再写入新文件（Windows 允许重命名运行中的文件）；
+///    `*.del` 删除失败不报错，待应用停止后由调用方的清理逻辑处理。
+pub fn safe_replace_file(src: &Path, dst: &Path) -> io::Result<()> {
+    let bak = del_path(dst);
+    replace_file(src, dst, &bak)?;
+    // 运行中的文件删除会失败，留给后续清理
+    let _ = fs::remove_file(&bak);
+    Ok(())
 }
 
 /// 生成唯一的 `*.del` 路径。
@@ -375,6 +387,41 @@ mod safe_replace_tests {
         fs::write(&src2, b"fresh").unwrap();
         safe_replace_file(&src2, &dst2).unwrap();
         assert_eq!(fs::read(&dst2).unwrap(), b"fresh");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `replace_file`：目标不存在（直接就位）、正常替换（不产生备份）、就位失败（让位后回滚）。
+    #[test]
+    fn replace_file_variants_and_rollback() {
+        let dir = std::env::temp_dir().join(format!("dhrust-replacefile-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let dst = dir.join("app.bin");
+        let bak = dir.join("app.bin.old");
+
+        // 目标不存在：直接就位，不产生备份
+        let src = dir.join("v1.bin");
+        fs::write(&src, b"v1").unwrap();
+        replace_file(&src, &dst, &bak).unwrap();
+        assert_eq!(fs::read(&dst).unwrap(), b"v1");
+        assert!(!bak.exists());
+
+        // 正常替换：原地改名，不产生备份
+        let src2 = dir.join("v2.bin");
+        fs::write(&src2, b"v2").unwrap();
+        replace_file(&src2, &dst, &bak).unwrap();
+        assert_eq!(fs::read(&dst).unwrap(), b"v2");
+        assert!(!bak.exists());
+
+        // 就位失败（源缺失）：目标先让位、失败后必须回滚恢复，备份不残留
+        let missing = dir.join("not-exist.bin");
+        let err = replace_file(&missing, &dst, &bak).unwrap_err();
+        let _ = err;
+        assert!(dst.exists(), "失败后目标必须回滚恢复");
+        assert_eq!(fs::read(&dst).unwrap(), b"v2");
+        assert!(!bak.exists(), "回滚后备份不应残留");
 
         let _ = fs::remove_dir_all(&dir);
     }
