@@ -16,6 +16,9 @@ pub mod threading; // 线程与定时调度（对应 DH.NCore Threading）
 pub mod times;
 pub mod web; // Web 辅助（URL 编码 / JSON 转义；对应 DH.NCore NewLife.Web 系列）
 pub mod zip; // 极简 ZIP 打包器（store 法；内存 + 流式落盘两种形态）
+pub mod version; // 版本号工具（数字段比较：Agent 自动升级的版本判断）
+#[cfg(feature = "patch")]
+pub mod patch; // zstd 字典差分补丁（增量升级：生成/还原；Pek.RAgent 与 DHDeploy.Agent.Rust 共用）
 
 #[cfg(feature = "razor")]
 pub mod razor; // Razor 子集模板引擎（方案 C）：同一份 .cshtml 双端渲染

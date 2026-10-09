@@ -37,6 +37,9 @@ toml_edit = { version = "0.25", optional = true }
 # ———— feature `zip-extract`（ZIP 解压；版本/特性与 Pek.RAgent 一致）————
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 
+# ———— feature `patch`（zstd 字典差分补丁：以旧文件为字典压缩新文件；增量升级，Pek.RAgent ↔ DHDeploy.Agent.Rust 共用）————
+zstd = { version = "0.13", optional = true }
+
 # ———— feature `http-client` / `net`（DHDeploy.Agent Rust 迁移网络内核；版本与 bench-net 已验证一致）————
 # 运行时（多线程调度/网络/定时/同步）
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "fs"], optional = true }
@@ -102,6 +105,8 @@ secret = ["dep:aes-gcm"]
 service = ["dep:windows-service"]
 # ZIP 解压（防目录穿越/占用文件安全替换；Pek.RAgent 与 DHDeploy.Agent 共用）
 zip-extract = ["dep:zip"]
+# zstd 字典差分补丁（增量升级：生成/还原；Pek.RAgent 与 DHDeploy.Agent.Rust 共用）
+patch = ["dep:zstd"]
 # 插件包格式 + 插件源目录签名（Ed25519；含 zip-extract）——Pek.RAgent（安装/发布）与 Pek.RPanlServer（平台）共用
 plugin = ["zip-extract", "dep:ed25519-dalek"]
 # 真 PTY 会话引擎（Windows ConPTY / Unix openpty；在线终端等服务端能力共用）
