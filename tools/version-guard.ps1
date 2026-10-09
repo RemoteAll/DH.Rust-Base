@@ -7,7 +7,11 @@ dist/.pack-guard.json；若同一版本号再次打包且内容指纹已变化 �
   - 新版本（未记录）        → 放行并记录指纹；
   - 同版本 + 指纹未变化     → 放行（重复打包同内容，允许）；
   - 同版本 + 指纹已变化     → 拒绝（throw），除非 -Force；
-  - -Bump / -BumpMinor      → 打包前自动递升版本（写 Cargo.toml + cargo check 更新 Cargo.lock）。
+  - -Bump / -BumpMinor      → 打包前自动递升版本（Cargo 项目写 Cargo.toml + cargo check 更新 Cargo.lock；
+                              自定义版本源直接写回、跳过 cargo check）。
+  - -VersionFile/-VersionPattern → 自定义版本源（如 C# 常量文件 Shared/AgentSoftwareVersion.cs：
+                              pattern='CurrentVersion\s*=\s*"(\d+)\.(\d+)\.(\d+)"'；要求 3 个捕获组 major/minor/patch）。
+  - -Include               → 自定义内容指纹白名单（相对仓库根的路径；默认 Cargo 项目布局）。
 
 用法（各项目 build-release.ps1 中，$root 为本仓库根）：
   $depPath = (Select-String -Path (Join-Path $root 'Cargo.toml') `
@@ -17,11 +21,15 @@ dist/.pack-guard.json；若同一版本号再次打包且内容指纹已变化 �
 #>
 
 # 计算打包内容指纹：白名单目录（存在的才纳入）内全部文件，按相对路径排序后逐文件 SHA-256 汇总
+# -Include：自定义白名单（相对仓库根的路径数组，目录递归/文件单取；默认 Cargo 项目布局）
 function Get-SourceFingerprint {
-    param([Parameter(Mandatory)][string]$RepoRoot)
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [string[]]$Include
+    )
 
     $rootFull = $RepoRoot.TrimEnd('\', '/')
-    $include = @('Cargo.toml', 'Cargo.lock', 'src', 'web', 'res', 'Entity', 'Views', 'plugins-src', 'third_party')
+    $include = if ($Include) { $Include } else { @('Cargo.toml', 'Cargo.lock', 'src', 'web', 'res', 'Entity', 'Views', 'plugins-src', 'third_party') }
     $files = @()
     foreach ($item in $include) {
         $p = Join-Path $rootFull $item
@@ -46,33 +54,58 @@ function Get-SourceFingerprint {
     return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
 }
 
-# 读取 Cargo.toml 包版本（[package] 段的 ^version = "x.y.z"）
-function Get-CargoPackageVersion {
-    param([Parameter(Mandatory)][string]$RepoRoot)
-    $line = Get-Content (Join-Path $RepoRoot 'Cargo.toml') -Encoding UTF8 |
-            Select-String -Pattern '^version\s*=\s*"(\d+\.\d+\.\d+)"' | Select-Object -First 1
-    if (-not $line) { throw '未在 Cargo.toml 中找到包版本行（^version = "x.y.z"）' }
-    return $line.Matches[0].Groups[1].Value
+# 读取版本文件并提取版本号（pattern 需含 3 个捕获组 major/minor/patch）
+function Get-VersionFromFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Pattern
+    )
+    if (-not (Test-Path $Path)) { throw "版本文件不存在：$Path" }
+    $text = [IO.File]::ReadAllText($Path)
+    $m = [regex]::Match($text, $Pattern)
+    if (-not $m.Success) { throw "未在版本文件中匹配到版本号（pattern=$Pattern）：$Path" }
+    return ($m.Groups[1].Value + '.' + $m.Groups[2].Value + '.' + $m.Groups[3].Value)
 }
 
-# 递升 Cargo.toml 包版本（patch 或 minor；minor 时 patch 归零）；返回新版本号
-function Step-CargoPackageVersion {
+# 递升版本文件中的版本号（只替换三个数字，保留原格式与编码 BOM 状态）；返回新版本号
+function Step-VersionInFile {
     param(
-        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Pattern,
         [ValidateSet('patch', 'minor')][string]$Kind = 'patch'
     )
-    $file = Join-Path $RepoRoot 'Cargo.toml'
-    $text = [IO.File]::ReadAllText($file)
-    $m = [regex]::Match($text, '(?m)^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"')
-    if (-not $m.Success) { throw '未在 Cargo.toml 中找到包版本行' }
+    if (-not (Test-Path $Path)) { throw "版本文件不存在：$Path" }
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+    $text = [IO.File]::ReadAllText($Path)
+    $m = [regex]::Match($text, $Pattern)
+    if (-not $m.Success) { throw "未在版本文件中匹配到版本号（pattern=$Pattern）：$Path" }
     $major = [int]$m.Groups[1].Value
     $minor = [int]$m.Groups[2].Value
     $patch = [int]$m.Groups[3].Value
     if ($Kind -eq 'minor') { $minor += 1; $patch = 0 } else { $patch += 1 }
     $newVer = "$major.$minor.$patch"
-    $text = $text.Remove($m.Index, $m.Length).Insert($m.Index, ('version = "' + $newVer + '"'))
-    [IO.File]::WriteAllText($file, $text, (New-Object Text.UTF8Encoding($false)))
+    # 从后往前逐组替换（只动数字，其余字符/空白/引号原样保留）
+    $span = $m.Groups[3]; $text = $text.Remove($span.Index, $span.Length).Insert($span.Index, "$patch")
+    $span = $m.Groups[2]; $text = $text.Remove($span.Index, $span.Length).Insert($span.Index, "$minor")
+    $span = $m.Groups[1]; $text = $text.Remove($span.Index, $span.Length).Insert($span.Index, "$major")
+    [IO.File]::WriteAllText($Path, $text, (New-Object Text.UTF8Encoding($hasBom)))
     return $newVer
+}
+
+# 读取 Cargo.toml 包版本（兼容入口）
+function Get-CargoPackageVersion {
+    param([Parameter(Mandatory)][string]$RepoRoot)
+    return Get-VersionFromFile -Path (Join-Path $RepoRoot 'Cargo.toml') -Pattern '(?m)^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"'
+}
+
+# 递升 Cargo.toml 包版本（兼容入口）；返回新版本号
+function Step-CargoPackageVersion {
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [ValidateSet('patch', 'minor')][string]$Kind = 'patch'
+    )
+    return Step-VersionInFile -Path (Join-Path $RepoRoot 'Cargo.toml') -Pattern '(?m)^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"' -Kind $Kind
 }
 
 # 版本升号守卫主体（打包脚本调用；失败 throw 终止打包）
@@ -81,6 +114,9 @@ function Assert-VersionGuard {
         [Parameter(Mandatory)][string]$RepoRoot,
         [string]$Name = 'package',
         [string]$StateFile,           # 默认 {RepoRoot}/dist/.pack-guard.json
+        [string]$VersionFile = 'Cargo.toml',  # 版本源（相对仓库根；C# 项目可用 Shared/XxxVersion.cs）
+        [string]$VersionPattern = '(?m)^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"',  # 需含 3 个捕获组 major/minor/patch
+        [string[]]$Include,           # 内容指纹白名单（默认 Cargo 项目布局）
         [switch]$Force,               # 内容变化时也放行（仅告警）
         [switch]$Bump,                # 打包前自动递升 patch 版本
         [switch]$BumpMinor            # 打包前自动递升 minor 版本
@@ -88,24 +124,33 @@ function Assert-VersionGuard {
     $root = $RepoRoot.TrimEnd('\', '/')
     if (-not $StateFile) { $StateFile = Join-Path $root 'dist\.pack-guard.json' }
 
-    # 0) 可选：自动递升版本（写 Cargo.toml + cargo check 更新 Cargo.lock）
+    # 0) 可选：自动递升版本（Cargo 项目写 Cargo.toml + cargo check 更新 Cargo.lock；自定义版本源直接写回）
     if ($Bump -or $BumpMinor) {
         $kind = if ($BumpMinor) { 'minor' } else { 'patch' }
-        $oldVer = Get-CargoPackageVersion -RepoRoot $root
-        $newVer = Step-CargoPackageVersion -RepoRoot $root -Kind $kind
-        Push-Location $root
-        try {
-            cargo check --quiet
-            if ($LASTEXITCODE -ne 0) { throw "版本递升后 cargo check 失败（Cargo.lock 未更新，打包会因 --locked 失败）：$newVer" }
+        $vf = Join-Path $root $VersionFile
+        $oldVer = Get-VersionFromFile -Path $vf -Pattern $VersionPattern
+        $newVer = Step-VersionInFile -Path $vf -Pattern $VersionPattern -Kind $kind
+        if ((Split-Path $VersionFile -Leaf) -eq 'Cargo.toml') {
+            Push-Location $root
+            try {
+                # 原生命令 stderr（cargo warning 等）不应在 Stop 下变成终止错误：临时放宽、以退出码判定
+                $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+                cargo check --quiet
+                $code = $LASTEXITCODE; $ErrorActionPreference = $prevEap
+                if ($code -ne 0) { throw "版本递升后 cargo check 失败（Cargo.lock 未更新，打包会因 --locked 失败）：$newVer" }
+            }
+            finally { Pop-Location }
         }
-        finally { Pop-Location }
+        else {
+            Write-Host "（版本源为 $VersionFile：非 Cargo 项目，跳过 cargo check）"
+        }
         Write-Host "== 版本已自动递升（$kind）：$oldVer -> $newVer ==" -ForegroundColor Cyan
     }
 
     # 1) 当前版本与内容指纹
-    $ver = Get-CargoPackageVersion -RepoRoot $root
+    $ver = Get-VersionFromFile -Path (Join-Path $root $VersionFile) -Pattern $VersionPattern
     Write-Host "== 版本守卫：$Name 当前版本 $ver，计算打包内容指纹… =="
-    $fp = Get-SourceFingerprint -RepoRoot $root
+    $fp = Get-SourceFingerprint -RepoRoot $root -Include $Include
 
     # 2) 读取历史记录（版本 -> {fp, at}）
     $state = @{}
