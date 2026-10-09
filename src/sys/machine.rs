@@ -261,6 +261,17 @@ pub fn hostname() -> String {
     CACHE.get_or_init(detect_hostname).clone()
 }
 
+/// 机器名（带回退值）：内核主机名/环境变量均不可用时返回 `fallback`。
+/// 供节点名、日志头等场景复用（对齐 C# `Environment.MachineName` + 业务兜底）。
+pub fn server_name(fallback: &str) -> String {
+    let name = hostname();
+    if name.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        name
+    }
+}
+
 fn detect_hostname() -> String {
     #[cfg(windows)]
     {
@@ -269,6 +280,14 @@ fn detect_hostname() -> String {
 
     #[cfg(not(windows))]
     {
+        // 内核运行时主机名优先（systemd/星尘托管下 HOSTNAME 环境变量可能缺失；
+        // 对齐 C# `Environment.MachineName` 的取值习惯）
+        if let Ok(name) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
+            let name = name.trim();
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
         if let Ok(name) = std::env::var("HOSTNAME") {
             if !name.trim().is_empty() {
                 return name.trim().to_string();
@@ -971,6 +990,14 @@ Shmem:            100000 kB
         assert_eq!(split_epoch_ms(946_730_096_789), (946_730_096, 789_000_000));
         assert_eq!(split_epoch_ms(0), (0, 0));
         assert_eq!(split_epoch_ms(-1), (-1, 999_000_000));
+    }
+
+    #[test]
+    fn server_name_prefers_real_hostname_and_falls_back() {
+        let name = server_name("fallback-x");
+        assert!(!name.is_empty(), "机器名不应为空");
+        // 本机必有主机名来源（Windows COMPUTERNAME / Unix 内核主机名），不应命中兜底
+        assert_ne!(name, "fallback-x");
     }
 
     #[cfg(windows)]

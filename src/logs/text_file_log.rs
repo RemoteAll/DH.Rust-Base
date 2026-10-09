@@ -631,21 +631,9 @@ mod windows_desc_tests {
     }
 }
 
-/// 机器名（对齐 C# `#OS` 第二段前半）。
+/// 机器名（对齐 C# `#OS` 第二段前半；取值链下沉 `sys::machine`，含内核主机名优先）。
 fn machine_name() -> String {
-    if let Ok(name) = std::env::var("COMPUTERNAME") {
-        if !name.trim().is_empty() {
-            return name;
-        }
-    }
-    if let Ok(name) = std::env::var("HOSTNAME") {
-        if !name.trim().is_empty() {
-            return name;
-        }
-    }
-    std::fs::read_to_string("/etc/hostname")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
+    crate::sys::machine::server_name("")
 }
 
 /// 用户名（对齐 C# `#OS` 第二段后半）。
