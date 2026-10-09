@@ -309,6 +309,52 @@ pub fn save_value<T: Serialize, P: AsRef<Path>>(path: P, value: &T) -> Result<()
     super::setting::atomic_write(path.as_ref(), &text)
 }
 
+/// 按渲染器产出的文本保存配置：读取现有文件 → 调用渲染器（传入现有文本）→
+/// **无变化不写盘**（撇号差异不触发重写；原子替换），返回是否发生写入。
+///
+/// 供文本管线（XML/TOML 等）的“加载即补齐”使用：渲染器按模板合并缺失项后返回完整文本，
+/// 库侧负责比对与写回——对齐 [`Config`] 的“缺失属性自动补齐并回存”语义
+/// （C# `Config<T>.Current` / 服务运行期多点 `Save()` 的等价行为）。
+/// 文件读取失败（非“不存在”）时返回错误，不覆盖原文件；文件不存在时直接创建。
+///
+/// # 示例
+///
+/// ```no_run
+/// let changed = dhrust::config::save_if_changed("Config/Demo.config", |cur| {
+///     let mut text = cur.unwrap_or("<Root>\n</Root>\n").to_string();
+///     if !text.contains("<NewKey>") {
+///         text = text.replace("</Root>", "  <NewKey>v</NewKey>\n</Root>");
+///     }
+///     Ok(text)
+/// })
+/// .unwrap();
+/// ```
+pub fn save_if_changed<P, F>(path: P, render: F) -> Result<bool, ConfigError>
+where
+    P: AsRef<Path>,
+    F: FnOnce(Option<&str>) -> Result<String, String>,
+{
+    let path = path.as_ref();
+    let current = match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(ConfigError::Io(e)),
+    };
+    let text = render(current.as_deref()).map_err(ConfigError::Parse)?;
+    // 空内容防御（与 atomic_write 一致：渲染异常退化为空时不修改目标文件）
+    if text.is_empty() {
+        return Ok(false);
+    }
+    // 与 atomic_write 相同的忽略首尾空白比较：避免末尾换行差异导致的无谓重写
+    if let Some(old) = current.as_deref() {
+        if old.trim() == text.trim() {
+            return Ok(false);
+        }
+    }
+    super::setting::atomic_write(path, &text)?;
+    Ok(true)
+}
+
 /// 文件版本戳（长度 + 修改时间），用于检测配置文件是否被外部修改。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FileStamp {
@@ -535,6 +581,26 @@ mod tests {
         (0..8)
             .map(|_| char::from(b'a' + rng.gen_range(0..26)))
             .collect()
+    }
+
+    #[test]
+    fn save_if_changed_writes_only_on_diff() {
+        // 文本管线“加载即补齐”：缺失文件/缺失项时写回；渲染结果与磁盘一致时不写盘
+        fn demo_render(cur: Option<&str>) -> Result<String, String> {
+            let mut text = cur.unwrap_or("<Root>\n</Root>\n").to_string();
+            if !text.contains("<Key>") {
+                text = text.replace("</Root>", "  <Key>v</Key>\n</Root>");
+            }
+            Ok(text)
+        }
+
+        let path = temp_path("ifchanged");
+        assert!(save_if_changed(&path, demo_render).unwrap(), "缺失文件应写回");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("<Key>v</Key>"), "{text}");
+
+        assert!(!save_if_changed(&path, demo_render).unwrap(), "无变化不应写盘");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
 
     #[test]

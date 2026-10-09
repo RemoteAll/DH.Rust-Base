@@ -495,11 +495,15 @@ pub fn replace_root_section(text: &str, name: &str, inner: &str) -> Result<Strin
                 stack.pop();
                 if stack.is_empty() {
                     if !replaced {
-                        // 根结束前：插入新节
+                        // 根结束前：插入新节；结束标签后补换行（与既有节排版一致，
+                        // 避免 `</Section></Root>` 粘接导致渲染输出不幂等）
                         writer
                             .write_event(Event::Text(BytesText::from_escaped("\n  ")))
                             .map_err(write_err)?;
                         write_section(&mut writer, name, inner, "  ")?;
+                        writer
+                            .write_event(Event::Text(BytesText::from_escaped("\n")))
+                            .map_err(write_err)?;
                         replaced = true;
                     } else if needs_nl {
                         // 输入本来粘接时顺带规范化
@@ -731,6 +735,21 @@ mod tests {
             out.contains("  </Services>\n</StarAgent>"),
             "replace 应补换行: {out}"
         );
+    }
+
+    #[test]
+    fn replace_root_section_insert_normalizes_trailing_newline() {
+        // 节不存在时插入：结束标签后应补换行（此前输出 `</Services></StarAgent>` 粘接，
+        // 导致“新增插入”与“整段替换”两条路径输出不一致、渲染不幂等）
+        let text = "<StarAgent>\n  <A>1</A>\n</StarAgent>";
+        let inner = "    <ServiceInfo Name=\"a\" />\n";
+        let out = replace_root_section(text, "Services", inner).unwrap();
+        assert!(out.contains("</Services>\n</StarAgent>"), "插入节应补换行: {out}");
+        assert!(!out.contains("</Services></StarAgent>"), "不应粘接: {out}");
+
+        // 幂等：插入后再执行（走整段替换路径）输出字节一致
+        let out2 = replace_root_section(&out, "Services", inner).unwrap();
+        assert_eq!(out2, out, "两条路径应输出一致（幂等）");
     }
 
     #[test]
