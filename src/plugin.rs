@@ -318,37 +318,9 @@ fn clamp_text(text: &str, max_chars: usize) -> String {
 
 // ————— 密钥与签名 —————
 
-/// hex 编码（小写）。
-pub fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
-}
-
-/// hex 解码（奇数长度或非法字符返回 `None`）。
-pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    let val = |c: u8| -> Option<u8> {
-        match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
-            _ => None,
-        }
-    };
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    let mut i = 0;
-    while i < bytes.len() {
-        out.push((val(bytes[i])? << 4) | val(bytes[i + 1])?);
-        i += 2;
-    }
-    Some(out)
-}
+/// hex 编码/解码——实现已下沉 [`crate::sign::hex_encode`] / [`crate::sign::hex_decode`]
+/// （2026-10-09 迁入通用散列工具族），此处保留原名转发、调用路径不变。
+pub use crate::sign::{hex_decode, hex_encode};
 
 /// 生成 Ed25519 私钥 seed（32 字节 OS 熵 → 64 位 hex；写入 `plugin-store.key`）。
 pub fn generate_signing_key() -> String {

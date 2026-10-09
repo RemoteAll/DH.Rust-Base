@@ -68,6 +68,15 @@ pub fn md5_file_hex<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<Strin
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// SHA1 十六进制小写（40 位；对齐 NewLife `Encrypt.GetSha1`）。
+///
+/// 收编自 HlktechIoT 设备签名算法（2026-10-09）：`SHA1(升序拼接 + 设备密钥)`
+/// 与 C# `Encrypt.GetSha1` 输出一致；`create_signature` 内部同为 SHA1。
+pub fn sha1_hex(text: &str) -> String {
+    let digest = Sha1::digest(text.as_bytes());
+    to_hex_lower(&digest)
+}
+
 /// SHA-256 摘要（32 字节）。
 pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(data);
@@ -103,6 +112,35 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 /// HMAC-SHA256 → 64 位小写十六进制。
 pub fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
     to_hex_lower(&hmac_sha256(key, data))
+}
+
+/// 字节数组 → 小写十六进制字符串（自 `plugin::hex_encode` 迁入，2026-10-09；
+/// plugin 内保留同名转发，原调用路径不变）。
+pub fn hex_encode(bytes: &[u8]) -> String {
+    to_hex_lower(bytes)
+}
+
+/// 十六进制字符串 → 字节数组（奇数长度或含非法字符返回 `None`；大小写均可）。
+pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let val = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        out.push((val(bytes[i])? << 4) | val(bytes[i + 1])?);
+        i += 2;
+    }
+    Some(out)
 }
 
 /// 标准 Base64 编码（带 `=` 填充）。
@@ -195,6 +233,19 @@ mod tests {
         let sign = create_signature("123".into(), "7".into(), "key".into());
         assert_eq!(sign.len(), 40);
         assert_eq!(getrand(12).chars().count(), 12);
+    }
+
+    #[test]
+    fn sha1_and_hex_helpers_match_reference() {
+        // SHA1 标准向量
+        assert_eq!(sha1_hex("abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(sha1_hex(""), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        // hex 编码/解码往返（大小写均可解码）
+        assert_eq!(hex_encode(&[0x00, 0x1f, 0xab, 0xff]), "001fabff");
+        assert_eq!(hex_decode("001FABff"), Some(vec![0x00, 0x1f, 0xab, 0xff]));
+        assert_eq!(hex_decode("abc"), None, "奇数长度拒绝");
+        assert_eq!(hex_decode("00zz"), None, "非法字符拒绝");
+        assert_eq!(hex_encode(&[]), "");
     }
 
     #[test]
