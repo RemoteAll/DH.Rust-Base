@@ -370,11 +370,22 @@ async fn supervise(client: WsClient, mut cmd_rx: mpsc::Receiver<Cmd>) {
                 // 断线后丢弃排队中的消息（对齐 C#：未连接时发送直接放弃）
                 drain_pending(&mut cmd_rx);
             }
-            Ok(Err(_e)) => {
+            Ok(Err(e)) => {
                 failures += 1;
+                // 连接失败原因此前被静默吞掉：下游只能看到“连不上”而无法定位（2026-10-09 实测：
+                // wss 地址 + 未启用 net-tls 特性时，代理日志只有“连接中”再无下文）。
+                // 记录失败原因（重试节奏由退避控制）；地址去掉查询串，避免令牌等敏感参数落日志
+                crate::logs::log().error(&format!(
+                    "WebSocket 连接失败（第 {failures} 次）：{}：{e}",
+                    sanitized_url(&client.url)
+                ));
             }
-            Err(_timeout) => {
+            Err(_) => {
                 failures += 1;
+                crate::logs::log().error(&format!(
+                    "WebSocket 连接超时（第 {failures} 次）：{}",
+                    sanitized_url(&client.url)
+                ));
             }
         }
 
@@ -389,6 +400,11 @@ async fn supervise(client: WsClient, mut cmd_rx: mpsc::Receiver<Cmd>) {
             _ = client.shared.shutdown_notify.notified() => break,
         }
     }
+}
+
+/// 日志用的连接地址（去掉查询串；令牌等敏感参数不落日志）。
+fn sanitized_url(url: &str) -> &str {
+    url.split(['?', '#']).next().unwrap_or(url)
 }
 
 /// 重连延迟：失败 0 次（刚断开）用基础间隔；之后指数退避；超阈值转长期模式。
@@ -1212,7 +1228,19 @@ async fn connect_handshake(url: &str) -> Result<PrefixedStream<ConnStream>, WsEr
     let head = String::from_utf8_lossy(&buf[..header_end]);
     let status_line = head.lines().next().unwrap_or("");
     if !status_line.contains(" 101") {
-        return Err(WsError::Handshake(format!("升级失败: {status_line}")));
+        // 附带响应体片段（网关/平台的 JSON 错误信封，如“接入令牌无效”），便于直接定位问题
+        let body = String::from_utf8_lossy(&buf[header_end..]);
+        let body = body.trim();
+        let detail = if body.is_empty() {
+            String::new()
+        } else {
+            let mut s: String = body.chars().take(200).collect();
+            if body.chars().count() > 200 {
+                s.push('…');
+            }
+            format!("：{s}")
+        };
+        return Err(WsError::Handshake(format!("升级失败: {status_line}{detail}")));
     }
     let expect = ws_accept(&key);
     let mut accept_ok = false;

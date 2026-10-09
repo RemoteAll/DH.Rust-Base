@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn token_store_lifecycle() {
-        let store = TokenStore::new();
+        let store: TokenStore = TokenStore::new();
         let token = store.issue();
         assert!(store.validate(&token));
         assert!(!store.validate("not-a-token"));
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn token_store_expires() {
-        let store = TokenStore::with_ttl_ms(1);
+        let store: TokenStore = TokenStore::with_ttl_ms(1);
         let token = store.issue();
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert!(!store.validate(&token), "过期令牌应失效");
