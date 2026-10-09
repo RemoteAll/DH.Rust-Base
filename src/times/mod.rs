@@ -145,6 +145,34 @@ pub fn format_system_time_stj(t: SystemTime) -> String {
     format_timestamp_stj(secs, nanos)
 }
 
+/// Unix 秒 → 本地时区文本（`%Y-%m-%d %H:%M:%S`；None/越界返回空串）。
+///
+/// 与 [`build_time_text!`](crate::build_time_text!) 配套：消费方 `build.rs` 注入 Unix 秒
+/// （`cargo:rustc-env=XXX=<秒>`），运行时代码经宏取用。
+pub fn unix_local_text(secs: Option<i64>) -> String {
+    secs.and_then(|s| chrono::DateTime::from_timestamp(s, 0))
+        .map(|utc| {
+            utc.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// 构建时间文本（在**调用方 crate** 展开 `option_env!`）。
+///
+/// `option_env!` 是编译期宏——若把本能力做成普通函数放进库，环境变量会在**库编译时**
+/// 求值（恒为空）；宏在调用方展开，才能读到消费方 `build.rs` 注入的值。
+///
+/// 用法：`build.rs` 注入 `cargo:rustc-env=XXX=<Unix 秒>`；代码中
+/// `dhrust::build_time_text!("XXX")` → 本地时区文本（如 `2026-10-09 09:23:06`；缺失/非法为空串）。
+#[macro_export]
+macro_rules! build_time_text {
+    ($env:literal) => {
+        $crate::times::unix_local_text(option_env!($env).and_then(|s| s.parse::<i64>().ok()))
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +205,22 @@ mod tests {
         assert!(parse_datetime("2026-09-26").is_some());
         assert!(parse_datetime("").is_none());
         assert!(parse_datetime("不是时间").is_none());
+    }
+
+    #[test]
+    fn unix_local_text_formats_and_handles_none() {
+        assert_eq!(unix_local_text(None), "");
+        let text = unix_local_text(Some(1_700_000_000));
+        assert_eq!(text.len(), 19);
+        // 与 chrono 本地换算一致（时区无关断言）
+        let expected = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        assert_eq!(text, expected);
+        // 宏：库自身构建未注入该变量 → 空串（消费方注入后才有值）
+        assert_eq!(crate::build_time_text!("DHRUST_TEST_MISSING_UNIX"), "");
     }
 
     #[test]
