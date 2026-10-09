@@ -131,7 +131,8 @@ function Assert-VersionGuard {
         $oldVer = Get-VersionFromFile -Path $vf -Pattern $VersionPattern
         $newVer = Step-VersionInFile -Path $vf -Pattern $VersionPattern -Kind $kind
         if ((Split-Path $VersionFile -Leaf) -eq 'Cargo.toml') {
-            Push-Location $root
+            # 在版本文件所在目录执行（支持版本文件位于仓库子目录的工程，如 DHDeploy 的 DHDeploy.Agent.Rust/Cargo.toml）
+            Push-Location (Split-Path $vf -Parent)
             try {
                 # 原生命令 stderr（cargo warning 等）不应在 Stop 下变成终止错误：临时放宽、以退出码判定
                 $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
