@@ -5,7 +5,9 @@
 //!
 //! - [`get`] / [`post_form`] / [`request`]：全量响应（小响应、JSON 错误体解析；
 //!   `request` 支持任意方法/自定义请求头与 Content-Type/原始请求体，供配置驱动转发场景）
-//! - [`download_to_file`]：流式落盘（大文件/大包，不驻留内存）
+//! - [`download_to_file`]：流式落盘（大文件/大包，不驻留内存；自动跟随 3xx 重定向）
+//! - [`download_to_file_with_progress`] / [`blocking_download_to_file`]：带进度回调的流式落盘
+//!   （模型权重等大文件下载场景；回调返回 false 中止）
 //! - `insecure_tls`：忽略服务器证书校验（服务器间自签证书部署场景必需）
 //!
 //! 依赖：`http-client` 特性（hyper client + tokio；`net` 特性自动包含）；`https` 需 `http-tls` 特性（rustls；`net-tls` 已包含）。
@@ -369,7 +371,7 @@ fn parse_method(method: &str) -> Result<Method, HttpClientError> {
         .map_err(|e| HttpClientError::new(format!("无效的 HTTP 方法 \"{method}\"：{e}")))
 }
 
-/// GET 请求流式落盘（2xx 时写目标文件；非 2xx 回读错误体）。
+/// GET 请求流式落盘（2xx 时写目标文件；非 2xx 回读错误体；**自动跟随 3xx 重定向**）。
 pub async fn download_to_file(
     url: &str,
     headers: &[(&str, &str)],
@@ -389,7 +391,7 @@ pub async fn download_to_file_at(
 ) -> Result<FileDownloadResult, HttpClientError> {
     tokio::time::timeout(
         options.timeout,
-        download_inner(url, headers, options, dest, offset),
+        download_inner(url, headers, options, dest, offset, |_, _| true),
     )
     .await
     .map_err(|_| HttpClientError::new(format!("请求超时（{}s）", options.timeout.as_secs())))?
@@ -421,34 +423,141 @@ pub async fn post_form_to_file(
             options,
         )
         .await?;
-        handle_response_to_file(res, dest, offset).await
+        handle_response_to_file(res, dest, offset, |_, _| true).await
     })
     .await
     .map_err(|_| HttpClientError::new(format!("请求超时（{}s）", options.timeout.as_secs())))?
 }
 
-async fn download_inner(
+/// GET 请求流式落盘（**带进度回调**；自动跟随 3xx 重定向，上限 5 跳）。
+///
+/// `on_progress(bytes_written, content_length)`：已写入本目标文件的字节数
+/// 与服务端 `Content-Length`（未知时 None）；返回 `false` 中止下载（错误消息“下载已取消”）。
+pub async fn download_to_file_with_progress<F>(
+    url: &str,
+    headers: &[(&str, &str)],
+    options: &HttpClientOptions,
+    dest: &Path,
+    on_progress: F,
+) -> Result<FileDownloadResult, HttpClientError>
+where
+    F: FnMut(u64, Option<u64>) -> bool,
+{
+    tokio::time::timeout(
+        options.timeout,
+        download_inner(url, headers, options, dest, 0, on_progress),
+    )
+    .await
+    .map_err(|_| HttpClientError::new(format!("请求超时（{}s）", options.timeout.as_secs())))?
+}
+
+/// GET 请求流式落盘（同步版，**带进度回调**；内部创建临时 tokio 运行时）。
+///
+/// 供阻塞上下文（后台线程）下载大文件（模型权重等）；异步上下文请用
+/// [`download_to_file_with_progress`]。注意：在已有 tokio 运行时线程内调用会因
+/// “运行时内 block_on”而 panic——那种场景请改在独立线程中调用本函数。
+pub fn blocking_download_to_file<F>(
+    url: &str,
+    headers: &[(&str, &str)],
+    options: &HttpClientOptions,
+    dest: &Path,
+    on_progress: F,
+) -> Result<FileDownloadResult, HttpClientError>
+where
+    F: FnMut(u64, Option<u64>) -> bool,
+{
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| HttpClientError::new(format!("创建 tokio 运行时失败: {e}")))?;
+
+    rt.block_on(download_to_file_with_progress(
+        url,
+        headers,
+        options,
+        dest,
+        on_progress,
+    ))
+}
+
+/// 重定向最大跳数（防循环）。
+const DOWNLOAD_MAX_REDIRECTS: usize = 5;
+
+/// 解析重定向目标（绝对地址原样；以 `/` 开头按当前源拼接；其它相对路径按当前目录拼接）。
+fn resolve_redirect(base_url: &str, location: &str) -> Result<String, HttpClientError> {
+    let loc = location.trim();
+    if loc.starts_with("http://") || loc.starts_with("https://") {
+        return Ok(loc.to_string());
+    }
+    let base = parse_url(base_url)?;
+    let scheme = if base.tls { "https" } else { "http" };
+    let authority = if (base.tls && base.port == 443) || (!base.tls && base.port == 80) {
+        base.host.clone()
+    } else {
+        format!("{}:{}", base.host, base.port)
+    };
+    if loc.starts_with('/') {
+        return Ok(format!("{scheme}://{authority}{loc}"));
+    }
+    let dir = match base.path.rfind('/') {
+        Some(pos) => &base.path[..=pos],
+        None => "/",
+    };
+    Ok(format!("{scheme}://{authority}{dir}{loc}"))
+}
+
+async fn download_inner<F>(
     url: &str,
     headers: &[(&str, &str)],
     options: &HttpClientOptions,
     dest: &Path,
     offset: u64,
-) -> Result<FileDownloadResult, HttpClientError> {
-    let target = parse_url(url)?;
-    let (_sender, res) =
-        send_request(Method::GET, &target, headers, None, Vec::new(), options).await?;
-    handle_response_to_file(res, dest, offset).await
+    mut on_progress: F,
+) -> Result<FileDownloadResult, HttpClientError>
+where
+    F: FnMut(u64, Option<u64>) -> bool,
+{
+    let mut current = url.to_string();
+    for _ in 0..=DOWNLOAD_MAX_REDIRECTS {
+        let target = parse_url(&current)?;
+        let (_sender, res) =
+            send_request(Method::GET, &target, headers, None, Vec::new(), options).await?;
+        let status = res.status().as_u16();
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            let loc = res
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+                .ok_or_else(|| HttpClientError::new("重定向响应缺少 Location 头".to_string()))?;
+            current = resolve_redirect(&current, &loc)?;
+            continue;
+        }
+        return handle_response_to_file(res, dest, offset, &mut on_progress).await;
+    }
+    Err(HttpClientError::new(format!(
+        "重定向次数过多（>{DOWNLOAD_MAX_REDIRECTS} 跳）: {url}"
+    )))
 }
 
 /// 统一处理"响应 → 落盘或错误体回读"：
 /// - 非 2xx，或 Content-Type 含 json（上游错误以 200+JSON 返回）→ 聚合 body 作错误体，不写文件；
 /// - 否则流式写入目标文件（offset 定位；offset=0 新建/截断；offset>0 打开或创建并定位）。
-async fn handle_response_to_file(
+async fn handle_response_to_file<F>(
     res: hyper::Response<hyper::body::Incoming>,
     dest: &Path,
     offset: u64,
-) -> Result<FileDownloadResult, HttpClientError> {
+    mut on_progress: F,
+) -> Result<FileDownloadResult, HttpClientError>
+where
+    F: FnMut(u64, Option<u64>) -> bool,
+{
     let status = res.status().as_u16();
+    let content_length: Option<u64> = res
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse().ok());
     let content_type = res
         .headers()
         .get("content-type")
@@ -497,6 +606,9 @@ async fn handle_response_to_file(
                 .await
                 .map_err(|e| HttpClientError::new(format!("写入目标文件失败: {e}")))?;
             len += data.len() as u64;
+            if !on_progress(len, content_length) {
+                return Err(HttpClientError::new("下载已取消".to_string()));
+            }
         }
     }
     tokio::io::AsyncWriteExt::flush(&mut file)
@@ -1076,6 +1188,66 @@ mod tests {
         assert_eq!(result.status, 200);
         assert_eq!(result.len, 5);
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello-world");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn download_follows_redirect_and_reports_progress() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            // 第一跳：302 → 真实文件地址
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let rsp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{addr}/real.bin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = s.write_all(rsp.as_bytes());
+            }
+            // 第二跳：真实内容
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let body: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(&body);
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("httpc-redir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("r.bin");
+        let mut pulls = 0usize;
+        let mut last = 0u64;
+        let mut total = None;
+        let result = download_to_file_with_progress(
+            &format!("http://{addr}/file.bin"),
+            &[],
+            &HttpClientOptions::default(),
+            &dest,
+            |n, t| {
+                pulls += 1;
+                last = n;
+                total = t;
+                true
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status, 200);
+        assert_eq!(result.len, 65536);
+        assert!(pulls >= 1, "进度回调应被调用");
+        assert_eq!(last, 65536);
+        assert_eq!(total, Some(65536));
+        assert_eq!(std::fs::read(&dest).unwrap().len(), 65536);
+        let _ = handle.join();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
