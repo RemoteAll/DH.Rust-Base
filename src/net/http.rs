@@ -512,6 +512,8 @@ async fn handle_http(
     upgrade_slot: Arc<Mutex<Option<(hyper::upgrade::OnUpgrade, WsServerHooks)>>>,
     remote: Option<String>,
 ) -> Response<Full<Bytes>> {
+    // 服务端处理计时（收到请求 → 输出响应）：响应头 X-Elapsed-Ms 供面板页脚展示性能
+    let started = std::time::Instant::now();
     // 升级意图必须先登记（handler 返回 WebSocket 时由 hyper 完成移交）
     let ws_candidate = is_ws_candidate(req.headers());
     let on_upgrade = if ws_candidate {
@@ -546,7 +548,21 @@ async fn handle_http(
         .unwrap_or(false);
 
     match (handler)(http_req).await {
-        HttpOutcome::Response(r) => finalize_http_response(r, accept_gzip, &options).into_hyper(),
+        HttpOutcome::Response(r) => {
+            // 处理耗时（毫秒，一位小数）：从进入 handle_http 到处理器返回。
+            // 业务已自带 X-Elapsed-Ms（如 HlkProductTool 中转计时段）时不覆盖、不重复追加。
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let r = if r
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("x-elapsed-ms"))
+            {
+                r
+            } else {
+                r.with_header("X-Elapsed-Ms", &format!("{elapsed_ms:.1}"))
+            };
+            finalize_http_response(r, accept_gzip, &options).into_hyper()
+        }
         HttpOutcome::WebSocket(hooks) => {
             // 合法性校验（对端可能伪造 Upgrade 头或版本不符）
             let (Some(on_upgrade), Some(key)) = (

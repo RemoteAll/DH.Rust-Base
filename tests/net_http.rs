@@ -168,6 +168,46 @@ async fn custom_fallback() {
     assert_eq!((s, b.as_str()), (200, "fallback:/whatever"));
 }
 
+/// 服务端处理耗时头：普通响应带 `X-Elapsed-Ms`（毫秒一位小数；面板页脚性能展示用）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn response_carries_elapsed_header() {
+    let mut r = Router::new();
+    r.map_get(
+        "/",
+        route(|_ctx: Ctx| async move { HttpOutcome::Response(HttpResponse::text(200, "ok")) }),
+    );
+    let addr = start(r).await;
+    let (s, head, b) = http_call(addr, "GET", "/", &[], b"").await;
+    assert_eq!((s, b.as_str()), (200, "ok"));
+    let line = head
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("x-elapsed-ms:"))
+        .expect("响应应带 X-Elapsed-Ms 头");
+    let v = line.split_once(':').unwrap().1.trim();
+    let ms: f64 = v.parse().expect("X-Elapsed-Ms 应为数字");
+    assert!((0.0..10_000.0).contains(&ms), "耗时值应在合理范围：{v}");
+}
+
+/// 业务自带 X-Elapsed-Ms 时不覆盖不重复（HlkProductTool 中转计时场景）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn elapsed_header_not_overridden_when_present() {
+    let mut r = Router::new();
+    r.map_get(
+        "/",
+        route(|_ctx: Ctx| async move {
+            HttpOutcome::Response(
+                HttpResponse::text(200, "ok").with_header("X-Elapsed-Ms", "99.9"),
+            )
+        }),
+    );
+    let addr = start(r).await;
+    let (s, head, b) = http_call(addr, "GET", "/", &[], b"").await;
+    assert_eq!((s, b.as_str()), (200, "ok"));
+    let count = head.to_ascii_lowercase().matches("x-elapsed-ms").count();
+    assert_eq!(count, 1, "不应重复追加：{head}");
+    assert!(head.contains("99.9"), "应为业务值：{head}");
+}
+
 /// 优雅停机：`serve_with_shutdown` 触发后 accept 循环退出、监听端口释放（可立即重绑）——
 /// “热重绑监听地址/免重启切换绑定”的基础能力。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
