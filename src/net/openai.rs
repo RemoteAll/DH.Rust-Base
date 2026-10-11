@@ -102,6 +102,36 @@ pub fn chat_blocking(opts: &OpenAiOptions, messages: &[Json]) -> Result<ChatRepl
     finish(resp)
 }
 
+/// 原始对话（完整请求体透传；返回完整响应 JSON）——供 Function Calling / 工具调用场景。
+///
+/// `payload` 为完整请求体（至少含 `model` 与 `messages`；可含 `tools`/`tool_choice`/`temperature` 等）；
+/// 返回服务端响应 JSON 原文（未做结构解析——调用方自行处理 `choices[0].message`，含 `tool_calls`）。
+/// 同步版（内部独立线程 + join；可在任意上下文安全调用）。
+pub fn chat_raw_blocking(opts: &OpenAiOptions, payload: &Json) -> Result<Json, String> {
+    let url = chat_completions_url(&opts.base_url);
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(format!("AI 接口地址无效（需 http/https）：{url}"));
+    }
+    let body = serde_json::to_vec(payload).map_err(|e| format!("请求序列化失败：{e}"))?;
+    let auth = format!("Bearer {}", opts.api_key.trim());
+    let timeout = opts.timeout;
+    let resp = http_client::blocking_request_offthread(
+        "POST",
+        &url,
+        &[("Authorization", auth.as_str())],
+        Some("application/json"),
+        body,
+        timeout,
+    )
+    .map_err(|e| format!("调用 AI 接口失败：{}", e.0))?;
+    let text = resp.body_text();
+    if !resp.is_success() {
+        let msg = parse_error_message(&text).unwrap_or_else(|| truncate(text.clone(), 300));
+        return Err(format!("AI 接口返回 HTTP {}：{msg}", resp.status));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("AI 响应不是有效 JSON：{e}"))
+}
+
 /// 异步调用（异步上下文直接使用）。
 pub async fn chat(opts: &OpenAiOptions, messages: &[Json]) -> Result<ChatReply, String> {
     let url = chat_completions_url(&opts.base_url);
@@ -221,6 +251,14 @@ mod tests {
             chat_completions_url("http://127.0.0.1:11434/v1/chat/completions"),
             "http://127.0.0.1:11434/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn chat_raw_validates_url() {
+        // 工具调用原始通道：地址校验与 chat_blocking 同构（HTTP 层复用同一 offthread 通道）
+        let opts = OpenAiOptions::new("ftp://invalid", "k", "m");
+        let err = chat_raw_blocking(&opts, &json!({ "model": "m", "messages": [] })).unwrap_err();
+        assert!(err.contains("接口地址无效"), "{err}");
     }
 
     #[test]
