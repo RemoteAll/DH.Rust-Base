@@ -30,7 +30,13 @@ if (-not (Test-Path $Workspace)) {
 }
 
 $ws = Get-Content $Workspace -Raw -Encoding UTF8 | ConvertFrom-Json
-$repos = @($ws.folders | ForEach-Object { $_.path }) | Where-Object { Test-Path (Join-Path $_ '.git') }
+# 解析每个登记目录所属 git 仓库根（支持“父仓库中的子目录”型项目，如 DHDeploy.Agent.Rust 属于 DHDeploy 仓库），并按仓库根去重
+$tops = @()
+foreach ($r in @($ws.folders | ForEach-Object { $_.path })) {
+    $top = git -C $r rev-parse --show-toplevel 2>$null
+    if ($LASTEXITCODE -eq 0 -and $top) { $tops += $top }
+}
+$repos = $tops | Sort-Object -Unique
 
 $doneList = @()
 $cleanList = @()
