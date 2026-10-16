@@ -35,7 +35,11 @@ toml = { version = "1", optional = true }
 toml_edit = { version = "0.25", optional = true }
 
 # ———— feature `zip-extract`（ZIP 解压；版本/特性与 Pek.RAgent 一致）————
-zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+# 上游把 `zip` 历史版本**几乎全部 yank**（crates.io 索引里仅 9.0.3 / 9.0.4 非 yanked）；
+# 停在 `^2` 时既有项目靠 Cargo.lock 里已锁的 2.4.2 仍可续编，但**新建项目**解析依赖会失败
+# （`failed to select a version for the requirement zip = "^2"`）。故对齐上游唯一可用线 9.x
+# （zip 文件格式向下兼容，读写互通；2026-10-16 由 2.x 升级）。
+zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
 
 # ———— feature `patch`（zstd 字典差分补丁：以旧文件为字典压缩新文件；增量升级，Pek.RAgent ↔ DHDeploy.Agent.Rust 共用）————
 zstd = { version = "0.13", optional = true }
