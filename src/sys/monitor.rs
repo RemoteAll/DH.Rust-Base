@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// 进程条目（Web 面板 Top 列表；字段口径对齐 htop / 云监控「进程监控」）。
+#[derive(Clone)]
 pub struct ProcItem {
     /// 进程名（不含 .exe 后缀）
     pub name: String,
@@ -38,6 +39,11 @@ pub struct ProcItem {
     pub handles: u32,
     /// 启动时间（Unix 秒；0 = 取不到）
     pub start_time: i64,
+    /// 本进程监听的 TCP 端口（升序去重；不监听则为空）。
+    ///
+    /// 由 [`listen_ports_map`] 的统一快照填充 —— 面板上能直接看出
+    /// 「dotnet 这个宿主到底在服务哪个端口」，也便于与假死探活目标对照。
+    pub ports: Vec<u16>,
 }
 
 
@@ -275,6 +281,63 @@ static LAST_CPU: Mutex<Option<CpuSnapshot>> = Mutex::new(None);
 ///   避免每次遍历都读全量 `/proc/{pid}/cmdline` 等小文件；
 /// - 平台取不到的重字段留空（Windows 无 PEB 读取，`command` 用 exe 路径、`cwd` 空）。
 pub fn top_processes(count: usize, sort_by_cpu: bool) -> Vec<ProcItem> {
+    let mut items = collect_light();
+    update_cpu_percent(&mut items);
+    if sort_by_cpu {
+        items.sort_by(|a, b| {
+            b.cpu_percent
+                .total_cmp(&a.cpu_percent)
+                .then(b.cpu_seconds.total_cmp(&a.cpu_seconds))
+        });
+    } else {
+        items.sort_by(|a, b| b.memory_mb.cmp(&a.memory_mb));
+    }
+    items.truncate(count);
+    finalize(&mut items);
+    items
+}
+
+/// 「CPU Top N ∪ 内存 Top N」——**只扫一遍系统**。
+///
+/// 面板同时需要两个榜单（前端可切换排序）：分别调两次 [`top_processes`] 会把
+/// 进程表快照与逐进程查询（Windows `OpenProcess` / Linux `/proc` 小文件）做两遍。
+/// 本函数收集一次、排序两次、取并集，并只给并集补重字段与监听端口。
+///
+/// 返回顺序：CPU 榜在前，其余为内存榜补充项（前端自行再排序）。
+pub fn top_processes_union(cpu_count: usize, mem_count: usize) -> Vec<ProcItem> {
+    let mut items = collect_light();
+    update_cpu_percent(&mut items);
+
+    // 用索引排序：两榜共用同一份数据，不复制 ProcItem
+    let mut idx_cpu: Vec<usize> = (0..items.len()).collect();
+    idx_cpu.sort_by(|a, b| {
+        let (x, y) = (&items[*a], &items[*b]);
+        y.cpu_percent
+            .total_cmp(&x.cpu_percent)
+            .then(y.cpu_seconds.total_cmp(&x.cpu_seconds))
+    });
+    idx_cpu.truncate(cpu_count);
+
+    let mut idx_mem: Vec<usize> = (0..items.len()).collect();
+    idx_mem.sort_by(|a, b| items[*b].memory_mb.cmp(&items[*a].memory_mb));
+    idx_mem.truncate(mem_count);
+
+    let mut seen: HashMap<u32, ()> = HashMap::with_capacity(idx_cpu.len() + idx_mem.len());
+    let mut picked: Vec<usize> = Vec::with_capacity(idx_cpu.len() + idx_mem.len());
+    for i in idx_cpu.into_iter().chain(idx_mem.into_iter()) {
+        if seen.insert(items[i].pid, ()).is_none() {
+            picked.push(i);
+        }
+    }
+
+    let mut out: Vec<ProcItem> = picked.into_iter().map(|i| items[i].clone()).collect();
+    finalize(&mut out);
+    out
+}
+
+/// 收集全系统进程的**轻字段**（名称 / PID / 内存 / 线程 / 累计 CPU / 启动时间）。
+#[allow(unused_mut)]
+fn collect_light() -> Vec<ProcItem> {
     let mut items: Vec<ProcItem> = Vec::new();
 
     #[cfg(windows)]
@@ -293,6 +356,7 @@ pub fn top_processes(count: usize, sort_by_cpu: bool) -> Vec<ProcItem> {
                 cwd: String::new(),
                 handles: 0,
                 start_time: 0,
+                ports: Vec::new(),
             });
         });
     }
@@ -353,58 +417,308 @@ pub fn top_processes(count: usize, sort_by_cpu: bool) -> Vec<ProcItem> {
                     } else {
                         0
                     },
+                    ports: Vec::new(),
                 });
             }
         }
     }
 
-    #[cfg(not(any(windows, target_os = "linux")))]
+    items
+}
+
+/// 瞬时 CPU%：与上次采样做差分；间隔过短则复用上次结果（避免连续调用全为 0）。
+fn update_cpu_percent(items: &mut [ProcItem]) {
+    let now = Instant::now();
+    let mut slot = LAST_CPU.lock().unwrap();
+    let prev = slot.take();
+    if let Some(prev) = prev.as_ref() {
+        let dt = now.duration_since(prev.at).as_secs_f64();
+        for item in items.iter_mut() {
+            if dt >= 0.2 {
+                if let Some(&before) = prev.cpu.get(&item.pid) {
+                    let delta = (item.cpu_seconds - before).max(0.0);
+                    // 占单核百分比：可超过 100（多线程进程）
+                    item.cpu_percent = (delta / dt * 100.0).min(100.0 * 64.0) as f32;
+                }
+            } else if let Some(&percent) = prev.percent.get(&item.pid) {
+                item.cpu_percent = percent;
+            }
+        }
+    }
+    *slot = Some(CpuSnapshot {
+        at: now,
+        cpu: items.iter().map(|i| (i.pid, i.cpu_seconds)).collect(),
+        percent: items.iter().map(|i| (i.pid, i.cpu_percent)).collect(),
+    });
+}
+
+/// 只给榜单里的进程补重字段（命令行 / 路径 / 工作目录 / 句柄 / 监听端口）。
+///
+/// 端口只针对这批进程查（不遍历全系统），且快照自带 2 秒缓存。
+fn finalize(items: &mut [ProcItem]) {
+    let pids: Vec<u32> = items.iter().map(|i| i.pid).collect();
+    let ports = listen_ports_many(&pids);
+    for item in items.iter_mut() {
+        fill_details(item);
+        if let Some(list) = ports.get(&item.pid) {
+            item.ports = list.clone();
+        }
+    }
+}
+
+// ───────────────────────────── 监听端口 ─────────────────────────────
+
+/// 端口快照有效期：面板 3 秒刷新一次，2 秒内复用刚扫过的结果。
+const PORTS_TTL: Duration = Duration::from_secs(2);
+
+/// 上一次端口快照 `(采样时间, 已扫描的 pid 列表（升序）, pid → 端口)`。
+static PORTS_CACHE: Mutex<Option<(Instant, Vec<u32>, HashMap<u32, Vec<u16>>)>> = Mutex::new(None);
+
+/// 指定这批进程的 TCP 监听端口（升序去重）。**只扫传入的 pid**，不遍历全系统。
+///
+/// - Linux：读 `/proc/net/tcp{,6}` 得 LISTEN 的 `socket inode → 端口`，
+///   再只为这批 pid 读 `/proc/{pid}/fd` 反查 socket inode；
+/// - Windows：`GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)` 一次取全表
+///   （系统调用本就只需一次），再按 pid 过滤，IPv4 + IPv6 都涵盖；
+/// - 结果缓存 [`PORTS_TTL`]：缓存已覆盖请求的 pid 时直接复用（进程表刷新会
+///   连续两次调用：CPU Top 与内存 Top）。
+///
+/// 只统计**监听**（LISTEN）端口，不含出站连接 —— 与应用「对外提供什么服务」的口径一致。
+pub fn listen_ports_many(pids: &[u32]) -> HashMap<u32, Vec<u16>> {
+    if pids.is_empty() {
+        return HashMap::new();
+    }
+    let mut wanted = pids.to_vec();
+    wanted.sort_unstable();
+    wanted.dedup();
     {
-        let _ = sort_by_cpu;
+        let slot = PORTS_CACHE.lock().unwrap();
+        if let Some((at, scanned, map)) = slot.as_ref() {
+            if at.elapsed() < PORTS_TTL
+                && wanted.iter().all(|p| scanned.binary_search(p).is_ok())
+            {
+                return map.clone();
+            }
+        }
+    }
+    let map = listen_ports_many_impl(&wanted);
+    if let Ok(mut slot) = PORTS_CACHE.lock() {
+        *slot = Some((Instant::now(), wanted, map.clone()));
+    }
+    map
+}
+
+/// 指定进程（含其子进程树）正在监听的 TCP 端口（升序去重）。
+///
+/// 用于「未配置 `HealthCheck`」时的自动探活：由上层找出子服务的监听口，再发起探活请求。
+/// 子进程树的意义：应用常由包装脚本 / 服务宿主再 fork 出真正监听者
+/// （`dotnet` → 子进程、`java -jar` → `sh` 包装）。取不到（无监听 / 权限不足）返回空。
+pub fn listen_ports_of(pid: u32) -> Vec<u16> {
+    let tree = process_tree(pid);
+    let map = listen_ports_many(&tree);
+    let mut ports = Vec::new();
+    for p in tree {
+        if let Some(list) = map.get(&p) {
+            ports.extend(list.iter().copied());
+        }
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+/// 进程自身 + 全部后代 PID（Linux 读 `/proc/{pid}/stat` 的 ppid 建树；其它平台只有自身）。
+#[cfg(target_os = "linux")]
+fn process_tree(pid: u32) -> Vec<u32> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    if let Ok(dir) = std::fs::read_dir("/proc") {
+        for entry in dir.flatten() {
+            let Ok(p) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{p}/stat")) else {
+                continue;
+            };
+            let Some(close) = stat.rfind(')') else { continue };
+            let rest: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+            if let Some(ppid) = rest.get(1).and_then(|v| v.parse::<u32>().ok()) {
+                children.entry(ppid).or_default().push(p);
+            }
+        }
     }
 
-    // ── 瞬时 CPU%：与上次调用做差分；间隔过短则复用上次结果（避免连续调用全为 0）──
-    let now = Instant::now();
-    {
-        let mut slot = LAST_CPU.lock().unwrap();
-        let prev = slot.take();
-        if let Some(prev) = prev.as_ref() {
-            let dt = now.duration_since(prev.at).as_secs_f64();
-            for item in items.iter_mut() {
-                if dt >= 0.2 {
-                    if let Some(&before) = prev.cpu.get(&item.pid) {
-                        let delta = (item.cpu_seconds - before).max(0.0);
-                        // 占单核百分比：可超过 100（多线程进程）
-                        item.cpu_percent = (delta / dt * 100.0).min(100.0 * 64.0) as f32;
-                    }
-                } else if let Some(&percent) = prev.percent.get(&item.pid) {
-                    item.cpu_percent = percent;
+    let mut pending = vec![pid];
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut pids = Vec::new();
+    while let Some(p) = pending.pop() {
+        if !seen.insert(p) {
+            continue;
+        }
+        pids.push(p);
+        if let Some(list) = children.get(&p) {
+            pending.extend(list.iter().copied());
+        }
+    }
+    pids
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_tree(pid: u32) -> Vec<u32> {
+    vec![pid]
+}
+
+/// Linux：读 `/proc/net/tcp{,6}` 的 LISTEN 行得 `socket inode → 端口`，
+/// 再**只为传入的 pid** 读 `/proc/{pid}/fd` 反查归属（不遍历全系统）。
+#[cfg(target_os = "linux")]
+fn listen_ports_many_impl(pids: &[u32]) -> HashMap<u32, Vec<u16>> {
+    // 1) socket inode → 监听端口（/proc/net/tcp 第 2 列地址含端口，第 4 列状态 0A=LISTEN，
+    //    第 10 列是 socket inode）
+    let mut inode_port: HashMap<u64, u16> = HashMap::new();
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in text.lines().skip(1) {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 10 || cols[3] != "0A" {
+                continue; // 仅 TCP LISTEN
+            }
+            let Ok(port) = u16::from_str_radix(cols[1].rsplit(':').next().unwrap_or("0"), 16)
+            else {
+                continue;
+            };
+            let Ok(inode) = cols[9].parse::<u64>() else {
+                continue;
+            };
+            if port != 0 {
+                inode_port.insert(inode, port);
+            }
+        }
+    }
+    if inode_port.is_empty() {
+        return HashMap::new();
+    }
+
+    // 2) 只看这批进程打开的 fd 里有没有 socket:[inode]（命中即归属该进程）
+    let mut map: HashMap<u32, Vec<u16>> = HashMap::new();
+    for &pid in pids {
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(target) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            let Some(text) = target.to_str() else { continue };
+            let Some(inode) = text
+                .strip_prefix("socket:[")
+                .and_then(|v| v.strip_suffix(']'))
+                .and_then(|v| v.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if let Some(&port) = inode_port.get(&inode) {
+                map.entry(pid).or_default().push(port);
+            }
+        }
+    }
+    for list in map.values_mut() {
+        list.sort_unstable();
+        list.dedup();
+    }
+    map
+}
+
+/// Windows：`GetExtendedTcpTable` 取一次全表（系统调用本就只需一次），再按 pid 过滤，
+/// IPv4 + IPv6 都涵盖。
+#[cfg(windows)]
+fn listen_ports_many_impl(pids: &[u32]) -> HashMap<u32, Vec<u16>> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, MIB_TCP6TABLE_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
+        TCP_TABLE_OWNER_PID_ALL,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+
+    let mut map: HashMap<u32, Vec<u16>> = HashMap::new();
+
+    // 通用取表：返回 (缓冲区, 行数)
+    fn fetch(family: u32) -> Option<(Vec<u8>, usize)> {
+        unsafe {
+            let mut size: u32 = 0;
+            GetExtendedTcpTable(
+                std::ptr::null_mut(),
+                &mut size,
+                0,
+                family,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            );
+            if size == 0 {
+                return None;
+            }
+            let mut buf = vec![0u8; size as usize];
+            let ret = GetExtendedTcpTable(
+                buf.as_mut_ptr() as *mut core::ffi::c_void,
+                &mut size,
+                0,
+                family,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            );
+            if ret != 0 {
+                return None;
+            }
+            let count = *(buf.as_ptr() as *const u32) as usize;
+            Some((buf, count))
+        }
+    }
+
+    unsafe {
+        if let Some((buf, count)) = fetch(AF_INET as u32) {
+            let table = buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID;
+            let rows = (*table).table.as_ptr();
+            for i in 0..count {
+                let row = rows.add(i);
+                if (*row).dwState != 2 {
+                    continue; // MIB_TCP_STATE_LISTEN
+                }
+                let port = (((*row).dwLocalPort & 0xffff) as u16).swap_bytes();
+                let pid = (*row).dwOwningPid;
+                if port != 0 && pids.binary_search(&pid).is_ok() {
+                    map.entry(pid).or_default().push(port);
                 }
             }
         }
-        *slot = Some(CpuSnapshot {
-            at: now,
-            cpu: items.iter().map(|i| (i.pid, i.cpu_seconds)).collect(),
-            percent: items.iter().map(|i| (i.pid, i.cpu_percent)).collect(),
-        });
+
+        if let Some((buf, count)) = fetch(AF_INET6 as u32) {
+            let table = buf.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID;
+            let rows = (*table).table.as_ptr();
+            for i in 0..count {
+                let row = rows.add(i);
+                if (*row).dwState != 2 {
+                    continue;
+                }
+                let port = (((*row).dwLocalPort & 0xffff) as u16).swap_bytes();
+                let pid = (*row).dwOwningPid;
+                if port != 0 && pids.binary_search(&pid).is_ok() {
+                    map.entry(pid).or_default().push(port);
+                }
+            }
+        }
     }
 
-    if sort_by_cpu {
-        items.sort_by(|a, b| {
-            b.cpu_percent
-                .total_cmp(&a.cpu_percent)
-                .then(b.cpu_seconds.total_cmp(&a.cpu_seconds))
-        });
-    } else {
-        items.sort_by(|a, b| b.memory_mb.cmp(&a.memory_mb));
+    for list in map.values_mut() {
+        list.sort_unstable();
+        list.dedup();
     }
-    items.truncate(count);
+    map
+}
 
-    // ── 只为返回项补全重字段（命令行 / 路径 / 工作目录 / 句柄）──
-    for item in items.iter_mut() {
-        fill_details(item);
-    }
-    items
+#[cfg(not(any(windows, target_os = "linux")))]
+fn listen_ports_many_impl(_pids: &[u32]) -> HashMap<u32, Vec<u16>> {
+    HashMap::new()
 }
 
 /// 进程重字段（平台实现见下方）。
@@ -1118,5 +1432,47 @@ mod tests {
         if let Some((threads, _handles)) = process_stats(pid) {
             assert!(threads >= 1, "至少应有一个线程");
         }
+    }
+
+    #[test]
+    fn listen_ports_many_only_reports_requested_pids() {
+        // 空列表不做事；只返回请求过的 pid（保护「不遍历全系统」的约束）
+        assert!(listen_ports_many(&[]).is_empty());
+        let map = listen_ports_many(&[std::process::id()]);
+        assert!(
+            map.keys().all(|p| *p == std::process::id()),
+            "只应返回请求过的 pid"
+        );
+    }
+
+    /// 手动基准：`cargo test bench_process_top_with_ports -- --ignored --nocapture`
+    ///
+    /// 目标：面板每 3 秒刷新一次，`top_processes(20)` ×2（CPU / 内存）+ 端口扫描
+    /// 必须保持在毫秒级，避免 RAgent 自己成为资源消耗源。
+    #[test]
+    #[ignore]
+    fn bench_process_top_with_ports() {
+        let round = |label: &str, f: &dyn Fn() -> u64| {
+            let t = Instant::now();
+            let mut n = 0u64;
+            for _ in 0..10 {
+                n += f();
+            }
+            let per = t.elapsed().as_secs_f64() * 100.0;
+            println!("{label}: {n} 项 / 10 次，单次 ≈ {per:.2} ms");
+        };
+        round("top_processes(20, cpu)", &|| {
+            top_processes(20, true).len() as u64
+        });
+        round("top_processes(20, mem)", &|| {
+            top_processes(20, false).len() as u64
+        });
+        round("top_processes_union(20,20)", &|| {
+            top_processes_union(20, 20).len() as u64
+        });
+        round("listen_ports_many(TOP20)", &|| {
+            let pids: Vec<u32> = top_processes(20, false).iter().map(|i| i.pid).collect();
+            listen_ports_many(&pids).len() as u64
+        });
     }
 }
