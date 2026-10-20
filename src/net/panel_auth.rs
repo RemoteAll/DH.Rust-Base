@@ -108,6 +108,9 @@ pub fn allows(ctx: &Ctx, level: AuthLevel, token_ok: impl Fn(&str) -> bool) -> b
     }
 }
 
+/// 面板令牌表容量上限（`restore` 导入时的兜底，正常使用远低于此值）。
+pub const MAX_TOKENS: usize = 512;
+
 /// 面板令牌表（内存态；token → (到期毫秒, 附加数据)）。
 ///
 /// 泛型 `T` 承载会话主体（用户/权限快照等；默认 `()` 即纯令牌表，
@@ -179,6 +182,33 @@ impl<T> TokenStore<T> {
         }
     }
 
+    /// 有效期（毫秒）。
+    pub fn ttl_ms(&self) -> i64 {
+        self.ttl_ms
+    }
+
+    /// 清空全部令牌（改密码/「退出所有设备」后统一失效）；返回清除数量。
+    pub fn clear(&self) -> usize {
+        let mut tokens = self.tokens.lock().unwrap();
+        let count = tokens.len();
+        tokens.clear();
+        count
+    }
+
+    /// 撤销除 `keep` 之外的全部令牌（保留当前会话）；返回移除数量。
+    ///
+    /// `keep` 为空等价于 [`TokenStore::clear`]。
+    pub fn revoke_all_except(&self, keep: &str) -> usize {
+        let mut tokens = self.tokens.lock().unwrap();
+        let before = tokens.len();
+        if keep.is_empty() {
+            tokens.clear();
+        } else {
+            tokens.retain(|token, _| token == keep);
+        }
+        before - tokens.len()
+    }
+
     /// 就地更新令牌绑定数据（存在且未过期才执行；返回是否命中）。
     pub fn update(&self, token: &str, f: impl FnOnce(&mut T)) -> bool {
         if token.is_empty() {
@@ -245,6 +275,76 @@ impl<T: Clone> TokenStore<T> {
             }
             None => None,
         }
+    }
+
+    /// 滑动续期：令牌仍有效且**剩余时间不足一半**时，把到期时间重置为 `now + ttl`。
+    ///
+    /// 返回 `true` 表示到期时间已改动（持久化调用方据此落盘）。
+    /// 只在剩余时间过半时才续期，避免每个请求都触发写文件；
+    /// 效果是「一直在用就一直不过期，连续 `ttl/2` 不用才失效」。
+    pub fn touch(&self, token: &str) -> bool {
+        if token.is_empty() {
+            return false;
+        }
+        let now = crate::times::getmilltimestamp() as i64;
+        let mut tokens = self.tokens.lock().unwrap();
+        match tokens.get_mut(token) {
+            Some((expire, _)) if *expire > now => {
+                if *expire - now <= self.ttl_ms / 2 {
+                    *expire = now + self.ttl_ms;
+                    true
+                } else {
+                    false
+                }
+            }
+            Some(_) => {
+                tokens.remove(token);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// 导出**未过期**令牌快照 `(令牌, 到期毫秒, 绑定数据)`。
+    ///
+    /// 供调用方序列化落盘（进程重启后 [`TokenStore::restore`] 恢复）。
+    pub fn snapshot(&self) -> Vec<(String, i64, T)> {
+        let now = crate::times::getmilltimestamp() as i64;
+        let tokens = self.tokens.lock().unwrap();
+        tokens
+            .iter()
+            .filter(|(_, (expire, _))| *expire > now)
+            .map(|(token, (expire, value))| (token.clone(), *expire, value.clone()))
+            .collect()
+    }
+
+    /// 导入令牌快照（过期项忽略，与现有表合并）；返回新增条数。
+    ///
+    /// 表容量上限 [`MAX_TOKENS`]，超出时优先丢弃最早到期的项（防损坏文件把内存撑爆）。
+    pub fn restore(&self, items: Vec<(String, i64, T)>) -> usize {
+        let now = crate::times::getmilltimestamp() as i64;
+        let mut tokens = self.tokens.lock().unwrap();
+        let mut added = 0usize;
+        for (token, expire, value) in items {
+            if token.is_empty() || expire <= now {
+                continue;
+            }
+            if tokens.insert(token, (expire, value)).is_none() {
+                added += 1;
+            }
+        }
+        if tokens.len() > MAX_TOKENS {
+            let mut entries: Vec<(String, i64)> = tokens
+                .iter()
+                .map(|(token, (expire, _))| (token.clone(), *expire))
+                .collect();
+            entries.sort_by_key(|(_, expire)| *expire);
+            let drop_count = tokens.len() - MAX_TOKENS;
+            for (token, _) in entries.into_iter().take(drop_count) {
+                tokens.remove(&token);
+            }
+        }
+        added
     }
 }
 
@@ -344,5 +444,44 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(store.get(&c), None);
         assert_eq!(store.get(&a), Some(10), "不匹配的令牌保留");
+    }
+
+    #[test]
+    fn token_store_snapshot_restore_and_touch() {
+        // 快照只含未过期项；恢复后可直接取到原绑定数据
+        let store: TokenStore<u32> = TokenStore::with_ttl_ms(1000);
+        let token = store.issue_with(7);
+        let snap = store.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].0, token);
+
+        let other: TokenStore<u32> = TokenStore::with_ttl_ms(1000);
+        let now = crate::times::getmilltimestamp() as i64;
+        let added = other.restore(vec![
+            ("t-live".to_string(), now + 100, 9u32),
+            ("t-dead".to_string(), now - 1, 8u32),
+        ]);
+        assert_eq!(added, 1, "过期项不导入");
+        assert_eq!(other.get("t-live"), Some(9));
+        assert_eq!(other.get("t-dead"), None);
+        // 剩余 100ms ≤ ttl/2（500ms）→ 续期为整段 ttl
+        assert!(other.touch("t-live"));
+        assert!(!other.touch("t-live"), "刚续期后剩余充足，不再重复续期");
+        assert!(!other.touch("t-missing"));
+        assert_eq!(other.revoke_all_except("t-live"), 0);
+        assert_eq!(other.clear(), 1);
+        assert!(other.snapshot().is_empty());
+    }
+
+    #[test]
+    fn token_store_revoke_all_except() {
+        let store: TokenStore<()> = TokenStore::new();
+        let a = store.issue();
+        let b = store.issue();
+        assert_eq!(store.revoke_all_except(&a), 1);
+        assert!(store.validate(&a));
+        assert!(!store.validate(&b));
+        assert_eq!(store.revoke_all_except(""), 1, "空 keep = 全部清除");
+        assert!(!store.validate(&a));
     }
 }
