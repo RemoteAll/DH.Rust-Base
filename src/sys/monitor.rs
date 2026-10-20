@@ -426,30 +426,53 @@ fn collect_light() -> Vec<ProcItem> {
     items
 }
 
-/// 瞬时 CPU%：与上次采样做差分；间隔过短则复用上次结果（避免连续调用全为 0）。
+/// 瞬时 CPU%：与上次**有效**采样做差分。
+///
+/// 关键约束（2026-10-20 修复「CPU 全是 0」）：间隔不足 200ms 的调用**复用上次结果，
+/// 且不推进采样基线**。否则任何高频调用方（面板一次刷新会打多个接口）都会把基线
+/// 一直顶到 now，导致每次差分窗口都 < 200ms → 永远算不出真实值，甚至把已经为 0 的
+/// 结果自我复用锁死在 0。
 fn update_cpu_percent(items: &mut [ProcItem]) {
     let now = Instant::now();
     let mut slot = LAST_CPU.lock().unwrap();
     let prev = slot.take();
-    if let Some(prev) = prev.as_ref() {
-        let dt = now.duration_since(prev.at).as_secs_f64();
-        for item in items.iter_mut() {
+    match prev {
+        None => {
+            // 首次：只建立基线（首帧 CPU% 为 0）
+            *slot = Some(CpuSnapshot {
+                at: now,
+                cpu: items.iter().map(|i| (i.pid, i.cpu_seconds)).collect(),
+                percent: items.iter().map(|i| (i.pid, i.cpu_percent)).collect(),
+            });
+        }
+        Some(prev) => {
+            let dt = now.duration_since(prev.at).as_secs_f64();
             if dt >= 0.2 {
-                if let Some(&before) = prev.cpu.get(&item.pid) {
-                    let delta = (item.cpu_seconds - before).max(0.0);
-                    // 占单核百分比：可超过 100（多线程进程）
-                    item.cpu_percent = (delta / dt * 100.0).min(100.0 * 64.0) as f32;
+                for item in items.iter_mut() {
+                    if let Some(&before) = prev.cpu.get(&item.pid) {
+                        let delta = (item.cpu_seconds - before).max(0.0);
+                        // 占单核百分比：可超过 100（多线程进程）
+                        item.cpu_percent = (delta / dt * 100.0).min(100.0 * 64.0) as f32;
+                    }
                 }
-            } else if let Some(&percent) = prev.percent.get(&item.pid) {
-                item.cpu_percent = percent;
+                // 只有真正算过，才推进基线
+                *slot = Some(CpuSnapshot {
+                    at: now,
+                    cpu: items.iter().map(|i| (i.pid, i.cpu_seconds)).collect(),
+                    percent: items.iter().map(|i| (i.pid, i.cpu_percent)).collect(),
+                });
+            } else {
+                // 间隔太短（同一次刷新内的第二个接口）：复用上次结果，
+                // 基线**原样放回**，让下一次 >=200ms 的调用仍有完整窗口
+                for item in items.iter_mut() {
+                    if let Some(&percent) = prev.percent.get(&item.pid) {
+                        item.cpu_percent = percent;
+                    }
+                }
+                *slot = Some(prev);
             }
         }
     }
-    *slot = Some(CpuSnapshot {
-        at: now,
-        cpu: items.iter().map(|i| (i.pid, i.cpu_seconds)).collect(),
-        percent: items.iter().map(|i| (i.pid, i.cpu_percent)).collect(),
-    });
 }
 
 /// 只给榜单里的进程补重字段（命令行 / 路径 / 工作目录 / 句柄 / 监听端口）。
@@ -1435,8 +1458,21 @@ mod tests {
     }
 
     #[test]
-    fn listen_ports_many_only_reports_requested_pids() {
-        // 空列表不做事；只返回请求过的 pid（保护「不遍历全系统」的约束）
+    fn short_interval_call_does_not_advance_cpu_baseline() {
+        // 面板一次刷新会打多个接口；短间隔调用若推进基线，
+        // 差分窗口就永远 < 200ms → CPU% 恒为 0（2026-10-20 实测踩到）
+        *LAST_CPU.lock().unwrap() = None;
+        let _ = top_processes(5, true); // 建基线
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = top_processes(5, true); // dt≈300ms → 计算并推进基线
+        let at_before = LAST_CPU.lock().unwrap().as_ref().map(|s| s.at);
+        let _ = top_processes(5, true); // dt≈0 → 复用，不得推进
+        let at_after = LAST_CPU.lock().unwrap().as_ref().map(|s| s.at);
+        assert_eq!(at_before, at_after, "短间隔调用不应推进 CPU 采样基线");
+    }
+
+    #[test]
+    fn listen_ports_many_only_reports_requested_pids() {        // 空列表不做事；只返回请求过的 pid（保护「不遍历全系统」的约束）
         assert!(listen_ports_many(&[]).is_empty());
         let map = listen_ports_many(&[std::process::id()]);
         assert!(
@@ -1474,5 +1510,20 @@ mod tests {
             let pids: Vec<u32> = top_processes(20, false).iter().map(|i| i.pid).collect();
             listen_ports_many(&pids).len() as u64
         });
+
+        // CPU% 正确性冒烟：上面的高频调用不得把基线顶到 now，
+        // 隔 1.2 秒再取一次，应能算出一批非 0 的进程（面板刷新同理）
+        std::thread::sleep(Duration::from_millis(1_200));
+        let after = top_processes_union(20, 20);
+        let top: Vec<(String, f32)> = after
+            .iter()
+            .take(5)
+            .map(|p| (p.name.clone(), p.cpu_percent))
+            .collect();
+        println!("CPU% top5 after 1.2s: {top:?}");
+        assert!(
+            after.iter().any(|p| p.cpu_percent > 0.0),
+            "间隔足够长时应有进程 CPU% 非 0（否则差分基线被错误推进）"
+        );
     }
 }
