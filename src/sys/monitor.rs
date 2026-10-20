@@ -8,22 +8,38 @@
 //! 进程 CPU 时间为“内核 + 用户”累计值（与 C# `TotalProcessorTime` 语义一致，
 //! Linux ticks 按 100Hz 换算）。
 
+use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// 进程条目（Web 面板 Top 列表）。
+/// 进程条目（Web 面板 Top 列表；字段口径对齐 htop / 云监控「进程监控」）。
 pub struct ProcItem {
     /// 进程名（不含 .exe 后缀）
     pub name: String,
     /// 进程 ID
     pub pid: u32,
-    /// 内存（MB）
+    /// 内存（MB；RSS / 工作集）
     pub memory_mb: u64,
     /// 线程数
     pub threads: u32,
     /// CPU 时间（秒；内核 + 用户，累计值，与 C# `TotalProcessorTime` 语义一致）
     pub cpu_seconds: f64,
+    /// 瞬时 CPU（占**单核**百分比，可 > 100，与 htop / 云监控一致；首次采样为 0）
+    pub cpu_percent: f32,
+    /// 运行账户（Linux 由 `/proc/{pid}/status` 的 Uid 反查；Windows 暂留空）
+    pub user: String,
+    /// 可执行文件完整路径（「文件目录」）
+    pub exe: String,
+    /// 完整命令行（Linux `cmdline`；Windows 用可执行文件路径代替）
+    pub command: String,
+    /// 工作目录（Linux `cwd`；Windows 留空）
+    pub cwd: String,
+    /// 句柄 / 打开文件数（Windows 句柄数；Linux `/proc/{pid}/fd` 条目数）
+    pub handles: u32,
+    /// 启动时间（Unix 秒；0 = 取不到）
+    pub start_time: i64,
 }
+
 
 /// 进程统计（线程数、句柄数）。取不到返回 None。
 pub fn process_stats(pid: u32) -> Option<(u32, u32)> {
@@ -240,7 +256,24 @@ pub fn is_process_running(name: &str) -> bool {
     }
 }
 
-/// Top 进程列表（按内存或 CPU 时间降序；取前 `count` 个）。
+/// 上一次 CPU 采样（用于差分计算瞬时 CPU%）。
+struct CpuSnapshot {
+    at: Instant,
+    cpu: HashMap<u32, f64>,
+    /// 上次算出的百分比（Δt 过短时直接复用，避免连续调用全部归零）
+    percent: HashMap<u32, f32>,
+}
+
+/// 进程 CPU 采样基线（进程表每次遍历结束后更新）。
+static LAST_CPU: Mutex<Option<CpuSnapshot>> = Mutex::new(None);
+
+/// Top 进程列表（按内存或瞬时 CPU 降序；取前 `count` 个）。
+///
+/// - `cpu_percent` 由**两次调用的累计 CPU 时间差分**得到（`Δt < 200ms` 时不计算，
+///   首次调用全为 0），口径为「占单核百分比」，可 > 100（与 htop / 云监控一致）；
+/// - 只有返回的前 `count` 个进程才补全重字段（命令行 / 路径 / 工作目录 / 句柄），
+///   避免每次遍历都读全量 `/proc/{pid}/cmdline` 等小文件；
+/// - 平台取不到的重字段留空（Windows 无 PEB 读取，`command` 用 exe 路径、`cwd` 空）。
 pub fn top_processes(count: usize, sort_by_cpu: bool) -> Vec<ProcItem> {
     let mut items: Vec<ProcItem> = Vec::new();
 
@@ -253,6 +286,13 @@ pub fn top_processes(count: usize, sort_by_cpu: bool) -> Vec<ProcItem> {
                 memory_mb: super::process::memory_mb(pid).unwrap_or(0),
                 threads,
                 cpu_seconds: process_cpu_split(pid).map(|(total, _, _)| total).unwrap_or(0.0),
+                cpu_percent: 0.0,
+                user: String::new(),
+                exe: String::new(),
+                command: String::new(),
+                cwd: String::new(),
+                handles: 0,
+                start_time: 0,
             });
         });
     }
@@ -268,13 +308,16 @@ pub fn top_processes(count: usize, sort_by_cpu: bool) -> Vec<ProcItem> {
             }
             size as u64
         });
+        let hz = clock_ticks();
+        let boot = linux_boot_time();
 
         if let Ok(dir) = std::fs::read_dir("/proc") {
             for entry in dir.flatten() {
                 let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
                     continue;
                 };
-                // /proc/{pid}/stat：comm 位于括号内，其后 utime/stime/num_threads 为第 14/15/20 字段
+                // /proc/{pid}/stat：comm 位于括号内，其后 utime/stime/num_threads/starttime
+                // 为第 14/15/20/22 字段（close 后索引 11/12/17/19）
                 let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
                     continue;
                 };
@@ -285,6 +328,7 @@ pub fn top_processes(count: usize, sort_by_cpu: bool) -> Vec<ProcItem> {
                 let utime: u64 = rest.get(11).and_then(|v| v.parse().ok()).unwrap_or(0);
                 let stime: u64 = rest.get(12).and_then(|v| v.parse().ok()).unwrap_or(0);
                 let threads: u32 = rest.get(17).and_then(|v| v.parse().ok()).unwrap_or(0);
+                let start_ticks: i64 = rest.get(19).and_then(|v| v.parse().ok()).unwrap_or(0);
 
                 let memory_mb = std::fs::read_to_string(format!("/proc/{pid}/statm"))
                     .ok()
@@ -298,6 +342,17 @@ pub fn top_processes(count: usize, sort_by_cpu: bool) -> Vec<ProcItem> {
                     memory_mb,
                     threads,
                     cpu_seconds: (utime + stime) as f64 / 100.0,
+                    cpu_percent: 0.0,
+                    user: String::new(),
+                    exe: String::new(),
+                    command: String::new(),
+                    cwd: String::new(),
+                    handles: 0,
+                    start_time: if boot > 0 && start_ticks > 0 {
+                        boot + start_ticks / hz.max(1)
+                    } else {
+                        0
+                    },
                 });
             }
         }
@@ -308,14 +363,257 @@ pub fn top_processes(count: usize, sort_by_cpu: bool) -> Vec<ProcItem> {
         let _ = sort_by_cpu;
     }
 
+    // ── 瞬时 CPU%：与上次调用做差分；间隔过短则复用上次结果（避免连续调用全为 0）──
+    let now = Instant::now();
+    {
+        let mut slot = LAST_CPU.lock().unwrap();
+        let prev = slot.take();
+        if let Some(prev) = prev.as_ref() {
+            let dt = now.duration_since(prev.at).as_secs_f64();
+            for item in items.iter_mut() {
+                if dt >= 0.2 {
+                    if let Some(&before) = prev.cpu.get(&item.pid) {
+                        let delta = (item.cpu_seconds - before).max(0.0);
+                        // 占单核百分比：可超过 100（多线程进程）
+                        item.cpu_percent = (delta / dt * 100.0).min(100.0 * 64.0) as f32;
+                    }
+                } else if let Some(&percent) = prev.percent.get(&item.pid) {
+                    item.cpu_percent = percent;
+                }
+            }
+        }
+        *slot = Some(CpuSnapshot {
+            at: now,
+            cpu: items.iter().map(|i| (i.pid, i.cpu_seconds)).collect(),
+            percent: items.iter().map(|i| (i.pid, i.cpu_percent)).collect(),
+        });
+    }
+
     if sort_by_cpu {
-        items.sort_by(|a, b| b.cpu_seconds.total_cmp(&a.cpu_seconds));
+        items.sort_by(|a, b| {
+            b.cpu_percent
+                .total_cmp(&a.cpu_percent)
+                .then(b.cpu_seconds.total_cmp(&a.cpu_seconds))
+        });
     } else {
         items.sort_by(|a, b| b.memory_mb.cmp(&a.memory_mb));
     }
     items.truncate(count);
+
+    // ── 只为返回项补全重字段（命令行 / 路径 / 工作目录 / 句柄）──
+    for item in items.iter_mut() {
+        fill_details(item);
+    }
     items
 }
+
+/// 进程重字段（平台实现见下方）。
+/// Windows：exe 路径 + 句柄数 + 启动时间（命令行/工作目录需要读 PEB，未实现）。
+#[cfg(windows)]
+fn fill_details(item: &mut ProcItem) {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessHandleCount, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    item.user = windows_process_user(item.pid);
+
+    fn filetime_secs(t: FILETIME) -> i64 {
+        let ticks = ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
+        if ticks == 0 {
+            0
+        } else {
+            (ticks / 10_000_000) as i64 - 11_644_473_600
+        }
+    }
+
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, item.pid);
+        if h.is_null() {
+            return;
+        }
+        let mut buf = [0u16; 1024];
+        let mut size = buf.len() as u32;
+        if QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size) != 0 {
+            let path = String::from_utf16_lossy(&buf[..size as usize]);
+            if item.command.is_empty() {
+                item.command = path.clone();
+            }
+            item.exe = path;
+        }
+        let mut handles = 0u32;
+        if GetProcessHandleCount(h, &mut handles) != 0 {
+            item.handles = handles;
+        }
+        let (mut creation, mut exit, mut kernel, mut user): (
+            FILETIME,
+            FILETIME,
+            FILETIME,
+            FILETIME,
+        ) = (
+            std::mem::zeroed(),
+            std::mem::zeroed(),
+            std::mem::zeroed(),
+            std::mem::zeroed(),
+        );
+        if GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user) != 0 {
+            item.start_time = filetime_secs(creation);
+        }
+        CloseHandle(h);
+    }
+}
+
+/// Linux：用户 / 命令行 / 可执行文件 / 工作目录 / 打开文件数（`/proc`）。
+#[cfg(target_os = "linux")]
+fn fill_details(item: &mut ProcItem) {
+    let pid = item.pid;
+    item.user = linux_user_of(pid);
+    if let Ok(path) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+        item.exe = path.to_string_lossy().into_owned();
+    }
+    if let Ok(path) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
+        item.cwd = path.to_string_lossy().into_owned();
+    }
+    if let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+        let text = String::from_utf8_lossy(&bytes).replace('\0', " ");
+        item.command = text.trim().to_string();
+    }
+    if item.command.is_empty() {
+        item.command = item.exe.clone();
+    }
+    item.handles = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .map(|d| d.count() as u32)
+        .unwrap_or(0);
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn fill_details(_item: &mut ProcItem) {}
+
+/// Windows：进程运行账户名（`OpenProcessToken` + `LookupAccountSidW`；失败返回空）。
+#[cfg(windows)]
+fn windows_process_user(pid: u32) -> String {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, LookupAccountSidW, TokenUser, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return String::new();
+        }
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(h, TOKEN_QUERY, &mut token) == 0 {
+            CloseHandle(h);
+            return String::new();
+        }
+        let mut size = 0u32;
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut size);
+        let mut buffer = vec![0u8; size.max(64) as usize];
+        let mut name = String::new();
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr() as *mut core::ffi::c_void,
+            size,
+            &mut size,
+        ) != 0
+        {
+            let user = &*(buffer.as_ptr() as *const TOKEN_USER);
+            let mut name_buf = [0u16; 256];
+            let mut name_len = name_buf.len() as u32;
+            let mut domain_buf = [0u16; 256];
+            let mut domain_len = domain_buf.len() as u32;
+            let mut use_type = 0i32;
+            if LookupAccountSidW(
+                std::ptr::null_mut(),
+                user.User.Sid,
+                name_buf.as_mut_ptr(),
+                &mut name_len,
+                domain_buf.as_mut_ptr(),
+                &mut domain_len,
+                &mut use_type,
+            ) != 0
+            {
+                name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
+            }
+        }
+        CloseHandle(token);
+        CloseHandle(h);
+        name
+    }
+}
+
+/// Linux：`/proc/{pid}/status` 的 Uid → 用户名（`/etc/passwd` 缓存）。
+#[cfg(target_os = "linux")]
+fn linux_user_of(pid: u32) -> String {
+    use std::sync::OnceLock;
+    static USERS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+    let Some(uid) = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|line| line.starts_with("Uid:"))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .map(str::to_string)
+        })
+    else {
+        return String::new();
+    };
+    let cache = USERS.get_or_init(|| {
+        let mut map = HashMap::new();
+        if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
+            for line in passwd.lines() {
+                let cols: Vec<&str> = line.split(':').collect();
+                if cols.len() >= 3 {
+                    map.insert(cols[2].to_string(), cols[0].to_string());
+                }
+            }
+        }
+        Mutex::new(map)
+    });
+    let guard = cache.lock().unwrap();
+    guard.get(&uid).cloned().unwrap_or(uid)
+}
+
+/// Linux：开机墙钟（`/proc/stat` 的 `btime`，Unix 秒；0 = 未知）。
+#[cfg(target_os = "linux")]
+fn linux_boot_time() -> i64 {
+    use std::sync::OnceLock;
+    static BTIME: OnceLock<i64> = OnceLock::new();
+    *BTIME.get_or_init(|| {
+        std::fs::read_to_string("/proc/stat")
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find(|line| line.starts_with("btime"))
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|value| value.parse::<i64>().ok())
+            })
+            .unwrap_or(0)
+    })
+}
+
+/// Linux：每秒时钟滴答数（`_SC_CLK_TCK`，通常 100）。
+#[cfg(target_os = "linux")]
+fn clock_ticks() -> i64 {
+    use std::sync::OnceLock;
+    static HZ: OnceLock<i64> = OnceLock::new();
+    *HZ.get_or_init(|| {
+        let value = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if value > 0 {
+            value as i64
+        } else {
+            100
+        }
+    })
+}
+
 
 /// 系统 TCP 连接计数（已建立 / TIME_WAIT / CLOSE_WAIT）。
 pub fn tcp_counts() -> (u32, u32, u32) {
