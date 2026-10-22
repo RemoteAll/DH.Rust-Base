@@ -417,70 +417,92 @@ pub fn wait_pool_stopped(pool: &str, timeout: Duration) -> bool {
 
 /// 停站点（幂等）。
 pub fn stop_site(site: &str, timeout: Duration) -> Result<(), String> {
-    let site = site.trim();
-    if site.is_empty() {
-        return Err("站点名为空".to_string());
-    }
-    if state_is(&site_states(), site, "Stopped") {
-        return Ok(());
-    }
-    let result = appcmd(&["stop", "site", site], timeout).map(|_| ());
-    invalidate_cache();
-    if result.is_err() && state_is(&site_states(), site, "Stopped") {
-        return Ok(());
-    }
-    result
+    change_state("site", site, "Stopped", timeout)
 }
 
 /// 启站点（幂等）。
 pub fn start_site(site: &str, timeout: Duration) -> Result<(), String> {
-    let site = site.trim();
-    if site.is_empty() {
-        return Err("站点名为空".to_string());
-    }
-    if state_is(&site_states(), site, "Started") {
-        return Ok(());
-    }
-    let result = appcmd(&["start", "site", site], timeout).map(|_| ());
-    invalidate_cache();
-    if result.is_err() && state_is(&site_states(), site, "Started") {
-        return Ok(());
-    }
-    result
+    change_state("site", site, "Started", timeout)
 }
 
 /// 停应用池（幂等）。共享池会波及其它站点，调用方需自行提示。
 pub fn stop_app_pool(pool: &str, timeout: Duration) -> Result<(), String> {
-    let pool = pool.trim();
-    if pool.is_empty() {
-        return Err("应用池名为空".to_string());
-    }
-    if state_is(&app_pool_states(), pool, "Stopped") {
-        return Ok(());
-    }
-    let result = appcmd(&["stop", "apppool", pool], timeout).map(|_| ());
-    invalidate_cache();
-    if result.is_err() && state_is(&app_pool_states(), pool, "Stopped") {
-        return Ok(());
-    }
-    result
+    change_state("apppool", pool, "Stopped", timeout)
 }
 
 /// 启应用池（幂等）。
 pub fn start_app_pool(pool: &str, timeout: Duration) -> Result<(), String> {
-    let pool = pool.trim();
-    if pool.is_empty() {
-        return Err("应用池名为空".to_string());
+    change_state("apppool", pool, "Started", timeout)
+}
+
+/// 实时查询站点状态（`Started`/`Stopped`；未安装 IIS 或查询失败返回 None）。
+///
+/// 与 [`site_states`]（批量 + 缓存）不同：本函数每次真实调用 appcmd，用于停/启后的裁决。
+pub fn site_state(site: &str) -> Option<String> {
+    current_state("site", site.trim())
+}
+
+/// 实时查询应用池状态（`Started`/`Stopped`；未安装 IIS 或查询失败返回 None）。
+pub fn app_pool_state(pool: &str) -> Option<String> {
+    current_state("apppool", pool.trim())
+}
+
+/// 站点/应用池状态切换（幂等）。
+///
+/// 重要：`appcmd stop/start` 对「目标已是期望状态」会返回非 0 退出码且输出空的
+/// `<?xml?><appcmd></appcmd>`（例如启动一个已启动的应用池），因此命令失败时一律用
+/// **实时单对象查询**复核，达到期望状态即视为成功，避免部署被误判为失败。
+fn change_state(kind: &str, name: &str, want: &str, timeout: Duration) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(if kind == "site" {
+            "站点名为空".to_string()
+        } else {
+            "应用池名为空".to_string()
+        });
     }
-    if state_is(&app_pool_states(), pool, "Started") {
+    let verb = if want.eq_ignore_ascii_case("Stopped") {
+        "stop"
+    } else {
+        "start"
+    };
+    if current_state(kind, name).is_some_and(|s| s.eq_ignore_ascii_case(want)) {
         return Ok(());
     }
-    let result = appcmd(&["start", "apppool", pool], timeout).map(|_| ());
-    invalidate_cache();
-    if result.is_err() && state_is(&app_pool_states(), pool, "Started") {
-        return Ok(());
+    match appcmd(&[verb, kind, name], timeout) {
+        Ok(_) => {
+            invalidate_cache();
+            Ok(())
+        }
+        Err(e) => {
+            invalidate_cache();
+            let state = current_state(kind, name);
+            if state.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(want)) {
+                return Ok(());
+            }
+            Err(match &state {
+                Some(s) => format!("{e}（当前状态：{s}）"),
+                None => format!("{e}（未能查询到当前状态）"),
+            })
+        }
     }
-    result
+}
+
+/// 实时查询状态（每次真实调用 appcmd，不读缓存）。
+fn current_state(kind: &str, name: &str) -> Option<String> {
+    #[cfg(windows)]
+    {
+        if name.is_empty() {
+            return None;
+        }
+        let out = appcmd(&["list", kind, name], APPCMD_TIMEOUT).ok()?;
+        parse_state_text(&out, name)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (kind, name);
+        None
+    }
 }
 
 /// 强制结束应用池的 w3wp（调用前应先停池，避免 WAS 自动拉起）。返回结束的进程数。
@@ -516,10 +538,16 @@ pub fn appcmd(args: &[&str], timeout: Duration) -> Result<String, String> {
             } else {
                 r.stderr
             };
+            let detail = if msg.trim().is_empty() {
+                "(无输出)".to_string()
+            } else {
+                msg.trim().to_string()
+            };
             return Err(format!(
-                "appcmd 执行失败（退出码 {}）：{}",
+                "appcmd 执行失败（退出码 {}，命令：appcmd {}）：{}",
                 r.exit_code,
-                msg.trim()
+                args.join(" "),
+                detail
             ));
         }
         Ok(r.stdout)
@@ -663,32 +691,49 @@ fn parse_named_states_xml(
 fn parse_site_states_text(text: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for line in text.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("SITE ") else {
-            continue;
-        };
-        let Some(open) = rest.find('"') else {
-            continue;
-        };
-        let rest = &rest[open + 1..];
-        let Some(close) = rest.find('"') else {
-            continue;
-        };
-        let name = &rest[..close];
-        let tail = &rest[close + 1..];
-        let Some(pos) = tail.rfind("state:") else {
-            continue;
-        };
-        let state = tail[pos + 6..]
-            .split([',', ')'])
-            .next()
-            .unwrap_or("")
-            .trim();
-        if !name.is_empty() && !state.is_empty() {
-            out.insert(name.to_string(), state.to_string());
+        if let Some((name, state)) = parse_state_line(line) {
+            out.insert(name, state);
         }
     }
     out
+}
+
+/// 从 appcmd 文本输出中解析指定对象的状态（`SITE "x" (id:1,...,state:Started)`）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_state_text(text: &str, name: &str) -> Option<String> {
+    for line in text.lines() {
+        if let Some((n, s)) = parse_state_line(line) {
+            if n.eq_ignore_ascii_case(name) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// 解析 `PREFIX "name" (...,state:Started)` 一行（站点与应用池输出通用，`state:` 不区分大小写）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_state_line(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    let open = line.find('"')?;
+    let rest = &line[open + 1..];
+    let close = rest.find('"')?;
+    let name = rest[..close].trim();
+    if name.is_empty() {
+        return None;
+    }
+    let tail = &rest[close + 1..];
+    let lower = tail.to_ascii_lowercase();
+    let pos = lower.rfind("state:")?;
+    let state = tail[pos + 6..]
+        .split([',', ')'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    if state.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), state.to_string()))
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -705,13 +750,6 @@ fn collect_process_ids(value: &Value, out: &mut Vec<u32>) {
             collect_process_ids(child, out);
         }
     }
-}
-
-fn state_is(states: &HashMap<String, String>, name: &str, want: &str) -> bool {
-    states
-        .get(name)
-        .map(|s| s.eq_ignore_ascii_case(want))
-        .unwrap_or(false)
 }
 
 fn first_application_pool(value: Option<&Value>) -> Option<String> {
@@ -1022,5 +1060,42 @@ mod tests {
             normalize_for_compare(r"D:/WWW/Site"),
             normalize_for_compare(r"D:\WWW\Site")
         );
+    }
+
+    #[test]
+    fn parses_state_line_for_site_and_app_pool() {
+        // 站点：appcmd list site 的文本格式（小写 state:）
+        let site = r#"SITE "kf.hlktech.com" (id:2,bindings:http/*:80:kf.hlktech.com,state:Started)"#;
+        assert_eq!(
+            parse_state_line(site),
+            Some(("kf.hlktech.com".to_string(), "Started".to_string()))
+        );
+        // 应用池：appcmd list apppool 的文本格式（大写 State:）
+        let pool = r#"APPPOOL "kf.hlktech.com" (State:Started)"#;
+        assert_eq!(
+            parse_state_line(pool),
+            Some(("kf.hlktech.com".to_string(), "Started".to_string()))
+        );
+        // 中文站点名（非 ASCII）也能正确取状态
+        let zh = r#"SITE "海凌科 AI客服" (id:3,bindings:http/*:80:,state:Stopped)"#;
+        assert_eq!(
+            parse_state_line(zh),
+            Some(("海凌科 AI客服".to_string(), "Stopped".to_string()))
+        );
+        // 错误输出不带状态
+        assert_eq!(
+            parse_state_line(r#"ERROR ( message:Cannot find SITE object with identifier "x". )"#),
+            None
+        );
+        assert_eq!(parse_state_line("some other line"), None);
+    }
+
+    #[test]
+    fn parses_single_state_text() {
+        let text = "SITE \"a\" (id:1,state:Started)\nSITE \"b\" (id:2,state:Stopped)\n";
+        assert_eq!(parse_state_text(text, "A").as_deref(), Some("Started"));
+        assert_eq!(parse_state_text(text, "b").as_deref(), Some("Stopped"));
+        assert_eq!(parse_state_text(text, "c"), None);
+        assert_eq!(parse_state_text("", "a"), None);
     }
 }
