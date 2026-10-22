@@ -779,3 +779,220 @@ pub fn run_shell(command_line: &str, cwd: &Path, timeout_seconds: u64) -> ShellR
         working_directory: cwd.to_string_lossy().to_string(),
     }
 }
+
+// ————— 直接执行程序（非 shell；带超时；IIS appcmd 等场景） —————
+
+/// 直接执行程序的结果。
+#[derive(Debug, Clone)]
+pub struct RunResult {
+    /// 退出码（超时被强杀为 -1）
+    pub exit_code: i32,
+    /// 标准输出
+    pub stdout: String,
+    /// 标准错误
+    pub stderr: String,
+    /// 是否超时被强杀
+    pub timed_out: bool,
+}
+
+/// 直接执行程序并捕获输出，超时强杀（不经 shell，避免引号/注入问题）。
+///
+/// Windows 下自动隐藏控制台窗口；适用于 `appcmd.exe`、`sc.exe` 等系统命令。
+pub fn run_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> std::io::Result<RunResult> {
+    use std::io::Read;
+
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = cmd.spawn()?;
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(s) = stdout.as_mut() {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(s) = stderr.as_mut() {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let timeout = timeout.max(Duration::from_millis(1));
+    let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    let exit_code;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_code = status.code().unwrap_or(-1);
+                break;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    timed_out = true;
+                    exit_code = -1;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                exit_code = -1;
+                break;
+            }
+        }
+    }
+
+    let out_bytes = out_handle.join().unwrap_or_default();
+    let err_bytes = err_handle.join().unwrap_or_default();
+    Ok(RunResult {
+        exit_code,
+        stdout: String::from_utf8_lossy(&out_bytes).to_string(),
+        stderr: String::from_utf8_lossy(&err_bytes).to_string(),
+        timed_out,
+    })
+}
+
+/// 读取进程命令行（Windows，`NtQueryInformationProcess`；非 Windows 返回 None）。
+///
+/// 用于 `w3wp.exe -ap "应用池"` 等“从命令行识别身份”的场景，免 PEB、免子进程。
+#[cfg(windows)]
+pub fn command_line(pid: u32) -> Option<String> {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtQueryInformationProcess(
+            process_handle: *mut c_void,
+            process_information_class: u32,
+            process_information: *mut c_void,
+            process_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+    }
+
+    // ProcessCommandLineInformation（Windows 8.1+）
+    const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
+
+    unsafe {
+        let mut handle = OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid,
+        );
+        if handle.is_null() {
+            handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        }
+        if handle.is_null() {
+            return None;
+        }
+        let result = (|| {
+            let mut needed = 0u32;
+            let status = NtQueryInformationProcess(
+                handle,
+                PROCESS_COMMAND_LINE_INFORMATION,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+            if status >= 0 {
+                return None;
+            }
+            // 少数系统首次调用不返回长度：给一个足够大的回退缓冲区
+            let size = if needed == 0 { 64 * 1024 } else { needed };
+            let words = (size as usize + 7) / 8 + 4;
+            let mut buf = vec![0u64; words];
+            let mut got = 0u32;
+            let status = NtQueryInformationProcess(
+                handle,
+                PROCESS_COMMAND_LINE_INFORMATION,
+                buf.as_mut_ptr() as *mut c_void,
+                (buf.len() * 8) as u32,
+                &mut got,
+            );
+            if status < 0 {
+                return None;
+            }
+            let us = std::ptr::read_unaligned(buf.as_ptr() as *const UnicodeString);
+            let bytes = us.length as usize;
+            if us.buffer.is_null() || bytes == 0 || bytes % 2 != 0 {
+                return None;
+            }
+            let base = buf.as_ptr() as usize;
+            let start = us.buffer as usize;
+            if start < base || start.saturating_add(bytes) > base + buf.len() * 8 {
+                return None;
+            }
+            let chars = std::slice::from_raw_parts(us.buffer, bytes / 2);
+            Some(String::from_utf16_lossy(chars))
+        })();
+        CloseHandle(handle);
+        result
+    }
+}
+
+/// 读取进程命令行（非 Windows 不支持）。
+#[cfg(not(windows))]
+pub fn command_line(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn run_with_timeout_captures_output() {
+        let r = run_with_timeout(
+            "cmd.exe",
+            &["/c", "echo hello"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(!r.timed_out);
+        assert_eq!(r.exit_code, 0);
+        assert!(r.stdout.contains("hello"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_with_timeout_captures_output() {
+        let r = run_with_timeout("sh", &["-c", "echo hello"], Duration::from_secs(10)).unwrap();
+        assert!(!r.timed_out);
+        assert_eq!(r.exit_code, 0);
+        assert!(r.stdout.contains("hello"));
+    }
+}

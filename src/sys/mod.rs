@@ -7,11 +7,13 @@
 //!
 //! - [`disk`]：挂载点过滤黑名单、`/proc/mounts` 八进制转义还原（`\040` 等）
 //! - [`net`]：网卡累计流量（Linux `/proc/net/dev`；Windows `GetIfTable2`）
-//! - [`process`]：进程管理（拉起/存活判定/信号与强制停止/资源查询/优先级）
+//! - [`process`]：进程管理（拉起/存活判定/信号与强制停止/资源查询/优先级/命令行）
 //! - [`monitor`]：实时指标采集（CPU 差分/负载/TCP 连接数/磁盘 IO/进程统计/Top）
 //! - [`machine`]：机器事实与设置（主机/系统/CPU/内存/网络接口/磁盘/机器标识/校时）
+//! - [`iis`]：IIS 配置解析、站点/应用池/物理路径反查、w3wp 映射与 appcmd 控制（Windows）
 
 pub mod disk;
+pub mod iis;
 pub mod machine;
 pub mod monitor;
 pub mod net;
