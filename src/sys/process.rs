@@ -610,7 +610,10 @@ mod tests {
                 .args(["-c", &format!("pgrep -g {} | wc -l", pid)])
                 .output()
                 .unwrap();
-            String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0)
         };
 
         let mut ready = false;
@@ -932,7 +935,7 @@ pub fn command_line(pid: u32) -> Option<String> {
             }
             // 少数系统首次调用不返回长度：给一个足够大的回退缓冲区
             let size = if needed == 0 { 64 * 1024 } else { needed };
-            let words = (size as usize + 7) / 8 + 4;
+            let words = (size as usize).div_ceil(8) + 4;
             let mut buf = vec![0u64; words];
             let mut got = 0u32;
             let status = NtQueryInformationProcess(
@@ -947,7 +950,7 @@ pub fn command_line(pid: u32) -> Option<String> {
             }
             let us = std::ptr::read_unaligned(buf.as_ptr() as *const UnicodeString);
             let bytes = us.length as usize;
-            if us.buffer.is_null() || bytes == 0 || bytes % 2 != 0 {
+            if us.buffer.is_null() || bytes == 0 || !bytes.is_multiple_of(2) {
                 return None;
             }
             let base = buf.as_ptr() as usize;
@@ -976,12 +979,8 @@ mod run_tests {
     #[test]
     #[cfg(windows)]
     fn run_with_timeout_captures_output() {
-        let r = run_with_timeout(
-            "cmd.exe",
-            &["/c", "echo hello"],
-            Duration::from_secs(10),
-        )
-        .unwrap();
+        let r =
+            run_with_timeout("cmd.exe", &["/c", "echo hello"], Duration::from_secs(10)).unwrap();
         assert!(!r.timed_out);
         assert_eq!(r.exit_code, 0);
         assert!(r.stdout.contains("hello"));

@@ -105,7 +105,11 @@ pub fn uninstall(mgr: &ServiceManager, stop: bool) -> Result<(), String> {
                 return Err(super::ownership_conflict_message(
                     &mgr.name,
                     &exe.display().to_string(),
-                    &format!("systemctl disable --now {} && rm {}", mgr.name, path.display()),
+                    &format!(
+                        "systemctl disable --now {} && rm {}",
+                        mgr.name,
+                        path.display()
+                    ),
                 ));
             }
         }
@@ -116,7 +120,8 @@ pub fn uninstall(mgr: &ServiceManager, stop: bool) -> Result<(), String> {
     }
     let _ = run("systemctl", &["disable", &mgr.name]);
 
-    std::fs::remove_file(&path).map_err(|e| format!("删除单元文件失败 {}：{}", path.display(), e))?;
+    std::fs::remove_file(&path)
+        .map_err(|e| format!("删除单元文件失败 {}：{}", path.display(), e))?;
 
     let (code, _, err) = run("systemctl", &["daemon-reload"]);
     if code != 0 {
@@ -243,7 +248,10 @@ fn diagnose(name: &str) -> String {
     let (_, so, _) = run("systemctl", &["status", name, "--no-pager", "-l"]);
     if !so.trim().is_empty() {
         out.push_str("\n—— systemctl status（尾部）——\n");
-        out.push_str(&super::inits::clip(&super::inits::tail_lines(&so, 15), 2000));
+        out.push_str(&super::inits::clip(
+            &super::inits::tail_lines(&so, 15),
+            2000,
+        ));
     }
 
     let (_, so, _) = run("journalctl", &["-u", name, "-n", "15", "--no-pager"]);

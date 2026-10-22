@@ -116,8 +116,10 @@ impl StaticFiles {
     /// ```
     pub fn embed_many(mut self, files: &[(&'static str, &'static [u8])]) -> StaticFiles {
         for (path, data) in files {
-            self.embedded
-                .insert(normalize_key(path), EmbeddedAsset::new(data, mime_type(path)));
+            self.embedded.insert(
+                normalize_key(path),
+                EmbeddedAsset::new(data, mime_type(path)),
+            );
         }
         self
     }
@@ -141,7 +143,10 @@ impl StaticFiles {
     /// 例如 `&["/api", "/star"]`——后端命名空间的 404 保持 JSON 语义。
     /// 空串忽略；大小写不敏感；`/apiary` 不算 `/api` 的子路径（按段边界匹配）。
     pub fn spa_excludes(mut self, prefixes: &[&str]) -> StaticFiles {
-        self.spa_excludes = prefixes.iter().filter_map(|p| normalize_prefix(p)).collect();
+        self.spa_excludes = prefixes
+            .iter()
+            .filter_map(|p| normalize_prefix(p))
+            .collect();
         self
     }
 
@@ -427,7 +432,11 @@ mod tests {
     #[test]
     fn embedded_resources_take_priority() {
         let statics = StaticFiles::new("不存在的目录")
-            .embed("/index.html", b"<b>embedded</b>", "text/html; charset=utf-8")
+            .embed(
+                "/index.html",
+                b"<b>embedded</b>",
+                "text/html; charset=utf-8",
+            )
             .embed("favicon.ico", &[0u8, 1, 2], "image/x-icon");
 
         let home = statics.try_serve("/").expect("应命中嵌入 index.html");
@@ -486,7 +495,11 @@ mod tests {
     #[test]
     fn spa_fallback_serves_index_for_route_like_paths() {
         let statics = StaticFiles::new("不存在的目录")
-            .embed("/index.html", b"<html>index</html>", "text/html; charset=utf-8")
+            .embed(
+                "/index.html",
+                b"<html>index</html>",
+                "text/html; charset=utf-8",
+            )
             .embed("/assets/app.js", b"js", "text/javascript; charset=utf-8")
             .spa_fallback(true);
 
@@ -573,7 +586,11 @@ mod tests {
         use crate::net::http::HttpRequest;
 
         let statics = StaticFiles::new("不存在的目录")
-            .embed("/index.html", b"<html>panel</html>", "text/html; charset=utf-8")
+            .embed(
+                "/index.html",
+                b"<html>panel</html>",
+                "text/html; charset=utf-8",
+            )
             .spa_fallback(true);
 
         // 静态响应带强 ETag 与 no-cache
@@ -608,7 +625,10 @@ mod tests {
 
         // 通配 `*` 与弱前缀 `W/` 同样命中；SPA 回退路径亦条件化
         assert_eq!(
-            statics.try_serve_request(&make_req("/", Some("*"))).unwrap().status,
+            statics
+                .try_serve_request(&make_req("/", Some("*")))
+                .unwrap()
+                .status,
             304
         );
         assert_eq!(
@@ -634,6 +654,12 @@ mod tests {
                 .status,
             200
         );
-        assert_eq!(statics.try_serve_request(&make_req("/", None)).unwrap().status, 200);
+        assert_eq!(
+            statics
+                .try_serve_request(&make_req("/", None))
+                .unwrap()
+                .status,
+            200
+        );
     }
 }

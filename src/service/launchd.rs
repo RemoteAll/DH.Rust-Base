@@ -202,7 +202,11 @@ pub fn uninstall(mgr: &ServiceManager, stop: bool) -> Result<(), String> {
                 return Err(super::ownership_conflict_message(
                     &mgr.name,
                     &exe.display().to_string(),
-                    &format!("launchctl bootout system/{} && rm {}", mgr.name, path.display()),
+                    &format!(
+                        "launchctl bootout system/{} && rm {}",
+                        mgr.name,
+                        path.display()
+                    ),
                 ));
             }
         }
@@ -218,7 +222,8 @@ pub fn uninstall(mgr: &ServiceManager, stop: bool) -> Result<(), String> {
         let _ = run(&["unload", "-w", &path_text]);
     }
 
-    std::fs::remove_file(&path).map_err(|e| format!("删除 plist 失败 {}：{}", path.display(), e))?;
+    std::fs::remove_file(&path)
+        .map_err(|e| format!("删除 plist 失败 {}：{}", path.display(), e))?;
 
     super::log_format("launchd 服务已卸载：{}", &[&mgr.name]);
     Ok(())

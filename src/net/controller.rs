@@ -29,9 +29,9 @@
 //!     .mount(&mut router);
 //! ```
 
-use std::collections::HashMap;
 #[cfg(feature = "razor")]
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "razor")]
 use std::rc::Rc;
@@ -431,9 +431,7 @@ mod tests {
     /// 取出响应体文本。
     fn body_of(outcome: HttpOutcome) -> String {
         match outcome {
-            HttpOutcome::Response(response) => {
-                String::from_utf8_lossy(&response.body).to_string()
-            }
+            HttpOutcome::Response(response) => String::from_utf8_lossy(&response.body).to_string(),
             _ => String::new(),
         }
     }
@@ -484,7 +482,12 @@ mod tests {
     #[test]
     fn arg_binding_priority_and_case() {
         // 查询串优先于 body
-        let ctx = request("POST", "/api/echo", "text=fromQuery", "{\"TEXT\":\"fromBody\"}");
+        let ctx = request(
+            "POST",
+            "/api/echo",
+            "text=fromQuery",
+            "{\"TEXT\":\"fromBody\"}",
+        );
         assert_eq!(arg(&ctx, "text").as_deref(), Some("fromQuery"));
 
         // body 字段（大小写不敏感）
@@ -516,7 +519,10 @@ mod tests {
             ActionResult::Response(r) => HttpOutcome::Response(r),
             _ => panic!("应为响应"),
         });
-        assert!(text.contains("\"code\":401") && text.contains("Unauthorized"), "{text}");
+        assert!(
+            text.contains("\"code\":401") && text.contains("Unauthorized"),
+            "{text}"
+        );
     }
 
     #[cfg(feature = "razor")]
@@ -536,7 +542,12 @@ mod tests {
 
         let renderer = ViewRenderer::with_root(dir.join("Views"));
         let html = renderer
-            .render("home", "index", "Index", &serde_json::json!({ "Name": "Rust" }))
+            .render(
+                "home",
+                "index",
+                "Index",
+                &serde_json::json!({ "Name": "Rust" }),
+            )
             .expect("渲染应成功");
         assert_eq!(html, "Hello Rust");
 

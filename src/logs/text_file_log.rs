@@ -155,7 +155,11 @@ impl ILog for TextFileLog {
         if self.shared.queued.load(Ordering::Relaxed) > MAX_QUEUE {
             return;
         }
-        if self.tx.send(Msg::Line(format_line(level, message).text)).is_ok() {
+        if self
+            .tx
+            .send(Msg::Line(format_line(level, message).text))
+            .is_ok()
+        {
             self.shared.queued.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -309,7 +313,7 @@ fn format_thousands(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -759,7 +763,10 @@ mod tests {
         assert_eq!(parts[1].len(), 2, "线程ID列应为两位: {line}");
         assert_eq!(parts[2], "N", "测试线程应为普通线程: {line}");
         assert!(!text.contains("[INFO]"), "行格式不应包含级别标记: {text}");
-        assert!(!text.contains("调试不应出现"), "低于级别的日志不应出现: {text}");
+        assert!(
+            !text.contains("调试不应出现"),
+            "低于级别的日志不应出现: {text}"
+        );
     }
 
     #[test]

@@ -202,7 +202,15 @@ pub async fn request(
     body: Vec<u8>,
     options: &HttpClientOptions,
 ) -> Result<HttpResponse, HttpClientError> {
-    execute(parse_method(method)?, url, headers, content_type, body, options).await
+    execute(
+        parse_method(method)?,
+        url,
+        headers,
+        content_type,
+        body,
+        options,
+    )
+    .await
 }
 
 /// 校验 HTTP 方法是否合法（配置加载时快速失败；不发起请求）。
@@ -328,7 +336,14 @@ pub fn blocking_request_offthread_with(
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        blocking_request_with(&method, &url, &refs, content_type.as_deref(), body, &options)
+        blocking_request_with(
+            &method,
+            &url,
+            &refs,
+            content_type.as_deref(),
+            body,
+            &options,
+        )
     })
 }
 
@@ -782,9 +797,7 @@ async fn wrap_tls(
             let added = add_pem_roots(&mut roots, pem)
                 .map_err(|e| HttpClientError::new(format!("根证书 PEM 解析失败: {e}")))?;
             if added == 0 {
-                return Err(HttpClientError::new(
-                    "根证书 PEM 未包含证书块".to_string(),
-                ));
+                return Err(HttpClientError::new("根证书 PEM 未包含证书块".to_string()));
             }
         }
         ClientConfig::builder_with_provider(provider)
@@ -1096,7 +1109,10 @@ mod tests {
         assert!(resp.is_success());
 
         let req = captured.lock().await.clone();
-        assert!(req.starts_with("PUT /Api/V1/Order/SetBarcode HTTP/1.1"), "请求行：{req}");
+        assert!(
+            req.starts_with("PUT /Api/V1/Order/SetBarcode HTTP/1.1"),
+            "请求行：{req}"
+        );
         // hyper 会把请求头名规范为小写；服务端侧统一按大小写不敏感读取
         let req_lower = req.to_lowercase();
         assert!(req_lower.contains("content-type: application/json"));

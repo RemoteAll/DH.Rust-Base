@@ -122,7 +122,7 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 
 /// 十六进制字符串 → 字节数组（奇数长度或含非法字符返回 `None`；大小写均可）。
 pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let val = |c: u8| -> Option<u8> {
@@ -152,8 +152,8 @@ pub fn base64_encode(data: &[u8]) -> String {
 
 /// Base64 解码（标准与 URL 安全字符混用、容忍缺省填充、忽略空白）。
 pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
-    use base64::Engine as _;
     use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    use base64::Engine as _;
 
     // URL 安全字符归一化为标准字符；空白（含换行）剔除
     let mut normalized = String::with_capacity(text.len());
@@ -268,10 +268,7 @@ mod tests {
     #[test]
     fn md5_bytes_matches_string_variant() {
         assert_eq!(md5_hex_bytes(b"abc"), md5_hex("abc"));
-        assert_eq!(
-            md5_hex_bytes(b""),
-            "d41d8cd98f00b204e9800998ecf8427e"
-        );
+        assert_eq!(md5_hex_bytes(b""), "d41d8cd98f00b204e9800998ecf8427e");
     }
 
     #[test]
@@ -317,7 +314,7 @@ mod tests {
 
         // URL 安全变体、缺省填充与空白容忍
         assert_eq!(base64_decode("Zm9vYmFy").unwrap(), b"foobar");
-        assert_eq!(base64_decode("Zm9v-_Yh").is_some(), true);
+        assert!(base64_decode("Zm9v-_Yh").is_some());
         assert_eq!(base64_decode(" Zm9\n  vYmFy ").unwrap(), b"foobar");
         assert_eq!(base64_url_no_pad(b"foobar"), "Zm9vYmFy");
     }

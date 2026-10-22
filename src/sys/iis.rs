@@ -540,11 +540,7 @@ pub fn appcmd_path() -> Option<PathBuf> {
             .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
         let mut candidates = Vec::new();
         if cfg!(target_pointer_width = "32") {
-            candidates.push(
-                root.join("Sysnative")
-                    .join("inetsrv")
-                    .join("appcmd.exe"),
-            );
+            candidates.push(root.join("Sysnative").join("inetsrv").join("appcmd.exe"));
         }
         candidates.push(root.join("System32").join("inetsrv").join("appcmd.exe"));
         candidates.into_iter().find(|p| p.is_file())
@@ -632,7 +628,11 @@ fn query_site_states() -> HashMap<String, String> {
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
-fn parse_named_states_xml(xml: &str, element: &str, name_attrs: &[&str]) -> HashMap<String, String> {
+fn parse_named_states_xml(
+    xml: &str,
+    element: &str,
+    name_attrs: &[&str],
+) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let Ok(value) = crate::config::read_xml_to_json(xml) else {
         return out;
@@ -795,8 +795,7 @@ fn attr_ci(value: &Value, names: &[&str]) -> String {
 }
 
 fn cmd_char_before(text: &str, byte_index: usize) -> Option<char> {
-    text.get(..byte_index)
-        .and_then(|s| s.chars().next_back())
+    text.get(..byte_index).and_then(|s| s.chars().next_back())
 }
 
 fn pool_from_user(user: &str, apps: &HashMap<String, Vec<IisSite>>) -> Option<String> {
@@ -939,7 +938,7 @@ mod tests {
         let config = IisHostConfig::from_xml(SAMPLE);
         let target = config.resolve_by_site("gicisky.net").expect("site");
         assert_eq!(target.app_path, "/");
-        assert!(target.shared_pool == false);
+        assert!(!target.shared_pool);
         // gicisky.net 池被同一站点的两个应用使用，但只算一个站点 → 不算共享
         let mut xml = SAMPLE.replace(
             r#"<site name="site2" id="2">"#,
@@ -1015,7 +1014,13 @@ mod tests {
 
     #[test]
     fn normalizes_paths_for_comparison() {
-        assert_eq!(normalize_for_compare(r"D:\WWW\Site\"), normalize_for_compare(r"D:\WWW\Site"));
-        assert_eq!(normalize_for_compare(r"D:/WWW/Site"), normalize_for_compare(r"D:\WWW\Site"));
+        assert_eq!(
+            normalize_for_compare(r"D:\WWW\Site\"),
+            normalize_for_compare(r"D:\WWW\Site")
+        );
+        assert_eq!(
+            normalize_for_compare(r"D:/WWW/Site"),
+            normalize_for_compare(r"D:\WWW\Site")
+        );
     }
 }

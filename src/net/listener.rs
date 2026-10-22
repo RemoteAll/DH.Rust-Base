@@ -132,9 +132,7 @@ impl Listener {
                 runtime.block_on(async move {
                     let bound = match tls {
                         #[cfg(feature = "net-tls")]
-                        Some((cert, key)) => {
-                            HttpServer::bind_tls(&addr_text, &cert, &key).await
-                        }
+                        Some((cert, key)) => HttpServer::bind_tls(&addr_text, &cert, &key).await,
                         #[cfg(not(feature = "net-tls"))]
                         Some(_) => {
                             let _ = ready_tx

@@ -487,7 +487,8 @@ mod tests {
         // 上限：第 3 个被拒
         assert!(term.ensure("own00003", "userA", 80, 24).is_err());
         term.reset("own00001");
-        term.ensure("own00003", "userA", 80, 24).expect("after reset");
+        term.ensure("own00003", "userA", 80, 24)
+            .expect("after reset");
         term.close_all();
     }
 
@@ -500,7 +501,12 @@ mod tests {
         term.ensure("test0002", "tester", 80, 24).expect("ensure");
         assert!(term.is_alive("test0002"));
         term.write("test0002", b"echo ready\r\n");
-        assert!(wait_replay(&term, "test0002", "ready", Duration::from_secs(20)));
+        assert!(wait_replay(
+            &term,
+            "test0002",
+            "ready",
+            Duration::from_secs(20)
+        ));
         term.reset("test0002");
         assert!(!term.is_alive("test0002"));
     }

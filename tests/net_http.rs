@@ -195,9 +195,7 @@ async fn elapsed_header_not_overridden_when_present() {
     r.map_get(
         "/",
         route(|_ctx: Ctx| async move {
-            HttpOutcome::Response(
-                HttpResponse::text(200, "ok").with_header("X-Elapsed-Ms", "99.9"),
-            )
+            HttpOutcome::Response(HttpResponse::text(200, "ok").with_header("X-Elapsed-Ms", "99.9"))
         }),
     );
     let addr = start(r).await;
@@ -220,13 +218,9 @@ async fn serve_with_shutdown_releases_port() {
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let join = tokio::spawn(async move {
         server
-            .serve_with_shutdown(
-                svc,
-                HttpServerOptions::default(),
-                async move {
-                    let _ = stop_rx.await;
-                },
-            )
+            .serve_with_shutdown(svc, HttpServerOptions::default(), async move {
+                let _ = stop_rx.await;
+            })
             .await
             .unwrap();
     });
@@ -505,14 +499,8 @@ async fn gzip_negotiation_and_threshold() {
     assert_eq!(body.len(), 4096);
 
     // 小响应（< 阈值）→ 不压缩
-    let (s, head, body) = http_call_raw(
-        addr,
-        "GET",
-        "/small",
-        &[("Accept-Encoding", "gzip")],
-        b"",
-    )
-    .await;
+    let (s, head, body) =
+        http_call_raw(addr, "GET", "/small", &[("Accept-Encoding", "gzip")], b"").await;
     assert_eq!(s, 200);
     assert!(!head.to_ascii_lowercase().contains("content-encoding"));
     assert_eq!(body, b"tiny");
@@ -537,14 +525,8 @@ async fn gzip_can_be_disabled_and_skips_encoded() {
         },
     )
     .await;
-    let (s, head, body) = http_call_raw(
-        addr,
-        "GET",
-        "/big",
-        &[("Accept-Encoding", "gzip")],
-        b"",
-    )
-    .await;
+    let (s, head, body) =
+        http_call_raw(addr, "GET", "/big", &[("Accept-Encoding", "gzip")], b"").await;
     assert_eq!(s, 200);
     assert!(!head.to_ascii_lowercase().contains("content-encoding"));
     assert_eq!(body.len(), 4096);

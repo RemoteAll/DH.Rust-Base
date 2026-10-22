@@ -119,7 +119,10 @@ mod tests {
         assert_eq!(format_bytes_iec(1024), "1 KiB");
         assert_eq!(format_bytes_iec(1536), "1.5 KiB");
         assert_eq!(format_bytes_iec(20 * 1024 * 1024 * 1024), "20 GiB");
-        assert_eq!(format_bytes_iec(1024 * 1024 * 1024 + 512 * 1024 * 1024), "1.5 GiB");
+        assert_eq!(
+            format_bytes_iec(1024 * 1024 * 1024 + 512 * 1024 * 1024),
+            "1.5 GiB"
+        );
     }
 
     #[test]

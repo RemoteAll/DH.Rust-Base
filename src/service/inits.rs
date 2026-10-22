@@ -293,11 +293,23 @@ mod tests {
 
     #[test]
     fn decide_override_wins() {
-        assert_eq!(decide(Some("procd"), true, false, false, false), InitKind::Procd);
-        assert_eq!(decide(Some(" SysV "), false, false, false, false), InitKind::Sysv);
-        assert_eq!(decide(Some("systemd"), false, false, false, true), InitKind::Systemd);
+        assert_eq!(
+            decide(Some("procd"), true, false, false, false),
+            InitKind::Procd
+        );
+        assert_eq!(
+            decide(Some(" SysV "), false, false, false, false),
+            InitKind::Sysv
+        );
+        assert_eq!(
+            decide(Some("systemd"), false, false, false, true),
+            InitKind::Systemd
+        );
         // 无效值 → 忽略并自动探测
-        assert_eq!(decide(Some("bogus"), false, false, false, true), InitKind::Sysv);
+        assert_eq!(
+            decide(Some("bogus"), false, false, false, true),
+            InitKind::Sysv
+        );
     }
 
     #[test]
@@ -358,7 +370,10 @@ WantedBy=multi-user.target\n";
 
     #[test]
     fn quote_path_only_when_needed() {
-        assert_eq!(quote_path("/opt/staragent/pek-ragent"), "/opt/staragent/pek-ragent");
+        assert_eq!(
+            quote_path("/opt/staragent/pek-ragent"),
+            "/opt/staragent/pek-ragent"
+        );
         assert_eq!(quote_path("/opt/my agent/app"), "\"/opt/my agent/app\"");
     }
 

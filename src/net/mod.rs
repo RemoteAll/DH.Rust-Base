@@ -31,12 +31,12 @@ pub mod controller;
 pub mod http;
 #[cfg(feature = "http-client")]
 pub mod http_client;
-#[cfg(feature = "http-client")]
-pub mod openai;
-#[cfg(feature = "mqtt")]
-pub mod mqtt;
 #[cfg(feature = "net")]
 pub mod listener;
+#[cfg(feature = "mqtt")]
+pub mod mqtt;
+#[cfg(feature = "http-client")]
+pub mod openai;
 #[cfg(feature = "net")]
 pub mod panel_auth;
 #[cfg(feature = "net")]

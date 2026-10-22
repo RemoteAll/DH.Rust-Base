@@ -56,11 +56,7 @@ impl Default for LoginGuard {
 impl LoginGuard {
     /// 默认策略：15 分钟窗口内失败 5 次 → 封禁 5 分钟。
     pub fn new() -> Self {
-        Self::with_policy(
-            5,
-            Duration::from_secs(15 * 60),
-            Duration::from_secs(5 * 60),
-        )
+        Self::with_policy(5, Duration::from_secs(15 * 60), Duration::from_secs(5 * 60))
     }
 
     /// 自定义策略（窗口内失败 `max_attempts` 次封禁 `block` 时长）。

@@ -123,7 +123,10 @@ fn cleanup_one(mgr: &ServiceManager, legacy: &str) {
     let detail = format!("{stdout}{stderr}");
     let detail = detail.trim();
     if code == 0 {
-        super::log_format("已自动清理旧服务名 {}（原指向本程序，已停止并删除）", &[legacy]);
+        super::log_format(
+            "已自动清理旧服务名 {}（原指向本程序，已停止并删除）",
+            &[legacy],
+        );
     } else {
         super::log_format(
             "旧服务名 {} 清理失败：{}（如仍存在请手工执行 sc delete {}）",
@@ -414,7 +417,9 @@ mod tests {
         let out = "[SC] QueryServiceConfig SUCCESS\n\nSERVICE_NAME: StarAgent\n        BINARY_PATH_NAME   : \"C:\\Program Files\\Star Agent\\pek-ragent.exe\" -s\n";
         assert_eq!(
             parse_bin_path(out),
-            Some(PathBuf::from("C:\\Program Files\\Star Agent\\pek-ragent.exe"))
+            Some(PathBuf::from(
+                "C:\\Program Files\\Star Agent\\pek-ragent.exe"
+            ))
         );
     }
 

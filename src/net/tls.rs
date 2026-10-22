@@ -41,8 +41,8 @@ pub fn ensure_self_signed_cert(
         }
     }
 
-    let key_pair = rcgen::KeyPair::generate()
-        .map_err(|e| io::Error::other(format!("生成密钥失败: {e}")))?;
+    let key_pair =
+        rcgen::KeyPair::generate().map_err(|e| io::Error::other(format!("生成密钥失败: {e}")))?;
     let mut params = rcgen::CertificateParams::new(sans)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("证书参数失败: {e}")))?;
     params

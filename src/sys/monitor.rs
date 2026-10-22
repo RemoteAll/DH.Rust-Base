@@ -46,7 +46,6 @@ pub struct ProcItem {
     pub ports: Vec<u16>,
 }
 
-
 /// 进程统计（线程数、句柄数）。取不到返回 None。
 pub fn process_stats(pid: u32) -> Option<(u32, u32)> {
     #[cfg(windows)]
@@ -54,7 +53,7 @@ pub fn process_stats(pid: u32) -> Option<(u32, u32)> {
         use std::mem::zeroed;
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
             TH32CS_SNAPPROCESS,
         };
         use windows_sys::Win32::System::Threading::{
@@ -290,7 +289,7 @@ pub fn top_processes(count: usize, sort_by_cpu: bool) -> Vec<ProcItem> {
                 .then(b.cpu_seconds.total_cmp(&a.cpu_seconds))
         });
     } else {
-        items.sort_by(|a, b| b.memory_mb.cmp(&a.memory_mb));
+        items.sort_by_key(|p| std::cmp::Reverse(p.memory_mb));
     }
     items.truncate(count);
     finalize(&mut items);
@@ -324,7 +323,7 @@ pub fn top_processes_union(cpu_count: usize, mem_count: usize) -> Vec<ProcItem> 
 
     let mut seen: HashMap<u32, ()> = HashMap::with_capacity(idx_cpu.len() + idx_mem.len());
     let mut picked: Vec<usize> = Vec::with_capacity(idx_cpu.len() + idx_mem.len());
-    for i in idx_cpu.into_iter().chain(idx_mem.into_iter()) {
+    for i in idx_cpu.into_iter().chain(idx_mem) {
         if seen.insert(items[i].pid, ()).is_none() {
             picked.push(i);
         }
@@ -348,7 +347,9 @@ fn collect_light() -> Vec<ProcItem> {
                 pid,
                 memory_mb: super::process::memory_mb(pid).unwrap_or(0),
                 threads,
-                cpu_seconds: process_cpu_split(pid).map(|(total, _, _)| total).unwrap_or(0.0),
+                cpu_seconds: process_cpu_split(pid)
+                    .map(|(total, _, _)| total)
+                    .unwrap_or(0.0),
                 cpu_percent: 0.0,
                 user: String::new(),
                 exe: String::new(),
@@ -386,7 +387,9 @@ fn collect_light() -> Vec<ProcItem> {
                     continue;
                 };
                 let Some(open) = stat.find('(') else { continue };
-                let Some(close) = stat.rfind(')') else { continue };
+                let Some(close) = stat.rfind(')') else {
+                    continue;
+                };
                 let name = stat[open + 1..close].to_string();
                 let rest: Vec<&str> = stat[close + 1..].split_whitespace().collect();
                 let utime: u64 = rest.get(11).and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -494,8 +497,11 @@ fn finalize(items: &mut [ProcItem]) {
 /// 端口快照有效期：面板 3 秒刷新一次，2 秒内复用刚扫过的结果。
 const PORTS_TTL: Duration = Duration::from_secs(2);
 
-/// 上一次端口快照 `(采样时间, 已扫描的 pid 列表（升序）, pid → 端口)`。
-static PORTS_CACHE: Mutex<Option<(Instant, Vec<u32>, HashMap<u32, Vec<u16>>)>> = Mutex::new(None);
+/// 端口快照缓存槽：`(采样时间, 已扫描的 pid 列表（升序）, pid → 端口)`。
+type PortsCacheSlot = Option<(Instant, Vec<u32>, HashMap<u32, Vec<u16>>)>;
+
+/// 上一次端口快照。
+static PORTS_CACHE: Mutex<PortsCacheSlot> = Mutex::new(None);
 
 /// 指定这批进程的 TCP 监听端口（升序去重）。**只扫传入的 pid**，不遍历全系统。
 ///
@@ -517,9 +523,7 @@ pub fn listen_ports_many(pids: &[u32]) -> HashMap<u32, Vec<u16>> {
     {
         let slot = PORTS_CACHE.lock().unwrap();
         if let Some((at, scanned, map)) = slot.as_ref() {
-            if at.elapsed() < PORTS_TTL
-                && wanted.iter().all(|p| scanned.binary_search(p).is_ok())
-            {
+            if at.elapsed() < PORTS_TTL && wanted.iter().all(|p| scanned.binary_search(p).is_ok()) {
                 return map.clone();
             }
         }
@@ -564,7 +568,9 @@ fn process_tree(pid: u32) -> Vec<u32> {
             let Ok(stat) = std::fs::read_to_string(format!("/proc/{p}/stat")) else {
                 continue;
             };
-            let Some(close) = stat.rfind(')') else { continue };
+            let Some(close) = stat.rfind(')') else {
+                continue;
+            };
             let rest: Vec<&str> = stat[close + 1..].split_whitespace().collect();
             if let Some(ppid) = rest.get(1).and_then(|v| v.parse::<u32>().ok()) {
                 children.entry(ppid).or_default().push(p);
@@ -634,7 +640,9 @@ fn listen_ports_many_impl(pids: &[u32]) -> HashMap<u32, Vec<u16>> {
             let Ok(target) = std::fs::read_link(fd.path()) else {
                 continue;
             };
-            let Some(text) = target.to_str() else { continue };
+            let Some(text) = target.to_str() else {
+                continue;
+            };
             let Some(inode) = text
                 .strip_prefix("socket:[")
                 .and_then(|v| v.strip_suffix(']'))
@@ -951,7 +959,6 @@ fn clock_ticks() -> i64 {
     })
 }
 
-
 /// 系统 TCP 连接计数（已建立 / TIME_WAIT / CLOSE_WAIT）。
 pub fn tcp_counts() -> (u32, u32, u32) {
     #[cfg(windows)]
@@ -1142,7 +1149,11 @@ mod process_cpu_meter_tests {
     fn process_cpu_percent_clamps_to_range() {
         assert_eq!(process_cpu_percent(0.5, 1.0, 4), 12.5);
         assert_eq!(process_cpu_percent(-1.0, 1.0, 4), 0.0);
-        assert_eq!(process_cpu_percent(100.0, 1.0, 4), 100.0, "整机口径钳制到 100");
+        assert_eq!(
+            process_cpu_percent(100.0, 1.0, 4),
+            100.0,
+            "整机口径钳制到 100"
+        );
         assert_eq!(process_cpu_percent(0.5, 0.0, 4), 0.0, "零窗口返回 0");
         assert_eq!(process_cpu_percent(0.5, 1.0, 0), 0.0, "零核数返回 0");
     }
@@ -1155,7 +1166,7 @@ mod process_cpu_meter_tests {
         let t = std::time::Instant::now();
         while t.elapsed().as_millis() < 60 {}
         let rate = meter.sample().expect("次帧应有值");
-        assert!(rate >= 0.0 && rate <= 100.0, "{rate}");
+        assert!((0.0..=100.0).contains(&rate), "{rate}");
     }
 
     #[test]
@@ -1163,7 +1174,7 @@ mod process_cpu_meter_tests {
         let meter = ProcessCpuMeter::new();
         let start = std::time::Instant::now();
         let rate = meter.sample_since(start);
-        assert!(rate >= 0.0 && rate <= 100.0, "{rate}");
+        assert!((0.0..=100.0).contains(&rate), "{rate}");
     }
 }
 
@@ -1184,8 +1195,17 @@ pub fn process_cpu_split(pid: u32) -> Option<(f64, f64, f64)> {
         if h.is_null() {
             return None;
         }
-        let (mut creation, mut exit, mut kernel, mut user): (FILETIME, FILETIME, FILETIME, FILETIME) =
-            (std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed());
+        let (mut creation, mut exit, mut kernel, mut user): (
+            FILETIME,
+            FILETIME,
+            FILETIME,
+            FILETIME,
+        ) = (
+            std::mem::zeroed(),
+            std::mem::zeroed(),
+            std::mem::zeroed(),
+            std::mem::zeroed(),
+        );
         let ok = GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user);
         CloseHandle(h);
         if ok == 0 {
@@ -1222,7 +1242,7 @@ fn for_each_process(mut f: impl FnMut(&str, u32, u32)) {
     use std::mem::zeroed;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
 
@@ -1382,7 +1402,11 @@ pub fn disk_io() -> Option<DiskIo> {
             }
         }
 
-        if available { Some(io) } else { None }
+        if available {
+            Some(io)
+        } else {
+            None
+        }
     }
 
     #[cfg(not(any(target_os = "linux", windows)))]
@@ -1472,7 +1496,8 @@ mod tests {
     }
 
     #[test]
-    fn listen_ports_many_only_reports_requested_pids() {        // 空列表不做事；只返回请求过的 pid（保护「不遍历全系统」的约束）
+    fn listen_ports_many_only_reports_requested_pids() {
+        // 空列表不做事；只返回请求过的 pid（保护「不遍历全系统」的约束）
         assert!(listen_ports_many(&[]).is_empty());
         let map = listen_ports_many(&[std::process::id()]);
         assert!(

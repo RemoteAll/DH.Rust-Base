@@ -136,7 +136,13 @@ fn reply_json(reply: &ApiReply) -> String {
         push_kv(&mut s, &mut first, "Message", &reply.message, false);
     }
     if !reply.service_name.is_empty() {
-        push_kv(&mut s, &mut first, "ServiceName", &reply.service_name, false);
+        push_kv(
+            &mut s,
+            &mut first,
+            "ServiceName",
+            &reply.service_name,
+            false,
+        );
     }
 
     s.push('}');
@@ -314,8 +320,9 @@ pub fn invoke(
                 // 非预期报文（其他会话/半包）：忽略并继续等待
                 last_err = "收到非预期报文".to_string();
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut =>
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 last_err = "等待响应超时".to_string();
             }
@@ -343,17 +350,36 @@ pub fn restart_service(
     service_name: &str,
     timeout: Duration,
 ) -> Result<ApiReply, String> {
-    invoke(addr, "RestartService", Some(&service_args(service_name)), timeout)
+    invoke(
+        addr,
+        "RestartService",
+        Some(&service_args(service_name)),
+        timeout,
+    )
 }
 
 /// 停止服务（对齐 C# `StopService`；调用方按 C# 语义可忽略失败）。
 pub fn stop_service(addr: &str, service_name: &str, timeout: Duration) -> Result<ApiReply, String> {
-    invoke(addr, "StopService", Some(&service_args(service_name)), timeout)
+    invoke(
+        addr,
+        "StopService",
+        Some(&service_args(service_name)),
+        timeout,
+    )
 }
 
 /// 启动服务（对齐 C# `StartService`；调用方按 C# 语义可忽略失败）。
-pub fn start_service(addr: &str, service_name: &str, timeout: Duration) -> Result<ApiReply, String> {
-    invoke(addr, "StartService", Some(&service_args(service_name)), timeout)
+pub fn start_service(
+    addr: &str,
+    service_name: &str,
+    timeout: Duration,
+) -> Result<ApiReply, String> {
+    invoke(
+        addr,
+        "StartService",
+        Some(&service_args(service_name)),
+        timeout,
+    )
 }
 
 // ————— 服务端 —————
@@ -573,37 +599,36 @@ mod tests {
         let server = std::thread::spawn({
             let addr = addr.clone();
             move || {
-                serve_udp_until(
-                    &addr,
-                    true,
-                    &flag,
-                    |action, args| match action {
-                        "RestartService" => {
-                            let name = args
-                                .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok())
-                                .and_then(|v| v.get("serviceName").and_then(|x| x.as_str()).map(|s| s.to_string()))
-                                .unwrap_or_default();
-                            if name == "demo" {
-                                ApiReply {
-                                    success: true,
-                                    message: "服务重启成功".to_string(),
-                                    service_name: name,
-                                }
-                            } else {
-                                ApiReply {
-                                    success: false,
-                                    message: "服务不存在".to_string(),
-                                    service_name: name,
-                                }
+                serve_udp_until(&addr, true, &flag, |action, args| match action {
+                    "RestartService" => {
+                        let name = args
+                            .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok())
+                            .and_then(|v| {
+                                v.get("serviceName")
+                                    .and_then(|x| x.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .unwrap_or_default();
+                        if name == "demo" {
+                            ApiReply {
+                                success: true,
+                                message: "服务重启成功".to_string(),
+                                service_name: name,
+                            }
+                        } else {
+                            ApiReply {
+                                success: false,
+                                message: "服务不存在".to_string(),
+                                service_name: name,
                             }
                         }
-                        _ => ApiReply {
-                            success: false,
-                            message: format!("不支持的动作：{action}"),
-                            service_name: String::new(),
-                        },
+                    }
+                    _ => ApiReply {
+                        success: false,
+                        message: format!("不支持的动作：{action}"),
+                        service_name: String::new(),
                     },
-                )
+                })
                 .unwrap();
             }
         });

@@ -374,8 +374,14 @@ mod tests {
         assert_eq!(parse_bearer(None), None);
         assert_eq!(parse_bearer(Some("Basic abc")), None);
         assert_eq!(parse_bearer(Some("Bearer ")), None);
-        assert_eq!(parse_bearer(Some("bearer t-123 ")), Some("t-123".to_string()));
-        assert_eq!(parse_bearer(Some("Bearer t-123")), Some("t-123".to_string()));
+        assert_eq!(
+            parse_bearer(Some("bearer t-123 ")),
+            Some("t-123".to_string())
+        );
+        assert_eq!(
+            parse_bearer(Some("Bearer t-123")),
+            Some("t-123".to_string())
+        );
     }
 
     #[test]

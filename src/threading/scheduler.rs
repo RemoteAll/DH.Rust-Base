@@ -1172,7 +1172,10 @@ mod tests {
         );
         // 池非空 = 存在空闲执行线程等待复用（复用失效时为每 tick 新建且立即退出）
         assert!(
-            wait_until(|| !scheduler.inner.async_idle.lock().expect("pool").is_empty(), 2000),
+            wait_until(
+                || !scheduler.inner.async_idle.lock().expect("pool").is_empty(),
+                2000
+            ),
             "空闲异步执行线程应被复用（池为空说明仍按 tick 新建线程）"
         );
         // 多次触发只应留下极少的空闲线程（复用而非线性增长）

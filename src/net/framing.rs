@@ -359,7 +359,10 @@ impl FrameDecoder {
 pub fn trim_control(data: &[u8]) -> &[u8] {
     let is_ctrl = |b: u8| b < 0x20 || b == 0x7F;
     let start = data.iter().position(|&b| !is_ctrl(b)).unwrap_or(data.len());
-    let end = data.iter().rposition(|&b| !is_ctrl(b)).map_or(start, |i| i + 1);
+    let end = data
+        .iter()
+        .rposition(|&b| !is_ctrl(b))
+        .map_or(start, |i| i + 1);
     &data[start..end]
 }
 
@@ -493,7 +496,10 @@ mod tests {
         assert_eq!("CRLF".parse::<Terminator>().unwrap(), Terminator::CrLf);
         assert_eq!("lf".parse::<Terminator>().unwrap(), Terminator::Lf);
         assert_eq!("ETX".parse::<Terminator>().unwrap(), Terminator::Etx);
-        assert_eq!("HEX:0d".parse::<Terminator>().unwrap(), Terminator::Byte(0x0D));
+        assert_eq!(
+            "HEX:0d".parse::<Terminator>().unwrap(),
+            Terminator::Byte(0x0D)
+        );
         assert!("XYZ".parse::<Terminator>().is_err());
         assert_eq!(Terminator::Byte(0x7C).to_string(), "HEX:7C");
     }
@@ -587,7 +593,9 @@ mod tests {
         let mut out = vec![];
         d.feed(b"heartbeatheartbeat", &mut out);
         assert_eq!(
-            out.iter().filter(|e| matches!(e, FrameEvent::Keepalive)).count(),
+            out.iter()
+                .filter(|e| matches!(e, FrameEvent::Keepalive))
+                .count(),
             2,
             "每个完整保活串应上报一次事件：{out:?}"
         );
@@ -604,7 +612,11 @@ mod tests {
         assert_eq!(d.pure_keepalives(b"yheartbeat"), None);
 
         let plain = FrameDecoder::new(&FrameOptions::default());
-        assert_eq!(plain.pure_keepalives(b"heartbeat"), None, "未配置保活串时不应识别");
+        assert_eq!(
+            plain.pure_keepalives(b"heartbeat"),
+            None,
+            "未配置保活串时不应识别"
+        );
     }
 
     #[test]

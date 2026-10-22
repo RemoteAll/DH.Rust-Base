@@ -46,11 +46,7 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
         match p[0] {
             '*' => (0..=t.len()).any(|i| matches(&p[1..], &t[i..])),
             '?' => !t.is_empty() && matches(&p[1..], &t[1..]),
-            c => {
-                !t.is_empty()
-                    && c.eq_ignore_ascii_case(&t[0])
-                    && matches(&p[1..], &t[1..])
-            }
+            c => !t.is_empty() && c.eq_ignore_ascii_case(&t[0]) && matches(&p[1..], &t[1..]),
         }
     }
 
@@ -250,9 +246,9 @@ mod tests {
 
         // latest 场景：移除 a.log（'a' 的字母序大于日期文件名，避免干扰比较）
         fs::remove_file(&file).unwrap();
-        write_all_text_atomic(&dir.join("2026_10_01.log"), "x").unwrap();
-        write_all_text_atomic(&dir.join("2026_10_02.log"), "y").unwrap();
-        write_all_text_atomic(&dir.join("readme.txt"), "z").unwrap();
+        write_all_text_atomic(dir.join("2026_10_01.log"), "x").unwrap();
+        write_all_text_atomic(dir.join("2026_10_02.log"), "y").unwrap();
+        write_all_text_atomic(dir.join("readme.txt"), "z").unwrap();
         let latest = latest_file_by_ext(&dir, ".log").unwrap();
         assert!(latest.ends_with("2026_10_02.log"), "{latest:?}");
 

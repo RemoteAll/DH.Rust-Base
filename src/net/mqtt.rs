@@ -308,7 +308,10 @@ async fn supervisor(
                 shared.set(false, format!("{}:{} 连接已断开", opts.host, opts.port));
             }
             Err(e) => {
-                shared.set(false, format!("{}:{} 连接失败（{e}）", opts.host, opts.port));
+                shared.set(
+                    false,
+                    format!("{}:{} 连接失败（{e}）", opts.host, opts.port),
+                );
             }
         }
 
@@ -356,9 +359,11 @@ async fn connect_and_handshake(opts: &MqttOptions) -> Result<TcpStream, String> 
         .map_err(|_| "等待 CONNACK 超时".to_string())?
         .map_err(|e| format!("读取 CONNACK 失败：{e}"))?;
 
-    if codec::packet_type(first) != codec::CONNACK
-    {
-        return Err(format!("握手响应异常（报文类型 {}）", codec::packet_type(first)));
+    if codec::packet_type(first) != codec::CONNACK {
+        return Err(format!(
+            "握手响应异常（报文类型 {}）",
+            codec::packet_type(first)
+        ));
     }
     let code = data.get(1).copied().unwrap_or(0xFF);
     if code != 0 {
@@ -394,7 +399,11 @@ async fn session(
     // 连接（或重连）成功：全量恢复订阅（服务端 Clean Session 不保留订阅关系）
     for (topic, qos) in subs.iter() {
         let id = next_packet_id();
-        if wr.write_all(&codec::encode_subscribe(id, topic, *qos, opts.version)).await.is_err() {
+        if wr
+            .write_all(&codec::encode_subscribe(id, topic, *qos, opts.version))
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -514,7 +523,11 @@ async fn next_ping(ping: &mut Option<tokio::time::Interval>) {
 fn next_packet_id() -> u16 {
     static NEXT: AtomicU16 = AtomicU16::new(1);
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    if id == 0 { 1 } else { id }
+    if id == 0 {
+        1
+    } else {
+        id
+    }
 }
 
 /// MQTT 3.1.1 报文编解码（纯函数，便于单测）。
@@ -749,7 +762,9 @@ pub(crate) mod codec {
     }
 
     /// 读取一个完整报文：返回 `(固定头首字节, 正文)`。
-    pub async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(u8, Vec<u8>), String> {
+    pub async fn read_packet<R: AsyncRead + Unpin>(
+        reader: &mut R,
+    ) -> Result<(u8, Vec<u8>), String> {
         let mut first = [0u8; 1];
         reader
             .read_exact(&mut first)
@@ -862,18 +877,13 @@ mod tests {
         let packet = codec::encode_connect(&opts);
         let expected: Vec<u8> = [
             // 固定头：CONNECT + 剩余长度 21
-            0x10, 0x15,
-            // 协议名 "MQTT"
+            0x10, 0x15, // 协议名 "MQTT"
             0x00, 0x04, b'M', b'Q', b'T', b'T',
             // 版本 4 + flags（clean=1、user=1、pass=1）
-            0x04, 0xC2,
-            // keepalive 60
-            0x00, 0x3C,
-            // client id "abc"
-            0x00, 0x03, b'a', b'b', b'c',
-            // username "u"
-            0x00, 0x01, b'u',
-            // password "p"
+            0x04, 0xC2, // keepalive 60
+            0x00, 0x3C, // client id "abc"
+            0x00, 0x03, b'a', b'b', b'c', // username "u"
+            0x00, 0x01, b'u', // password "p"
             0x00, 0x01, b'p',
         ]
         .to_vec();
@@ -981,7 +991,11 @@ mod tests {
         });
 
         let client = MqttClient::spawn(test_opts(port));
-        assert!(wait_connected(&client, Duration::from_secs(5)).await, "首连失败：{}", client.status());
+        assert!(
+            wait_connected(&client, Duration::from_secs(5)).await,
+            "首连失败：{}",
+            client.status()
+        );
 
         client
             .publish("WFSCAN", b"{\"sn\":\"x\"}", 1, Duration::from_secs(3))
@@ -1010,7 +1024,11 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(!client.is_connected());
-        assert!(client.status().contains("连接失败"), "状态：{}", client.status());
+        assert!(
+            client.status().contains("连接失败"),
+            "状态：{}",
+            client.status()
+        );
 
         let err = client
             .publish("t", b"x", 1, Duration::from_secs(1))
@@ -1080,9 +1098,18 @@ mod tests {
         );
 
         // 回执报文
-        assert_eq!(codec::encode_ack(codec::PUBACK, 9), vec![0x40, 0x02, 0x00, 0x09]);
-        assert_eq!(codec::encode_ack(codec::PUBREC, 9), vec![0x50, 0x02, 0x00, 0x09]);
-        assert_eq!(codec::encode_ack(codec::PUBCOMP, 9), vec![0x70, 0x02, 0x00, 0x09]);
+        assert_eq!(
+            codec::encode_ack(codec::PUBACK, 9),
+            vec![0x40, 0x02, 0x00, 0x09]
+        );
+        assert_eq!(
+            codec::encode_ack(codec::PUBREC, 9),
+            vec![0x50, 0x02, 0x00, 0x09]
+        );
+        assert_eq!(
+            codec::encode_ack(codec::PUBCOMP, 9),
+            vec![0x70, 0x02, 0x00, 0x09]
+        );
     }
 
     #[test]
@@ -1155,7 +1182,11 @@ mod tests {
 
         let client = MqttClient::spawn(test_opts(port));
         let mut rx = client.message_receiver();
-        assert!(wait_connected(&client, Duration::from_secs(5)).await, "首连失败：{}", client.status());
+        assert!(
+            wait_connected(&client, Duration::from_secs(5)).await,
+            "首连失败：{}",
+            client.status()
+        );
         client.subscribe("t", 1).unwrap();
 
         let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())

@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::net::http_client::{self, HttpClientOptions};
 
@@ -226,7 +226,10 @@ mod tests {
         assert_eq!(text["msgtype"], "text");
         assert_eq!(text["text"]["content"], "hello");
         assert_eq!(text["text"]["mentioned_list"][0], "@all");
-        assert!(text["text"].get("mentioned_mobile_list").is_none(), "空列表不输出");
+        assert!(
+            text["text"].get("mentioned_mobile_list").is_none(),
+            "空列表不输出"
+        );
 
         let markdown = markdown_payload("**加粗**");
         assert_eq!(markdown["msgtype"], "markdown");
@@ -242,7 +245,8 @@ mod tests {
         let ok = parse_response(r#"{"errcode":0,"errmsg":"ok"}"#).unwrap();
         assert_eq!(ok.errcode, 0);
 
-        let err = parse_response(r#"{"errcode":93000,"errmsg":"invalid webhook url"}"#).unwrap_err();
+        let err =
+            parse_response(r#"{"errcode":93000,"errmsg":"invalid webhook url"}"#).unwrap_err();
         assert!(err.to_string().contains("93000"), "{err}");
         assert!(err.to_string().contains("invalid webhook url"), "{err}");
 
@@ -262,7 +266,9 @@ mod tests {
 
     /// 启动单连接 HTTP 桩：返回（端口, 收到的请求体）；按给定响应体回 200。
     async fn stub_once(response_body: &'static str) -> (u16, Arc<Mutex<String>>) {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let port = listener.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(String::new()));
         let got = received.clone();
@@ -293,7 +299,9 @@ mod tests {
                     let mut it = l.splitn(2, ':');
                     let name = it.next()?.trim().to_ascii_lowercase();
                     let value = it.next()?.trim();
-                    (name == "content-length").then(|| value.parse::<usize>().ok()).flatten()
+                    (name == "content-length")
+                        .then(|| value.parse::<usize>().ok())
+                        .flatten()
                 })
                 .unwrap_or(0);
             while buf.len() < header_end + len {
@@ -321,7 +329,10 @@ mod tests {
     async fn send_markdown_v2_against_local_stub() {
         let (port, received) = stub_once(r#"{"errcode":0,"errmsg":"ok"}"#).await;
         let bot = WeComBot::new(format!("http://127.0.0.1:{port}/send"));
-        let result = bot.send_markdown_v2("# 测试标题\n条码 SD26145916").await.unwrap();
+        let result = bot
+            .send_markdown_v2("# 测试标题\n条码 SD26145916")
+            .await
+            .unwrap();
         assert_eq!(result.errcode, 0);
 
         let body = received.lock().unwrap().clone();
@@ -332,7 +343,8 @@ mod tests {
 
     #[tokio::test]
     async fn business_error_is_surfaced() {
-        let (port, _received) = stub_once(r#"{"errcode":93000,"errmsg":"invalid webhook url"}"#).await;
+        let (port, _received) =
+            stub_once(r#"{"errcode":93000,"errmsg":"invalid webhook url"}"#).await;
         let bot = WeComBot::new(format!("http://127.0.0.1:{port}/send"));
         let err = bot.send_markdown("hi").await.unwrap_err();
         assert!(err.to_string().contains("93000"), "{err}");

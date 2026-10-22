@@ -222,10 +222,7 @@ impl LogOptions {
 
     /// 过滤判定：启用 且 级别达标（`level >= 阈值`；`All`/`Off` 作为记录级别时不输出）
     pub fn should_log(&self, level: LogLevel) -> bool {
-        self.enabled()
-            && level >= self.level()
-            && level != LogLevel::All
-            && level != LogLevel::Off
+        self.enabled() && level >= self.level() && level != LogLevel::All && level != LogLevel::Off
     }
 }
 
@@ -417,7 +414,12 @@ mod tests {
         // 形如 12:34:56.789 01 N - 磁盘空间不足（列序对齐 DH.NCore 默认 LogLineFormat）
         let parts: Vec<&str> = line.text.split(' ').collect();
         assert!(parts.len() >= 5, "列数不足: {}", line.text);
-        assert_eq!(parts[0].len(), 12, "时间列应形如 HH:mm:ss.fff: {}", line.text);
+        assert_eq!(
+            parts[0].len(),
+            12,
+            "时间列应形如 HH:mm:ss.fff: {}",
+            line.text
+        );
         assert_eq!(parts[1].len(), 2, "线程ID列应为两位: {}", line.text);
         assert!(matches!(parts[2], "N" | "Y" | "W"), "类型列: {}", line.text);
         assert!(!parts[3].is_empty(), "名称列: {}", line.text);

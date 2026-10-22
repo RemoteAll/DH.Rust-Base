@@ -39,7 +39,11 @@ pub struct OpenAiOptions {
 
 impl OpenAiOptions {
     /// 便捷构造（默认温度 0.3、超时 300s）。
-    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>, model: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             api_key: api_key.into(),

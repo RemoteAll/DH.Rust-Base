@@ -211,9 +211,7 @@ pub fn read_manifest_at(
             fallback_id
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    "无法确定插件 id：plugin.json 缺 id 字段且无回退名".to_string()
-                })?
+                .ok_or_else(|| "无法确定插件 id：plugin.json 缺 id 字段且无回退名".to_string())?
                 .to_string()
         } else {
             v
@@ -233,8 +231,8 @@ pub fn read_installed_manifest(dir: &Path, id: &str) -> Result<Manifest, String>
 
 /// 读取 `plugin.json`（须存在且为 JSON 对象）。
 fn read_manifest_json(dir: &Path) -> Result<Json, String> {
-    let text = fs::read_to_string(dir.join("plugin.json"))
-        .map_err(|_| "缺少 plugin.json".to_string())?;
+    let text =
+        fs::read_to_string(dir.join("plugin.json")).map_err(|_| "缺少 plugin.json".to_string())?;
     let man: Json =
         serde_json::from_str(&text).map_err(|e| format!("plugin.json 解析失败：{e}"))?;
     if !man.is_object() {
@@ -339,8 +337,8 @@ pub fn signing_key_from_hex(hex_text: &str) -> Result<SigningKey, String> {
 
 /// 读取私钥文件（hex seed；文本可为多行，取修剪后内容）。
 pub fn signing_key_from_file(path: &Path) -> Result<SigningKey, String> {
-    let text = fs::read_to_string(path)
-        .map_err(|e| format!("读取私钥失败（{}）：{e}", path.display()))?;
+    let text =
+        fs::read_to_string(path).map_err(|e| format!("读取私钥失败（{}）：{e}", path.display()))?;
     signing_key_from_hex(&text)
 }
 
@@ -435,7 +433,11 @@ impl CatalogEntry {
         }
         let name = {
             let n = field("name");
-            if n.is_empty() { id.clone() } else { n }
+            if n.is_empty() {
+                id.clone()
+            } else {
+                n
+            }
         };
         let icon = {
             let i = field("icon");
@@ -616,10 +618,7 @@ mod tests {
 
     #[test]
     fn inspect_version_policy() {
-        let zip = build_zip(&[
-            ("p/plugin.json", r#"{"id":"p"}"#),
-            ("p/index.html", "x"),
-        ]);
+        let zip = build_zip(&[("p/plugin.json", r#"{"id":"p"}"#), ("p/index.html", "x")]);
         // 平台要求 version 必填
         let strict = InspectOptions {
             require_version: true,
@@ -629,7 +628,12 @@ mod tests {
             .unwrap_err()
             .contains("version"));
         // Agent 模式可空
-        assert_eq!(inspect_package(&zip, &InspectOptions::default()).unwrap().version, "");
+        assert_eq!(
+            inspect_package(&zip, &InspectOptions::default())
+                .unwrap()
+                .version,
+            ""
+        );
         // 版本号含非法字符 → 拒绝
         let bad = build_zip(&[
             ("p/plugin.json", r#"{"id":"p","version":"1.0 beta"}"#),
@@ -711,7 +715,10 @@ mod tests {
         let e = CatalogEntry::from_json(&item).unwrap();
         assert_eq!(e.id, "demo");
         assert_eq!(e.sha256.len(), 64);
-        assert!(e.sha256.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(e
+            .sha256
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
         let back = CatalogEntry::from_json(&e.to_json()).unwrap();
         assert_eq!(back.id, "demo");
         assert_eq!(back.url, e.url);
@@ -730,7 +737,9 @@ mod tests {
     #[test]
     fn allowed_store_url_rules() {
         assert!(is_allowed_store_url("https://example.com/catalog.json"));
-        assert!(is_allowed_store_url("http://127.0.0.1:5590/store/catalog.json"));
+        assert!(is_allowed_store_url(
+            "http://127.0.0.1:5590/store/catalog.json"
+        ));
         assert!(is_allowed_store_url("http://127.0.0.1/x"));
         assert!(!is_allowed_store_url("http://example.com/x"));
         assert!(!is_allowed_store_url("ftp://example.com/x"));

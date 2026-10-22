@@ -32,13 +32,13 @@ pub(crate) fn log_error(message: &str) {
 pub mod windows;
 
 #[cfg(target_os = "linux")]
-mod systemd;
+mod linux;
 #[cfg(target_os = "linux")]
 mod procd;
 #[cfg(target_os = "linux")]
-mod sysv;
+mod systemd;
 #[cfg(target_os = "linux")]
-mod linux;
+mod sysv;
 
 /// Linux init 探测与脚本模板（纯逻辑；测试时也编译，便于在开发机上跑单测）
 #[cfg(any(target_os = "linux", test))]
@@ -50,14 +50,14 @@ mod launchd;
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod unsupported;
 
-#[cfg(windows)]
-use windows as platform;
-#[cfg(target_os = "linux")]
-use linux as platform;
 #[cfg(target_os = "macos")]
 use launchd as platform;
+#[cfg(target_os = "linux")]
+use linux as platform;
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 use unsupported as platform;
+#[cfg(windows)]
+use windows as platform;
 
 /// 服务状态。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

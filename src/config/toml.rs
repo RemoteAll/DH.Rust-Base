@@ -47,7 +47,10 @@ pub fn unknown_keys(json: &Value, template: &Value, free_form_sections: &[&str])
 
     for (section, value) in obj {
         if let Some(inner) = value.as_object() {
-            let Some(known) = tmpl.and_then(|t| t.get(section)).and_then(|v| v.as_object()) else {
+            let Some(known) = tmpl
+                .and_then(|t| t.get(section))
+                .and_then(|v| v.as_object())
+            else {
                 // 整段无法识别（如把 [frame] 拼成 [frames]）
                 out.push(section.clone());
                 continue;
@@ -260,7 +263,9 @@ pub fn sync_array_of_tables(doc: &mut DocumentMut, name: &str, entries: &[Value]
     }
 
     for (index, entry) in entries.iter().enumerate() {
-        let Some(object) = entry.as_object() else { continue };
+        let Some(object) = entry.as_object() else {
+            continue;
+        };
 
         if index >= tables.len() {
             // 新增条目
@@ -336,8 +341,9 @@ mod tests {
     #[test]
     fn merge_backfills_with_comments_and_keeps_values() {
         let mut doc: DocumentMut = "[server]\nport = 59090\n".parse().unwrap();
-        let example: DocumentMut =
-            "[server]\n# 端口\nport = 0\n# 监听地址\nbind = \"0.0.0.0\"\n".parse().unwrap();
+        let example: DocumentMut = "[server]\n# 端口\nport = 0\n# 监听地址\nbind = \"0.0.0.0\"\n"
+            .parse()
+            .unwrap();
 
         let added = merge_missing_keys(doc.as_table_mut(), example.as_table());
         assert_eq!(added, 1, "只应补齐 bind");
@@ -371,7 +377,10 @@ mod tests {
         });
 
         let list = unknown_keys(&json, &template, &["aliases"]);
-        assert_eq!(list, vec!["frames".to_string(), "server.heartbeat".to_string()]);
+        assert_eq!(
+            list,
+            vec!["frames".to_string(), "server.heartbeat".to_string()]
+        );
     }
 
     #[test]
@@ -406,7 +415,9 @@ mod tests {
     #[test]
     fn sync_array_of_tables_keeps_comments_updates_and_appends() {
         let mut doc: DocumentMut =
-            "# 应用列表\n[[Apps]]\n# 应用A的注释\nName = \"a\"\nEnable = true\n".parse().unwrap();
+            "# 应用列表\n[[Apps]]\n# 应用A的注释\nName = \"a\"\nEnable = true\n"
+                .parse()
+                .unwrap();
 
         let entries = vec![
             serde_json::json!({ "Name": "a", "Enable": false }),
@@ -419,7 +430,10 @@ mod tests {
         assert!(text.contains("# 应用A的注释"), "段内注释应保留：\n{text}");
         assert!(text.contains("Enable = false"), "值应更新：\n{text}");
         assert!(text.contains("Name = \"b\""), "新段应追加：\n{text}");
-        assert!(text.contains("Arguments = \"\""), "null 应按空串写入：\n{text}");
+        assert!(
+            text.contains("Arguments = \"\""),
+            "null 应按空串写入：\n{text}"
+        );
 
         // 删除多余条目
         let changed = sync_array_of_tables(&mut doc, "Apps", &[serde_json::json!({ "Name": "a" })]);

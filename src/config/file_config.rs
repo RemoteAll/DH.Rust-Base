@@ -595,11 +595,17 @@ mod tests {
         }
 
         let path = temp_path("ifchanged");
-        assert!(save_if_changed(&path, demo_render).unwrap(), "缺失文件应写回");
+        assert!(
+            save_if_changed(&path, demo_render).unwrap(),
+            "缺失文件应写回"
+        );
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("<Key>v</Key>"), "{text}");
 
-        assert!(!save_if_changed(&path, demo_render).unwrap(), "无变化不应写盘");
+        assert!(
+            !save_if_changed(&path, demo_render).unwrap(),
+            "无变化不应写盘"
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
 

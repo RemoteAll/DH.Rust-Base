@@ -201,12 +201,12 @@ fn upsert_entry(text: &str, entry: &str, name: &str, eol: &str) -> Result<String
     } else {
         let mut target: Option<usize> = None;
         let mut first_svc: Option<usize> = None;
-        for i in (open_idx + 1)..close_idx {
-            if line_core(&lines[i]).contains("<ServiceInfo") {
+        for (i, line) in lines.iter().enumerate().take(close_idx).skip(open_idx + 1) {
+            if line_core(line).contains("<ServiceInfo") {
                 if first_svc.is_none() {
                     first_svc = Some(i);
                 }
-                if entry_line_matches(&lines[i], name) {
+                if entry_line_matches(line, name) {
                     target = Some(i);
                     break;
                 }
@@ -262,19 +262,27 @@ fn find_services(lines: &[String]) -> Result<(usize, usize), String> {
     let mut open_idx: Option<usize> = None;
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim_start();
-        if open_idx.is_none() {
-            if t.starts_with("<Services") {
-                open_idx = Some(i);
-                if t.contains("</Services>") {
-                    return Ok((i, i));
+        match open_idx {
+            None => {
+                if t.starts_with("<Services") {
+                    open_idx = Some(i);
+                    if t.contains("</Services>") {
+                        return Ok((i, i));
+                    }
                 }
             }
-        } else if t.starts_with("</Services") {
-            return Ok((open_idx.unwrap(), i));
+            Some(open) => {
+                if t.starts_with("</Services") {
+                    return Ok((open, i));
+                }
+            }
         }
     }
     match open_idx {
-        Some(i) => Err(format!("星尘配置第 {} 行有 <Services> 但缺少 </Services>", i + 1)),
+        Some(i) => Err(format!(
+            "星尘配置第 {} 行有 <Services> 但缺少 </Services>",
+            i + 1
+        )),
         None => Err("星尘配置中找不到 <Services> 段".to_string()),
     }
 }
@@ -322,21 +330,31 @@ mod tests {
         let two = upsert_entry(&one, &b, "DemoSvc", "\n").unwrap();
         assert_eq!(two.matches("new.exe").count(), 1);
         assert_eq!(two.matches("old.exe").count(), 0);
-        assert_eq!(two.matches("<ServiceInfo").count(), 2, "应只有 test + 服务两条：\n{two}");
+        assert_eq!(
+            two.matches("<ServiceInfo").count(),
+            2,
+            "应只有 test + 服务两条：\n{two}"
+        );
     }
 
     #[test]
     fn empty_single_line_expands() {
         let text = "<Root>\n  <Services></Services>\n</Root>";
         let out = upsert_entry(text, "ENTRY-X", "DemoSvc", "\n").unwrap();
-        assert!(out.contains("  <Services>\n    ENTRY-X\n  </Services>"), "{out}");
+        assert!(
+            out.contains("  <Services>\n    ENTRY-X\n  </Services>"),
+            "{out}"
+        );
     }
 
     #[test]
     fn empty_multiline_inserts() {
         let text = "<Root>\n  <Services>\n  </Services>\n</Root>";
         let out = upsert_entry(text, "ENTRY-X", "DemoSvc", "\n").unwrap();
-        assert!(out.contains("  <Services>\n    ENTRY-X\n  </Services>"), "{out}");
+        assert!(
+            out.contains("  <Services>\n    ENTRY-X\n  </Services>"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -391,7 +409,13 @@ mod tests {
 
     #[test]
     fn missing_services_section_fails() {
-        let err = upsert_entry("<Root>\n  <Debug>false</Debug>\n</Root>", "E", "DemoSvc", "\n").unwrap_err();
+        let err = upsert_entry(
+            "<Root>\n  <Debug>false</Debug>\n</Root>",
+            "E",
+            "DemoSvc",
+            "\n",
+        )
+        .unwrap_err();
         assert!(err.contains("找不到"), "{err}");
         let err2 = remove_entry("<Root/>", "DemoSvc").unwrap_err();
         assert!(err2.contains("找不到"), "{err2}");
@@ -399,16 +423,18 @@ mod tests {
 
     #[test]
     fn render_entry_fixed_shadow_rule_and_escaping() {
-        let e = render_entry(
-            &spec(),
-            Path::new(r"C:\a&b\demo.exe"),
-            Path::new(r"C:\a&b"),
-        );
+        let e = render_entry(&spec(), Path::new(r"C:\a&b\demo.exe"), Path::new(r"C:\a&b"));
         assert!(e.contains("Name=\"DemoSvc\""));
         assert!(e.contains("FileName=\"C:\\a&amp;b\\demo.exe\""));
         assert!(e.contains("Mode=\"11\""), "固定影子模式");
-        assert!(e.contains("Environments=\"DEMO_BASE=C:\\a&amp;b\""), "固定注入数据目录环境变量");
-        assert!(e.contains("ReloadOnChange=\"true\""), "固定文件变动自动重启");
+        assert!(
+            e.contains("Environments=\"DEMO_BASE=C:\\a&amp;b\""),
+            "固定注入数据目录环境变量"
+        );
+        assert!(
+            e.contains("ReloadOnChange=\"true\""),
+            "固定文件变动自动重启"
+        );
         assert!(e.contains("HealthCheck=\"\""), "未配置健康检查时为空串");
     }
 

@@ -547,7 +547,9 @@ fn name_of(e: &quick_xml::events::BytesStart<'_>) -> String {
 /// 文本的根结束标签（最后一个 `</`）之前是否缺换行（存在 `...</Key></Root>` 粘接格式）。
 fn needs_trailing_newline(text: &str) -> bool {
     match text.rfind("</") {
-        Some(i) => !text[..i].trim_end_matches([' ', '\t', '\r']).ends_with('\n'),
+        Some(i) => !text[..i]
+            .trim_end_matches([' ', '\t', '\r'])
+            .ends_with('\n'),
         None => false,
     }
 }
@@ -648,7 +650,8 @@ mod tests {
     #[test]
     fn read_to_json_strips_utf8_bom() {
         // C# XmlSerializer 保存的文件带 UTF-8 BOM；读取与重写时都应剥离
-        let text = "\u{feff}<?xml version=\"1.0\"?>\n<StarAgent><LocalPort>5500</LocalPort></StarAgent>";
+        let text =
+            "\u{feff}<?xml version=\"1.0\"?>\n<StarAgent><LocalPort>5500</LocalPort></StarAgent>";
         let json = read_to_json(text).unwrap();
         assert_eq!(json["StarAgent"]["LocalPort"], "5500");
 
@@ -684,7 +687,10 @@ mod tests {
         let out = upsert_root_values(text, &items).unwrap();
         assert!(out.contains("<Debug>false</Debug>"), "{out}");
         assert!(out.contains("<LocalPort>5600</LocalPort>"), "{out}");
-        assert!(out.contains("<!--调试开关。默认true-->"), "原注释应保留: {out}");
+        assert!(
+            out.contains("<!--调试开关。默认true-->"),
+            "原注释应保留: {out}"
+        );
         assert!(out.contains("<!--面板用户名-->"), "插入应带注释: {out}");
         assert!(out.contains("<WebUserName>admin</WebUserName>"), "{out}");
         assert!(!out.contains("<Debug>true</Debug>"), "旧值应被替换: {out}");
@@ -697,7 +703,8 @@ mod tests {
     #[test]
     fn upsert_root_values_clears_text_with_empty_value() {
         // 空值应清空元素文本（支持“清空字段”保存，如 WebLogs/PortTrafficPorts）
-        let text = "<StarAgent>\n  <WebLogs>demo=/tmp/a.log</WebLogs>\n  <Server>x</Server>\n</StarAgent>";
+        let text =
+            "<StarAgent>\n  <WebLogs>demo=/tmp/a.log</WebLogs>\n  <Server>x</Server>\n</StarAgent>";
         let items = vec![
             ("WebLogs".to_string(), String::new(), String::new()),
             ("Server".to_string(), "y".to_string(), String::new()),
@@ -744,7 +751,10 @@ mod tests {
         let text = "<StarAgent>\n  <A>1</A>\n</StarAgent>";
         let inner = "    <ServiceInfo Name=\"a\" />\n";
         let out = replace_root_section(text, "Services", inner).unwrap();
-        assert!(out.contains("</Services>\n</StarAgent>"), "插入节应补换行: {out}");
+        assert!(
+            out.contains("</Services>\n</StarAgent>"),
+            "插入节应补换行: {out}"
+        );
         assert!(!out.contains("</Services></StarAgent>"), "不应粘接: {out}");
 
         // 幂等：插入后再执行（走整段替换路径）输出字节一致
@@ -772,6 +782,9 @@ mod tests {
 
         // 空 inner：输出空元素
         let out = replace_root_section(text, "Services", "").unwrap();
-        assert!(out.contains("<Services></Services>"), "空节应为空元素: {out}");
+        assert!(
+            out.contains("<Services></Services>"),
+            "空节应为空元素: {out}"
+        );
     }
 }

@@ -1240,7 +1240,9 @@ async fn connect_handshake(url: &str) -> Result<PrefixedStream<ConnStream>, WsEr
             }
             format!("：{s}")
         };
-        return Err(WsError::Handshake(format!("升级失败: {status_line}{detail}")));
+        return Err(WsError::Handshake(format!(
+            "升级失败: {status_line}{detail}"
+        )));
     }
     let expect = ws_accept(&key);
     let mut accept_ok = false;

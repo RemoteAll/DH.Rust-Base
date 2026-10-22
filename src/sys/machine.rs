@@ -23,7 +23,7 @@ fn detect_machine_guid() -> Option<String> {
     {
         use windows_sys::Win32::Foundation::NO_ERROR;
         use windows_sys::Win32::System::Registry::{
-            HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
+            RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
         };
 
         fn wide(text: &str) -> Vec<u16> {
@@ -189,7 +189,7 @@ pub fn set_system_time(epoch_ms: i64) -> Result<(), String> {
             let looked_up =
                 LookupPrivilegeValueW(std::ptr::null(), privilege.as_ptr(), &mut luid) != 0;
 
-            let mut state = TOKEN_PRIVILEGES {
+            let state = TOKEN_PRIVILEGES {
                 PrivilegeCount: 1,
                 Privileges: [windows_sys::Win32::Security::LUID_AND_ATTRIBUTES {
                     Luid: luid,
@@ -200,7 +200,7 @@ pub fn set_system_time(epoch_ms: i64) -> Result<(), String> {
                 && AdjustTokenPrivileges(
                     token,
                     0,
-                    &mut state,
+                    &state,
                     0,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
@@ -373,7 +373,7 @@ fn detect_cpu_model() -> Option<String> {
     {
         use windows_sys::Win32::Foundation::NO_ERROR;
         use windows_sys::Win32::System::Registry::{
-            HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
+            RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
         };
 
         fn wide(text: &str) -> Vec<u16> {
@@ -596,7 +596,7 @@ pub fn network_interfaces() -> Vec<NetInterface> {
     {
         use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
         use windows_sys::Win32::NetworkManagement::IpHelper::{
-            FreeMibTable, GAA_FLAG_INCLUDE_GATEWAYS, GetAdaptersAddresses, GetIfTable2,
+            FreeMibTable, GetAdaptersAddresses, GetIfTable2, GAA_FLAG_INCLUDE_GATEWAYS,
             IP_ADAPTER_ADDRESSES_LH, MIB_IF_TABLE2,
         };
         use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC, SOCKADDR, SOCKADDR_IN};
@@ -640,8 +640,16 @@ pub fn network_interfaces() -> Vec<NetInterface> {
                         continue;
                     }
                     // 计数器不可用时为 u64::MAX
-                    let rx = if row.InOctets == u64::MAX { 0 } else { row.InOctets };
-                    let tx = if row.OutOctets == u64::MAX { 0 } else { row.OutOctets };
+                    let rx = if row.InOctets == u64::MAX {
+                        0
+                    } else {
+                        row.InOctets
+                    };
+                    let tx = if row.OutOctets == u64::MAX {
+                        0
+                    } else {
+                        row.OutOctets
+                    };
                     luid_stats.push((row.InterfaceLuid.Value, rx, tx));
                 }
                 FreeMibTable(table as *const _);
@@ -871,7 +879,11 @@ pub fn disks() -> Vec<DiskItem> {
                 name: root,
                 kind: kind.to_string(),
                 format: if ok { utf16z(&fs_buf) } else { String::new() },
-                label: if ok { utf16z(&label_buf) } else { String::new() },
+                label: if ok {
+                    utf16z(&label_buf)
+                } else {
+                    String::new()
+                },
                 total: if got { total } else { 0 },
                 free: if got { free } else { 0 },
                 ready: ok,
@@ -969,7 +981,10 @@ Shmem:            100000 kB
     fn parse_meminfo_without_optional_fields() {
         let sample = "MemTotal:       1000 kB\nMemFree:         100 kB\n";
         let (total, free, buffers, cached) = parse_meminfo_bytes(sample).unwrap();
-        assert_eq!((total, free, buffers, cached), (1000 * 1024, 100 * 1024, 0, 0));
+        assert_eq!(
+            (total, free, buffers, cached),
+            (1000 * 1024, 100 * 1024, 0, 0)
+        );
         assert!(
             parse_meminfo_bytes("MemFree: 100 kB\n").is_none(),
             "缺 MemTotal 应失败"
