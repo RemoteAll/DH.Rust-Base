@@ -261,6 +261,47 @@ pub fn is_process_running(name: &str) -> bool {
     }
 }
 
+/// 按进程名查找 PID（名称不区分大小写、可带或不带 `.exe`）。
+///
+/// 用途：IIS 的 w3wp 归属判定（再按命令行 `-ap` 匹配应用池），
+/// 避免依赖 `appcmd list wps` 的「空结果也返回非 0」语义。
+pub fn pids_by_name(name: &str) -> Vec<u32> {
+    let want = name.trim().trim_end_matches(".exe");
+    #[allow(unused_mut)]
+    let mut out: Vec<u32> = Vec::new();
+    if want.is_empty() {
+        return out;
+    }
+    #[cfg(windows)]
+    {
+        for_each_process(|pname, pid, _threads| {
+            if pname.trim_end_matches(".exe").eq_ignore_ascii_case(want) {
+                out.push(pid);
+            }
+        });
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(dir) = std::fs::read_dir("/proc") {
+            for entry in dir.flatten() {
+                let path = entry.path();
+                let Some(file) = path.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let Ok(pid) = file.parse::<u32>() else {
+                    continue;
+                };
+                if let Ok(comm) = std::fs::read_to_string(path.join("comm")) {
+                    if comm.trim().eq_ignore_ascii_case(want) {
+                        out.push(pid);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// 上一次 CPU 采样（用于差分计算瞬时 CPU%）。
 struct CpuSnapshot {
     at: Instant,

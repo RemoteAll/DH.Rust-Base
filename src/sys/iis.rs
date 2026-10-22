@@ -377,28 +377,58 @@ pub fn app_pool_states() -> HashMap<String, String> {
 }
 
 /// 查询应用池对应的 w3wp 进程 PID（Web 园可能有多个）。
+///
+/// 优先用**进程快照 + 命令行 `-ap "池名"` 归属**判定：`appcmd list wps` 在「没有
+/// worker」（应用池已停，部署时的常态）时会返回退出码 1 + 空的 `<appcmd></appcmd>`，
+/// 容易被误判为失败；快照方案不依赖该语义。快照未命中时再用 appcmd 交叉验证。
 pub fn workers_of_pool(pool: &str) -> Result<Vec<u32>, String> {
-    #[cfg(windows)]
-    {
-        let pool = pool.trim();
-        if pool.is_empty() {
-            return Ok(Vec::new());
+    let pool = pool.trim();
+    if pool.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut pids = Vec::new();
+    for pid in super::monitor::pids_by_name("w3wp") {
+        if let Some(cmd) = process::command_line(pid) {
+            if let Some(name) = parse_app_pool(&cmd) {
+                if name.eq_ignore_ascii_case(pool) {
+                    pids.push(pid);
+                }
+            }
         }
-        let filter = format!("/apppool.name:{pool}");
-        let out = appcmd(&["list", "wps", &filter, "/xml"], APPCMD_TIMEOUT)?;
-        let mut pids = Vec::new();
-        if let Ok(value) = crate::config::read_xml_to_json(&out) {
-            collect_process_ids(&value, &mut pids);
-        }
+    }
+    if !pids.is_empty() {
         pids.sort_unstable();
         pids.dedup();
-        Ok(pids)
+        return Ok(pids);
     }
-    #[cfg(not(windows))]
-    {
-        let _ = pool;
-        Err("仅 Windows/IIS 支持此操作".to_string())
+    #[cfg(windows)]
+    if let Some(pids) = appcmd_workers(pool) {
+        return Ok(pids);
     }
+    Ok(Vec::new())
+}
+
+/// `appcmd list wps` 的 worker PID（None 表示查询不可用/出错，调用方应以快照为准）。
+#[cfg(windows)]
+fn appcmd_workers(pool: &str) -> Option<Vec<u32>> {
+    let filter = format!("/apppool.name:{pool}");
+    let args = ["list", "wps", filter.as_str(), "/xml"];
+    let (code, stdout, stderr) = appcmd_raw(&args, APPCMD_TIMEOUT).ok()?;
+    if code != 0 {
+        // 「无匹配对象」= 空文档 + 无错误输出 → 没有 worker（正常）
+        return if stderr.trim().is_empty() && is_empty_appcmd_doc(&stdout) {
+            Some(Vec::new())
+        } else {
+            None
+        };
+    }
+    let mut pids = Vec::new();
+    if let Ok(value) = crate::config::read_xml_to_json(&stdout) {
+        collect_process_ids(&value, &mut pids);
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    Some(pids)
 }
 
 /// 等待应用池的 w3wp 全部退出（超时返回 false）。
@@ -521,42 +551,86 @@ pub fn kill_pool_workers(pool: &str) -> Result<usize, String> {
 pub fn appcmd(args: &[&str], timeout: Duration) -> Result<String, String> {
     #[cfg(windows)]
     {
-        let exe = appcmd_path().ok_or_else(|| "未找到 appcmd.exe（IIS 未安装？）".to_string())?;
-        let timeout = timeout.max(Duration::from_millis(200));
-        let r = process::run_with_timeout(&exe.to_string_lossy(), args, timeout)
-            .map_err(|e| format!("启动 appcmd 失败：{e}"))?;
-        if r.timed_out {
-            return Err(format!(
-                "appcmd 执行超时（{} 秒）：{}",
-                timeout.as_secs(),
-                args.join(" ")
-            ));
+        let (code, stdout, stderr) = appcmd_raw(args, timeout)?;
+        if code != 0 {
+            return Err(appcmd_failure(code, args, &stdout, &stderr));
         }
-        if r.exit_code != 0 {
-            let msg = if r.stderr.trim().is_empty() {
-                r.stdout
-            } else {
-                r.stderr
-            };
-            let detail = if msg.trim().is_empty() {
-                "(无输出)".to_string()
-            } else {
-                msg.trim().to_string()
-            };
-            return Err(format!(
-                "appcmd 执行失败（退出码 {}，命令：appcmd {}）：{}",
-                r.exit_code,
-                args.join(" "),
-                detail
-            ));
-        }
-        Ok(r.stdout)
+        Ok(stdout)
     }
     #[cfg(not(windows))]
     {
         let _ = (args, timeout);
         Err("仅 Windows/IIS 支持此操作".to_string())
     }
+}
+
+/// appcmd 原始执行结果（退出码 / 标准输出 / 标准错误）。
+///
+/// 与 [`appcmd`] 的区别：不把非 0 退出码直接当错误——`appcmd` 对「没有匹配对象」
+/// 会返回退出码 1 并输出空的 `<appcmd></appcmd>`（如查询无 worker 的应用池），
+/// 调用方可据此判定为「空结果」。
+#[cfg(windows)]
+fn appcmd_raw(args: &[&str], timeout: Duration) -> Result<(i32, String, String), String> {
+    let exe = appcmd_path().ok_or_else(|| "未找到 appcmd.exe（IIS 未安装？）".to_string())?;
+    let timeout = timeout.max(Duration::from_millis(200));
+    let r = process::run_with_timeout(&exe.to_string_lossy(), args, timeout)
+        .map_err(|e| format!("启动 appcmd 失败：{e}"))?;
+    if r.timed_out {
+        return Err(format!(
+            "appcmd 执行超时（{} 秒）：{}",
+            timeout.as_secs(),
+            args.join(" ")
+        ));
+    }
+    Ok((r.exit_code, r.stdout, r.stderr))
+}
+
+/// 组装 appcmd 失败消息（带命令与输出）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn appcmd_failure(code: i32, args: &[&str], stdout: &str, stderr: &str) -> String {
+    let msg = if stderr.trim().is_empty() {
+        stdout
+    } else {
+        stderr
+    };
+    let detail = if msg.trim().is_empty() {
+        "(无输出)".to_string()
+    } else {
+        msg.trim().to_string()
+    };
+    format!(
+        "appcmd 执行失败（退出码 {}，命令：appcmd {}）：{}",
+        code,
+        args.join(" "),
+        detail
+    )
+}
+
+/// appcmd 输出是否为「空对象文档」（`<?xml ...?><appcmd></appcmd>`、`<appcmd/>` 或空串）。
+///
+/// appcmd 在没有匹配对象时正是这种输出（配合退出码 1），此时应视为空结果而非错误。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_empty_appcmd_doc(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let lower = t.to_ascii_lowercase();
+    if lower.contains("<error") || lower.contains("error (") {
+        return false;
+    }
+    let mut body = t;
+    if let Some(pos) = lower.find("<appcmd") {
+        body = &t[pos..];
+    }
+    if let Some(start) = body.find('>') {
+        body = &body[start + 1..];
+    }
+    let lower_body = body.to_ascii_lowercase();
+    if let Some(end) = lower_body.rfind("</appcmd") {
+        body = &body[..end];
+    }
+    body.trim().is_empty()
 }
 
 /// appcmd.exe 路径（32 位进程优先 Sysnative，规避 System32 重定向）。
@@ -1097,5 +1171,27 @@ mod tests {
         assert_eq!(parse_state_text(text, "b").as_deref(), Some("Stopped"));
         assert_eq!(parse_state_text(text, "c"), None);
         assert_eq!(parse_state_text("", "a"), None);
+    }
+
+    #[test]
+    fn detects_empty_appcmd_document() {
+        // 无匹配对象时 appcmd 的真实输出（配退出码 1）
+        assert!(is_empty_appcmd_doc(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\n<appcmd>\n\n</appcmd>"
+        ));
+        assert!(is_empty_appcmd_doc("<?xml version=\"1.0\" encoding=\"UTF-8\"?><appcmd></appcmd>"));
+        assert!(is_empty_appcmd_doc("<appcmd/>"));
+        assert!(is_empty_appcmd_doc(""));
+        assert!(is_empty_appcmd_doc("   \r\n  "));
+        // 有对象或错误信息 → 不是空文档
+        assert!(!is_empty_appcmd_doc(
+            r#"<?xml version="1.0"?><appcmd><WP WP.NAME="123" processId="123"/></appcmd>"#
+        ));
+        assert!(!is_empty_appcmd_doc(
+            r#"<?xml version="1.0"?><appcmd><ERROR message="Cannot find APP"/></appcmd>"#
+        ));
+        assert!(!is_empty_appcmd_doc(
+            r#"ERROR ( message:Cannot find APPPOOL object with identifier "x". )"#
+        ));
     }
 }
