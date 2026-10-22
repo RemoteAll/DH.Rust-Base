@@ -112,6 +112,8 @@ secret = ["dep:aes-gcm"]
 service = ["dep:windows-service"]
 # ZIP 解压（防目录穿越/占用文件安全替换；Pek.RAgent 与 DHDeploy.Agent 共用）
 zip-extract = ["dep:zip"]
+# 文件管理（面板浏览/上传下载/编辑/压缩解压/搜索；Pek.RAgent 与 Pek.RPanlServer 共用）
+fileman = ["zip-extract"]
 # zstd 字典差分补丁（增量升级：生成/还原；Pek.RAgent 与 DHDeploy.Agent.Rust 共用）
 patch = ["dep:zstd"]
 # 插件包格式 + 插件源目录签名（Ed25519；含 zip-extract）——Pek.RAgent（安装/发布）与 Pek.RPanlServer（平台）共用

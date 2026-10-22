@@ -507,7 +507,10 @@ fn change_state(kind: &str, name: &str, want: &str, timeout: Duration) -> Result
         Err(e) => {
             invalidate_cache();
             let state = current_state(kind, name);
-            if state.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(want)) {
+            if state
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(want))
+            {
                 return Ok(());
             }
             Err(match &state {
@@ -1139,7 +1142,8 @@ mod tests {
     #[test]
     fn parses_state_line_for_site_and_app_pool() {
         // 站点：appcmd list site 的文本格式（小写 state:）
-        let site = r#"SITE "kf.hlktech.com" (id:2,bindings:http/*:80:kf.hlktech.com,state:Started)"#;
+        let site =
+            r#"SITE "kf.hlktech.com" (id:2,bindings:http/*:80:kf.hlktech.com,state:Started)"#;
         assert_eq!(
             parse_state_line(site),
             Some(("kf.hlktech.com".to_string(), "Started".to_string()))
@@ -1179,7 +1183,9 @@ mod tests {
         assert!(is_empty_appcmd_doc(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\n<appcmd>\n\n</appcmd>"
         ));
-        assert!(is_empty_appcmd_doc("<?xml version=\"1.0\" encoding=\"UTF-8\"?><appcmd></appcmd>"));
+        assert!(is_empty_appcmd_doc(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><appcmd></appcmd>"
+        ));
         assert!(is_empty_appcmd_doc("<appcmd/>"));
         assert!(is_empty_appcmd_doc(""));
         assert!(is_empty_appcmd_doc("   \r\n  "));
