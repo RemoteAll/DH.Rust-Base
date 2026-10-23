@@ -95,6 +95,23 @@ pub fn now_utc_str() -> String {
     format_datetime_with_digits(&now_utc(), 0)
 }
 
+/// 现在（**本地时区**）→ `%Y-%m-%d %H:%M:%S`。
+///
+/// 业务表里的"创建/更新时间"列一律用本地时间文本（与 PHP/C# 端写入口径一致，
+/// 便于直接比对），故消费方几乎都要这一行；此前各项目各自复制 `now_text()`。
+pub fn now_local_text() -> String {
+    chrono::Local::now()
+        .naive_local()
+        .format(DATETIME_SECONDS_FORMAT)
+        .to_string()
+}
+
+/// 现在（**本地时区**）→ `%Y-%m-%d %H:%M:%S%.3f`（毫秒精度，审计/日志用）。
+pub fn now_local_ms_text() -> String {
+    let now = chrono::Local::now().naive_local();
+    format_datetime_with_digits(&now, 3)
+}
+
 /// 时间 → System.Text.Json 形态文本（`yyyy-MM-ddTHH:mm:ss`，100ns 精度内尾零裁剪）。
 ///
 /// 对齐 C# `System.Text.Json` 序列化 `DateTime`（本地）的输出：
@@ -194,6 +211,25 @@ mod tests {
             format_datetime_with_digits(&dt, 6),
             "2026-09-26 18:01:02.123000"
         );
+    }
+
+    #[test]
+    fn now_local_text_shapes() {
+        // 秒级：`yyyy-MM-dd HH:mm:ss`（19 字符、无小数）
+        let text = now_local_text();
+        assert_eq!(text.len(), 19);
+        assert!(parse_datetime(&text).is_some());
+        assert!(!text.contains('.'));
+
+        // 毫秒级：`yyyy-MM-dd HH:mm:ss.fff`（23 字符）
+        let ms = now_local_ms_text();
+        assert_eq!(ms.len(), 23);
+        assert_eq!(ms.len() - ms.rfind('.').unwrap() - 1, 3);
+
+        // 与本地时间同一分钟（跨分钟执行时允许差 1）
+        let now = chrono::Local::now().naive_local();
+        let minutes_apart = (parse_datetime(&text).unwrap() - now).num_minutes().abs();
+        assert!(minutes_apart <= 1);
     }
 
     #[test]

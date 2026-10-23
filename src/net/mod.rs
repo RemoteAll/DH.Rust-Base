@@ -12,6 +12,8 @@
 //! - **WebSocket**：fastwebsockets 帧层（`after_handshake` 接管、自动行为全关），
 //!   会话/心跳/重连/发送串行/延迟响应自研，对齐 C# `MyWebSocketClient` 行为；
 //! - **RPC**：与 C# `WebSocketRpcModels` 字段级对齐的消息模型与 Dispatcher。
+//! - **[`reply`]**：统一 JSON 回信封 `{state, info|message}`（`ok/done/warn/fail/
+//!   unauthorized`）——各项目此前逐文件复制的同款辅助函数，统一用库内版本。
 //!
 //! `stun`（独立特性，仅依赖 tokio UDP；`net` 特性自动包含）：RFC 5389 Binding 服务，
 //! 供浏览器 WebRTC 公网地址发现（来源：PekSendToMo 收编 2026-09-29）。
@@ -39,6 +41,8 @@ pub mod mqtt;
 pub mod openai;
 #[cfg(feature = "net")]
 pub mod panel_auth;
+#[cfg(feature = "net")]
+pub mod reply;
 #[cfg(feature = "net")]
 pub mod router;
 #[cfg(feature = "net")]

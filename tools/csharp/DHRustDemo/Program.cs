@@ -58,6 +58,37 @@ switch (cmd)
             if (count < 2) Environment.Exit(1);
             break;
         }
+    case "password-hash":
+        {
+            // 口令散列（随机盐）：NewLife.Security.SaltPasswordProvider
+            var prv = new NewLife.Security.SaltPasswordProvider { Algorithm = args[1] };
+            Console.WriteLine(prv.Hash(args[2]));
+            break;
+        }
+    case "password-hash-fixed":
+        {
+            // 固定盐散列：用 NewLife 扩展方法逐行复刻 SaltPasswordProvider.Hash 的算法
+            Console.WriteLine(HashWithSalt(args[1], args[2], args[3]));
+            break;
+        }
+    case "password-verify":
+        {
+            var prv = new NewLife.Security.SaltPasswordProvider();
+            Console.WriteLine(prv.Verify(args[1], args[2]) ? "OK" : "FAIL");
+            break;
+        }
+    case "password-verify-alg":
+        {
+            var prv = new NewLife.Security.SaltPasswordProvider { Algorithm = args[1] };
+            Console.WriteLine(prv.Verify(args[2], args[3]) ? "OK" : "FAIL");
+            break;
+        }
+    case "password-legacy-md5":
+        {
+            // C# `String.MD5()` 口径（大写十六进制）
+            Console.WriteLine(args[1].MD5());
+            break;
+        }
     default:
         Console.Error.WriteLine("未知命令: " + cmd);
         Environment.Exit(2);
@@ -106,4 +137,20 @@ static void PrintSetting(Setting s, string file)
     Console.WriteLine($"PluginPath={s.PluginPath}");
     Console.WriteLine($"PluginServer={s.PluginServer}");
     Console.WriteLine($"ServiceAddress={s.ServiceAddress}");
+}
+
+// 固定盐口令散列（逐行复刻 SaltPasswordProvider.Hash 的算法，盐由调用方给定以便互通比对）
+static string HashWithSalt(string alg, string password, string salt)
+{
+    var hash = alg switch
+    {
+        "md5" => (password.MD5() + salt).MD5(),
+        "sha1" => password.GetBytes().SHA1(salt.GetBytes()).ToBase64(),
+        "sha512" => password.GetBytes().SHA512(salt.GetBytes()).ToBase64(),
+        "md5+sha1" => password.GetBytes().MD5().SHA1(salt.GetBytes()).ToBase64(),
+        "md5+sha512" => password.GetBytes().MD5().SHA512(salt.GetBytes()).ToBase64(),
+        _ => throw new NotSupportedException($"unsupported algorithm [{alg}]"),
+    };
+
+    return $"${alg}${salt}${hash}";
 }

@@ -4,6 +4,10 @@ use rand::Rng;
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 
+/// 口令散列（与 C# `NewLife.Security.SaltPasswordProvider` 字节级互通；
+/// 支持 md5 / sha1 / sha512 / md5+sha1 / md5+sha512，含旧式 MD5 自动升级）。
+pub mod password;
+
 /// 根据参数生成校验值
 /// timestamp1: 毫秒时间戳
 /// nonce: 随机数
