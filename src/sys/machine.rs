@@ -135,10 +135,12 @@ pub fn set_system_time(epoch_ms: i64) -> Result<(), String> {
     #[cfg(unix)]
     {
         let (secs, nanos) = split_epoch_ms(epoch_ms);
-        // 64 位目标上 `time_t` 恒为 i64（= c_long）：直接赋 i64，
-        // 避免引用 musl 目标上已被标记弃用的 `libc::time_t` 别名
+        // `tv_sec` 的位宽随目标平台变化：64 位目标 `time_t` = i64（= c_long），32 位目标（armv7 等）= i32。
+        // 用 `as _` 让编译器按字段类型推断（64 位是 i64→i64 的恒等转换，零成本），
+        // 既避免 32 位目标类型不匹配，又不必引用 musl 上已被标记弃用的 `libc::time_t` 别名。
+        // 注意：32 位目标沿用内核的 32 位 time_t，可用范围止于 2038-01-19（内核限制，非本库引入）。
         let ts = libc::timespec {
-            tv_sec: secs,
+            tv_sec: secs as _,
             tv_nsec: nanos as libc::c_long,
         };
         let rc = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
