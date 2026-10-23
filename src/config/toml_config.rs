@@ -9,6 +9,12 @@
 //! C# 没有 TOML 配置类；这里的补齐/容错/原子写全部复用本库既有管线
 //! （[`super::toml`] + [`super::coerce_json`] + [`super::save_if_changed`]）。
 //!
+//! # 旧版 JSON 自动迁移（零代码）
+//! 约定：**同一目录下的同名 `.json` 就是旧版配置**（`Config/Foo.toml` ← `Config/Foo.json`）。
+//! 当 TOML 不存在而 `.json` 存在时，[`TomlConfig::load`] 自动：读旧值 → 以**模板（调用方预设）为基**
+//! 合并 → 写 TOML（带注释）→ 旧文件改名 `.json.bak`；[`TomlConfig::save`] 也会把残留的旧 `.json`
+//! 备份掉。**各项目不需要再写任何迁移代码**，只要把配置路径改成 `.toml` 即可。
+//!
 //! # 示例
 //! ```no_run
 //! use dhrust::config::TomlConfig;
@@ -87,8 +93,38 @@ where
             Err(e) => return Err(ConfigError::Io(e)),
         };
 
-        // ① 文件不存在 → 按模板生成
+        // ① 文件不存在 → 先尝试**自动迁移同名旧版 JSON**（约定：`Config/Foo.toml` ← `Config/Foo.json`）
         let Some(text) = current else {
+            if let Some((value, rendered, legacy)) =
+                migrate_legacy::<T>(&path, &template_text, &mut notes)
+                    .map_err(ConfigError::Parse)?
+            {
+                // 迁移必须落盘（旧文件随后改名；不写会丢配置），与 create_on_missing 无关
+                save_if_changed(&path, |_| Ok(rendered))?;
+                // 旧文件改名留证（`.json.bak`）；已不存在则跳过
+                if legacy.exists() {
+                    let bak = legacy.with_extension("json.bak");
+                    match std::fs::rename(&legacy, &bak) {
+                        Ok(()) => notes.push(format!(
+                            "旧版配置已迁移为 {}（原文件备份为 {}）",
+                            path.display(),
+                            bak.display()
+                        )),
+                        Err(e) => notes.push(format!(
+                            "旧版配置 {} 重命名失败：{e}（请手工删除旧文件）",
+                            legacy.display()
+                        )),
+                    }
+                }
+                return Ok(TomlConfig {
+                    path: path.clone(),
+                    value,
+                    template: template_text,
+                    is_new: false,
+                    notes,
+                    stamp: file_stamp(&path),
+                });
+            }
             let value = value_of_template::<T>(&template_text, &mut notes)
                 .map_err(ConfigError::Parse)?;
             if options.create_on_missing {
@@ -148,11 +184,27 @@ where
     }
 
     /// 保存（渲染—比对—原子写；保留文件里已有的注释与排版）。
+    ///
+    /// 若同目录还存在旧版同名 `.json`，一并改名为 `.json.bak`（与自动迁移口径一致——
+    /// 避免“新配置已生效、旧配置还留着”造成运维误读）。
     pub fn save(&mut self) -> Result<(), ConfigError> {
         let template = self.template.clone();
         let want = serde_json::to_value(&self.value)
             .map_err(|e| ConfigError::Parse(format!("序列化配置失败：{e}")))?;
         save_if_changed(&self.path, |current| render(&template, &want, current))?;
+        let legacy = self.path.with_extension("json");
+        if legacy.is_file() {
+            let bak = legacy.with_extension("json.bak");
+            match std::fs::rename(&legacy, &bak) {
+                Ok(()) => self
+                    .notes
+                    .push(format!("旧版配置已备份：{}", bak.display())),
+                Err(e) => self.notes.push(format!(
+                    "旧版配置 {} 重命名失败：{e}（请手工删除）",
+                    legacy.display()
+                )),
+            }
+        }
         self.stamp = file_stamp(&self.path);
         Ok(())
     }
@@ -269,6 +321,75 @@ where
     }
 }
 
+/// 自动迁移同名旧版 JSON：`Foo.toml` 不存在时检查 `Foo.json`。
+///
+/// 语义与 `load_text` 一致——**模板（调用方预设）作基，旧文件值覆盖**，因此旧文件缺的键
+/// 会继承预设，不会因为结构体默认值把预设冲掉。返回 `(值, 渲染后的 TOML 文本, 旧文件路径)`。
+fn migrate_legacy<T>(
+    path: &Path,
+    template: &str,
+    notes: &mut Vec<String>,
+) -> Result<Option<(T, String, PathBuf)>, String>
+where
+    T: DeserializeOwned,
+{
+    if path.exists() {
+        return Ok(None);
+    }
+    let legacy = path.with_extension("json");
+    if !legacy.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&legacy)
+        .map_err(|e| format!("读取 {} 失败：{e}", legacy.display()))?;
+    // Windows 记事本 / PowerShell 5.1 的 UTF-8 会带 BOM
+    let over: Value = match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
+        Ok(v) => v,
+        Err(e) => {
+            notes.push(format!(
+                "旧版配置 {} 不是合法 JSON（已忽略）：{e}",
+                legacy.display()
+            ));
+            return Ok(None);
+        }
+    };
+    let tpl_doc = dtoml::parse_document(template)?;
+    let tpl_json = dtoml::document_to_json(&tpl_doc)?;
+    // 旧配置里模板没有的键无法落到 TOML 模板中——保留在值里（结构体忽略）但给出提示
+    let unknown = dtoml::unknown_keys(&over, &tpl_json, &[]);
+    if !unknown.is_empty() {
+        notes.push(format!(
+            "旧版配置存在未识别项（已忽略）：{}",
+            unknown.join(", ")
+        ));
+    }
+    let mut merged = tpl_json.clone();
+    merge_over(&mut merged, &over);
+    let (coerced, _) = super::coerce_json(merged, &tpl_json);
+    let value: T = serde_json::from_value(coerced.clone()).map_err(|e| {
+        format!("旧版配置 {} 与结构体不匹配：{e}", legacy.display())
+    })?;
+    let rendered = render(template, &coerced, None)?;
+    Ok(Some((value, rendered, legacy)))
+}
+
+/// 把 `over` 递归合并进 `base`（`over` 中缺失的键保留 `base` 的值）。
+fn merge_over(base: &mut Value, over: &Value) {
+    match (base, over) {
+        (Value::Object(b), Value::Object(o)) => {
+            for (k, v) in o {
+                match b.get_mut(k) {
+                    Some(slot) => merge_over(slot, v),
+                    None => {
+                        b.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        (slot, v) => *slot = v.clone(),
+    }
+}
+
 /// 解析文件文本：以模板补齐缺失键、修正类型，返回 `(值, 是否需要回写, 回写文本)`。
 fn load_text<T>(template: &str, text: &str, notes: &mut Vec<String>) -> Result<(T, bool, String), String>
 where
@@ -381,6 +502,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn legacy_json_is_migrated_automatically() {
+        let dir = temp("legacy");
+        let file = dir.join("a.toml");
+        let legacy = file.with_extension("json");
+        // 旧文件只写了部分键：缺失的键必须继承**模板**（调用方预设），不能用结构体默认值
+        std::fs::write(&legacy, r#"{ "value": 3 }"#).expect("写旧配置");
+        let mut cfg = TomlConfig::<Demo>::load(&file, TPL);
+        assert_eq!(cfg.value(), &Demo { value: 3, name: String::new() });
+        let notes = cfg.take_notes();
+        assert!(notes.iter().any(|n| n.contains("已迁移")), "{notes:?}");
+        assert!(file.is_file(), "应生成 TOML");
+        assert!(!legacy.exists(), "旧 JSON 应改名");
+        assert!(legacy.with_extension("json.bak").is_file(), "旧文件应备份");
+        // 生成的文件带模板注释
+        let text = std::fs::read_to_string(&file).expect("读 TOML");
+        assert!(text.contains("# 示例配置"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_json_partial_keeps_template_preset() {
+        let dir = temp("legacy-preset");
+        let file = dir.join("a.toml");
+        std::fs::write(file.with_extension("json"), r#"{ "value": 1 }"#).expect("写旧配置");
+        // 模板值 7 应作为“预设”保留 name（空串），value 被旧文件覆盖
+        let cfg = TomlConfig::<Demo>::load(&file, TPL);
+        assert_eq!(cfg.value().value, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broken_legacy_json_is_ignored_and_default_created() {
+        let dir = temp("legacy-bad");
+        let file = dir.join("a.toml");
+        std::fs::write(file.with_extension("json"), "{ not json").expect("写坏旧配置");
+        let mut cfg = TomlConfig::<Demo>::load(&file, TPL);
+        assert_eq!(cfg.value().value, 7);
+        assert!(cfg.take_notes().iter().any(|n| n.contains("不是合法 JSON")));
+        assert!(file.is_file(), "仍应生成 TOML");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn corrupt_file_is_backed_up_and_rebuilt() {
         let dir = temp("corrupt");
