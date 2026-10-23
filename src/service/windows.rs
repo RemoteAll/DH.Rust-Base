@@ -204,9 +204,11 @@ pub fn install(mgr: &ServiceManager, start: bool) -> Result<(), String> {
 }
 
 /// 重新安装。
+///
+/// **不再吞掉卸载错误**：归属冲突 / 服务停不下来时直接返回，避免"以为重装成功、
+/// 实际注册项还是旧的"（旧注册项缺 `-s` 会让 SCM 拉起后立即退出 → 1053）。
 pub fn reinstall(mgr: &ServiceManager) -> Result<(), String> {
-    let _ = uninstall(mgr, true);
-    std::thread::sleep(Duration::from_millis(500));
+    uninstall(mgr, true)?;
     install(mgr, true)
 }
 
@@ -227,8 +229,18 @@ pub fn uninstall(mgr: &ServiceManager, stop: bool) -> Result<(), String> {
         }
     }
 
-    if stop && query(mgr) == ServiceState::Running {
-        let _ = stop_service(mgr);
+    if stop {
+        // 不论当前状态都发一次 stop（STOP_PENDING / START_PENDING 也一并覆盖），
+        // 然后等它真正 STOPPED —— 宿主不响应 Stop 时直接报错，
+        // 而不是"删了注册但进程还占着端口"导致下次启动失败。
+        let _ = run("sc", &["stop", &mgr.name]);
+        if !wait_state(mgr, ServiceState::Stopped, 20_000) {
+            return Err(format!(
+                "服务 {} 未能停止（等待 20 秒超时）：进程可能未响应停止控制；\
+                 请结束 pek-rdbproxy/对应进程后重试，或重启系统",
+                mgr.name
+            ));
+        }
     }
 
     let (code, stdout, stderr) = run("sc", &["delete", &mgr.name]);
@@ -237,6 +249,15 @@ pub fn uninstall(mgr: &ServiceManager, stop: bool) -> Result<(), String> {
             "卸载服务失败（请以管理员身份运行）：{}",
             format!("{}\n{}", stdout.trim(), stderr.trim()).trim()
         ));
+    }
+
+    // 等待 SCM 真正移除注册（`sc delete` 对运行中的服务只是标记删除）
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if query(mgr) == ServiceState::NotInstalled {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
 
     super::log_format("Windows 服务已卸载：{}", &[&mgr.name]);
