@@ -92,9 +92,11 @@ pub fn allow_port(rule: &str, port: u16) -> Result<String, String> {
 }
 
 /// 撤销放行（幂等）。
-pub fn close_port(rule: &str, _port: u16) -> Result<String, String> {
+pub fn close_port(rule: &str, port: u16) -> Result<String, String> {
     #[cfg(windows)]
     {
+        // Windows 按规则名删除，不需要端口
+        let _ = port;
         let out = Command::new("netsh")
             .args([
                 "advfirewall",
