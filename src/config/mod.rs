@@ -8,8 +8,8 @@
 //!   [`coerce_json`]（字段级容错转换，供 TOML 等其它格式复用）、[`save_value`]（原子保存）、
 //!   [`save_if_changed`]（文本管线“渲染—比对—原子写回”；加载即补齐缺失项）。
 //! - [`toml`] 子模块（`feature = "toml"`）：TOML 配置维护管线——保注释补齐、类型修正回写、
-//!   未知项识别、备份写入（tcp-scanner-server 实践沉淀，供现场可编辑配置复用）。
-//! - Rust 读取 C# 写的配置文件、C# 读取 Rust 写的配置文件均保持兼容。
+//!   未知项识别、备份写入（tcp-scanner-server 实践沉淀，供现场可编辑配置复用）。//! - [`TomlConfig<T>`]（`feature = "toml"`）：[`Config<T>`] 的 **TOML 版**（同样语义：缺失生成、
+//!   缺键带注释补齐、类型容错、损坏备份重建、外部改动热加载）。需要运维手工改的配置用它。//! - Rust 读取 C# 写的配置文件、C# 读取 Rust 写的配置文件均保持兼容。
 //!
 //! # 示例
 //!
@@ -30,6 +30,11 @@ mod xml;
 
 #[cfg(feature = "toml")]
 pub mod toml;
+#[cfg(feature = "toml")]
+mod toml_config;
+
+#[cfg(feature = "toml")]
+pub use toml_config::TomlConfig;
 
 pub use file_config::{
     coerce_json, file_stamp, save_if_changed, save_value, Config, ConfigOptions, FileStamp,

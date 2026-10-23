@@ -21,8 +21,11 @@ use serde_json::Value;
 use toml_edit::{DocumentMut, Item, Table};
 
 /// 解析 TOML 文本为可编辑文档（保留注释与排版）。
+///
+/// 自动剥离 UTF-8 BOM（Windows 记事本 / PowerShell 5.1 保存的文件会带 BOM，TOML 解析器不认）。
 pub fn parse_document(text: &str) -> Result<DocumentMut, String> {
-    text.parse::<DocumentMut>()
+    text.trim_start_matches('\u{feff}')
+        .parse::<DocumentMut>()
         .map_err(|e| format!("TOML 语法错误：{e}"))
 }
 
@@ -332,6 +335,49 @@ pub fn backup_and_write(path: &Path, content: &str) -> io::Result<PathBuf> {
     fs::copy(path, &bak)?;
     fs::write(path, content)?;
     Ok(bak)
+}
+
+/// 旧版 JSON 配置文件迁移：读 JSON → 回调写新格式（通常是 TOML）→ 原文件备份为 `.json.bak`。
+///
+/// 为什么下沉：`Database.json` / `Git.json` / `Waf.json` 等历史配置在换格式时都要同一套迁移语义
+/// （读旧文件、写新文件、备份旧文件、失败不炸启动），各仓库不要各写一份。
+///
+/// 返回 `true` 表示发生了迁移（旧文件存在且解析成功）。
+pub fn migrate_json<T, F>(legacy: &Path, save_new: F) -> bool
+where
+    T: serde::de::DeserializeOwned,
+    F: FnOnce(&T),
+{
+    if !legacy.is_file() {
+        return false;
+    }
+    let text = match fs::read_to_string(legacy) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::warn!("读取旧版配置 {} 失败：{e}（已忽略）", legacy.display());
+            return false;
+        }
+    };
+    // Windows 记事本 / PowerShell 5.1 的 UTF-8 会带 BOM
+    let text = text.trim_start_matches('\u{feff}');
+    let Ok(value) = serde_json::from_str::<T>(text) else {
+        crate::warn!("旧版配置 {} 不是合法 JSON（已忽略）", legacy.display());
+        return false;
+    };
+    save_new(&value);
+    // 回调本身可能已经搬走旧文件（例如它的保存逻辑里带迁移）——已不存在就不再重复改名
+    if !legacy.exists() {
+        return true;
+    }
+    let bak = legacy.with_extension("json.bak");
+    match fs::rename(legacy, &bak) {
+        Ok(()) => crate::info!("旧版配置已迁移：{} → {}", legacy.display(), bak.display()),
+        Err(e) => crate::warn!(
+            "旧版配置 {} 重命名失败：{e}（新配置已生成，请手工删除旧文件）",
+            legacy.display()
+        ),
+    }
+    true
 }
 
 #[cfg(test)]
