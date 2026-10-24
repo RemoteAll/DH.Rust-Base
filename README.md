@@ -21,6 +21,7 @@ Pek 生态的 Rust 基础库，对应 C# 的 **DH.NCore**：为 Rust 项目提�
 | `stun` | STUN 服务（RFC 5389 Binding；feature `stun`，`net` 自动包含） | — |
 | `wecom` | 企业微信机器人（Webhook 推送：文本/Markdown/Markdown V2 + 响应解析；feature `http-client`，https 需 `http-tls`） | `Pek.WebHook`（`WeChatWorkRobot`） |
 | `razor` | Razor 子集模板引擎（feature `razor`） | — |
+| `upgrade` | **自升级管线·应用层**：`{exe}.new`/`Update/` 双通道、静置判定、可执行魔数、自检、原子替换（Windows 改名让位+重试）、交接重启（Unix `execv` 原地接管 / 助手兜底）、外部替换指纹、资源目录同步（`index.html` 最后）、zip 包内找程序（feature `zip-extract`）、影子模式判定 | — |
 
 ## HTTP 控制器与静态文件（net）
 
