@@ -3,7 +3,8 @@
 //! - [`url_encode`]：RFC 3986 百分号编码（URL 查询串与 `application/x-www-form-urlencoded` 值）；
 //! - [`json_escape`]：JSON 字符串转义（不含两端引号，供请求体模板内嵌 JSON 值）；
 //! - [`format_bytes`] / [`format_bytes_iec`] / [`format_speed`]：流量/速率可读格式化
-//!   （Pek 系面板与部署代理共用，口径分别对齐 C# `StarApi.FormatBytes` 与 `FormatBytes`）。
+//!   （Pek 系面板与部署代理共用，口径分别对齐 C# `StarApi.FormatBytes` 与 `FormatBytes`）；
+//! - [`uptime_text`] / [`uptime_text_compact`]：运行时长文本（两种口径，见各自文档）。
 
 /// RFC 3986 百分号编码：除 `A-Za-z0-9-._~` 外的字节全部转义为 `%XX`（大写十六进制）。
 ///
@@ -72,6 +73,43 @@ pub fn format_speed(bps: u64) -> String {
     }
 }
 
+/// 运行时长文本（`1 天 2 小时` / `1 小时 1 分` / `1 分 30 秒` / `0 秒`）。
+///
+/// 只保留两个粒度（避免面板串太长），空格分隔，**精确到秒**。
+/// 下沉自 HlktechIoT MQTT 接入服务面板（概览页「运行时长」）。
+pub fn uptime_text(secs: u64) -> String {
+    let d = secs / 86_400;
+    let h = (secs % 86_400) / 3_600;
+    let m = (secs % 3_600) / 60;
+    let s = secs % 60;
+    if d > 0 {
+        format!("{d} 天 {h} 小时")
+    } else if h > 0 {
+        format!("{h} 小时 {m} 分")
+    } else if m > 0 {
+        format!("{m} 分 {s} 秒")
+    } else {
+        format!("{s} 秒")
+    }
+}
+
+/// 运行时长文本（**星尘 C# 口径**：`21天13小时` / `3小时5分` / `5分`；无空格、按分钟取整）。
+///
+/// 用于需要与 C# StarAgent 面板逐字一致的场景（Pek.RAgent 实践沉淀）。
+pub fn uptime_text_compact(secs: u64) -> String {
+    let total_minutes = secs / 60;
+    let days = total_minutes / 1440;
+    let hours = (total_minutes % 1440) / 60;
+    let minutes = total_minutes % 60;
+    if days > 0 {
+        format!("{days}天{hours}小时")
+    } else if hours > 0 {
+        format!("{hours}小时{minutes}分")
+    } else {
+        format!("{minutes}分")
+    }
+}
+
 /// 最多两位小数、去尾零（对齐 C# `:0.##`）。
 fn trim2(v: f64) -> String {
     let s = format!("{v:.2}");
@@ -131,5 +169,23 @@ mod tests {
         assert_eq!(format_speed(900), "900 B/s");
         assert_eq!(format_speed(2048), "2.0 KB/s");
         assert_eq!(format_speed(3 * 1024 * 1024), "3.0 MB/s");
+    }
+
+    #[test]
+    fn uptime_text_two_granularities() {
+        // HlktechIoT 面板口径：空格分隔、精确到秒
+        assert_eq!(uptime_text(0), "0 秒");
+        assert_eq!(uptime_text(90), "1 分 30 秒");
+        assert_eq!(uptime_text(3660), "1 小时 1 分");
+        assert_eq!(uptime_text(90_000), "1 天 1 小时");
+    }
+
+    #[test]
+    fn uptime_text_compact_matches_staragent() {
+        // 星尘 C# 口径：无空格、按分钟取整
+        assert_eq!(uptime_text_compact(0), "0分");
+        assert_eq!(uptime_text_compact(90), "1分");
+        assert_eq!(uptime_text_compact(3_600 + 300), "1小时5分");
+        assert_eq!(uptime_text_compact(21 * 86_400 + 13 * 3_600), "21天13小时");
     }
 }
