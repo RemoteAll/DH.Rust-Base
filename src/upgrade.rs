@@ -586,6 +586,9 @@ pub fn apply(plan: &ApplyPlan) -> Result<ApplyOutcome, String> {
 /// - 其它平台：拉起**[`HELPER_FLAG`] 重启助手**（等本进程退出后由助手拉起新版本），然后退出。
 ///
 /// 调用方应先 `crate::logs::flush()`；本函数内部也会 flush 一次。
+///
+/// **没有「外部拉起者」的假设**：除「Windows 已安装为系统服务、由 SCM 失败恢复拉起」这一条外，
+/// 服务进程只能「自己拉起自己」——所以助手兜底不能省（RAgent / RPanlServer / HlktechIoT 都是如此）。
 pub fn handoff(exe: &Path, args: &[String]) -> ! {
     crate::logs::flush();
     #[cfg(unix)]
