@@ -1,4 +1,5 @@
 pub mod audit; // 审计日志脱敏与摘要（敏感字段 *** / 动作名 / 参数摘要；多消费方收编）
+pub mod cert; // 证书与域名工具（PEM 拆包 / 最小 X.509 解析 / 通配符匹配；证书下发与部署共用）
 pub mod config; // 配置项（对应 DH.NCore Setting/Configuration）
 #[cfg(feature = "fileman")]
 pub mod fileman; // 文件管理（浏览/上传下载/编辑/压缩解压/搜索；Pek.RAgent 与 Pek.RPanlServer 共用）
