@@ -278,6 +278,9 @@ pub struct SelftestSpec {
     pub args: Vec<String>,
     /// 超时（超时视为失败并杀进程）
     pub timeout: Duration,
+    /// 额外环境变量（如影子自检必须带 `PEK_RAGENT_BASE=<真实安装目录>`，
+    /// 否则自检进程会把暂存位置当程序目录、在其下生成 Log/Config）
+    pub envs: Vec<(String, String)>,
 }
 
 impl SelftestSpec {
@@ -286,7 +289,14 @@ impl SelftestSpec {
         Self {
             args: vec![flag.to_string()],
             timeout: Duration::from_secs(30),
+            envs: Vec::new(),
         }
+    }
+
+    /// 追加一个自检进程的环境变量（链式）。
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.envs.push((key.into(), value.into()));
+        self
     }
 }
 
@@ -299,6 +309,9 @@ pub fn selftest(program: &Path, spec: &SelftestSpec) -> Result<(), String> {
     }
     let mut cmd = std::process::Command::new(program);
     cmd.args(&spec.args);
+    for (k, v) in &spec.envs {
+        cmd.env(k, v);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -945,6 +958,26 @@ mod tests {
         assert!(bak.is_file());
         assert_eq!(std::fs::read(&bak).expect("读备份"), b"MZ-old");
         assert!(backup_file(&dir.join("nope")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 存量自检用例：环境变量透传（用 cmd/echo 造一个会回显环境变量的自检程序）。
+    #[test]
+    #[cfg(windows)]
+    fn selftest_passes_env_to_child() {
+        let dir = tmp_dir("selftest-env");
+        let bat = dir.join("check.bat");
+        std::fs::write(&bat, b"@echo off\r\nif \"%HLZX_PROBE%\"==\"ok\" exit /b 0\r\nexit /b 1\r\n")
+            .expect("写批处理");
+        let spec = SelftestSpec::new("")
+            .with_env("HLZX_PROBE", "ok");
+        let spec = SelftestSpec {
+            args: Vec::new(),
+            ..spec
+        };
+        selftest(&bat, &spec).expect("环境变量应透传，自检通过");
+        let bad = SelftestSpec { args: Vec::new(), timeout: Duration::from_secs(5), envs: Vec::new() };
+        assert!(selftest(&bat, &bad).is_err(), "未设置环境变量应自检失败");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
