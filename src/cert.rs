@@ -82,14 +82,13 @@ impl CertInfo {
         self.ip_addresses.iter().any(|ip| ip == host)
     }
 
-    /// `not_after` 距今剩余天数（向上取整；已过期返回负数）。
+    /// `not_after` 距今剩余**完整**天数（向下取整；已过期返回负数）。
+    ///
+    /// 口径说明：不足一天的零头不计入（剩 92.3 天 → 92），与 nginx/宝塔面板
+    /// 「剩余 X 天」的保守口径一致，避免"显示还有 1 天其实已经过期"的错觉。
+    /// 需要精确定位时请看 `not_after` 的日期本身（[`Self::validity_text`]）。
     pub fn days_left(&self, now: i64) -> i64 {
-        let secs = self.not_after - now;
-        if secs >= 0 {
-            (secs + 86_399) / 86_400
-        } else {
-            secs / 86_400
-        }
+        (self.not_after - now).div_euclid(86_400)
     }
 
     /// 是否已过期（相对给定 Unix 秒）。
