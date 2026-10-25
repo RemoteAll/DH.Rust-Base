@@ -8,6 +8,39 @@ pub fn read_all_text<P: AsRef<Path>>(path: P) -> io::Result<String> {
     Ok(text.strip_prefix('\u{feff}').unwrap_or(&text).to_string())
 }
 
+/// 读取二进制文件，超过 `max_bytes` 直接报错（不整读超大文件）。
+///
+/// 先用 metadata 预检，再用 `take(max+1)` 读取，防止检查后文件增长导致无界读取。
+pub fn read_file_limited<P: AsRef<Path>>(path: P, max_bytes: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let path = path.as_ref();
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "文件 {} 大小 {} 字节，超过上限 {} 字节",
+                path.display(),
+                metadata.len(),
+                max_bytes
+            ),
+        ));
+    }
+
+    let file = fs::File::open(path)?;
+    let mut buf = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("文件 {} 超过上限 {} 字节", path.display(), max_bytes),
+        ));
+    }
+    Ok(buf)
+}
+
 /// 写入文本文件全文（UTF-8 不带 BOM，对齐 .NET Core `File.WriteAllText` 行为）。
 pub fn write_all_text<P: AsRef<Path>>(path: P, text: &str) -> io::Result<()> {
     fs::write(path, text)
@@ -185,6 +218,21 @@ mod tests {
         bytes.extend_from_slice("<?xml version=\"1.0\"?>".as_bytes());
         fs::write(&file, bytes).unwrap();
         assert_eq!(read_all_text(&file).unwrap(), "<?xml version=\"1.0\"?>");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_limited_accepts_small_and_rejects_large() {
+        let dir = std::env::temp_dir().join(format!("dhrust-io-limited-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("sample.bin");
+        fs::write(&file, [1u8, 2, 3, 4]).unwrap();
+
+        assert_eq!(read_file_limited(&file, 4).unwrap(), vec![1, 2, 3, 4]);
+        let error = read_file_limited(&file, 3).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("超过上限"));
 
         let _ = fs::remove_dir_all(&dir);
     }

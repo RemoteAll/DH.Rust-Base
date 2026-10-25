@@ -95,6 +95,22 @@ pub fn now_utc_str() -> String {
     format_datetime_with_digits(&now_utc(), 0)
 }
 
+/// 现在（UTC）→ ISO 8601 `yyyy-MM-ddTHH:mm:ssZ`（阿里云 API 等签名/请求口径）。
+pub fn iso8601_utc() -> String {
+    now_utc().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Unix 秒 → UTC 日期 `yyyy-MM-dd`（越界返回 `None`）。
+pub fn utc_date_of(secs: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp(secs, 0).map(|dt| dt.format("%Y-%m-%d").to_string())
+}
+
+/// 现在（UTC）→ `(Unix 秒, yyyy-MM-dd)`（腾讯云等需要同时取时间戳与日期）。
+pub fn utc_now_parts() -> (i64, String) {
+    let now = chrono::Utc::now();
+    (now.timestamp(), now.format("%Y-%m-%d").to_string())
+}
+
 /// 现在（**本地时区**）→ `%Y-%m-%d %H:%M:%S`。
 ///
 /// 业务表里的"创建/更新时间"列一律用本地时间文本（与 PHP/C# 端写入口径一致，
@@ -241,6 +257,19 @@ mod tests {
         assert!(parse_datetime("2026-09-26").is_some());
         assert!(parse_datetime("").is_none());
         assert!(parse_datetime("不是时间").is_none());
+    }
+
+    #[test]
+    fn utc_helpers_shape() {
+        let iso = iso8601_utc();
+        assert_eq!(iso.len(), 20);
+        assert!(iso.ends_with('Z'));
+        assert!(parse_datetime(&iso).is_some());
+        assert_eq!(utc_date_of(1_700_000_000).as_deref(), Some("2023-11-14"));
+        assert!(utc_date_of(i64::MAX).is_none());
+        let (secs, date) = utc_now_parts();
+        assert!(secs > 1_700_000_000);
+        assert_eq!(date.len(), 10);
     }
 
     #[test]

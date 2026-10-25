@@ -1,5 +1,7 @@
 //! 通用文本小工具（多消费方收编：Pek.RAgent / Pek.RAdmin / DHDeploy.Agent.Rust 等）。
 
+use std::collections::HashSet;
+
 /// 按字符截断（附省略号"…"；不破坏 UTF-8 边界）。
 ///
 /// 字符数不超过 `max` 时原样返回；否则取前 `max` 个字符并追加省略号。
@@ -84,6 +86,57 @@ pub fn split_mail_addresses(addresses: &str) -> Vec<&str> {
         .collect()
 }
 
+/// 手机号拆分：`,` `;` `|` `，` `；` 分隔，去空白、去重（保持首次出现顺序）。
+pub fn split_phone_numbers(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for part in text.split([',', ';', '|', '，', '；']) {
+        let number = part.trim();
+        if number.is_empty() {
+            continue;
+        }
+        let owned = number.to_string();
+        if seen.insert(owned.clone()) {
+            out.push(owned);
+        }
+    }
+    out
+}
+
+/// 按 `{%key%}` 风格占位符单次扫描替换（未命中的占位符原样保留）。
+///
+/// `open`/`close` 由调用方指定（如 `"{%"` / `"%}"`）；`pairs` 保持调用方顺序，
+/// 冲突时以先出现者为准。相比“逐个 `String::replace`”，本实现只扫描一遍正文，
+/// 参数多、正文长时分配和扫描次数更少。
+pub fn replace_named<K, V>(text: &str, pairs: &[(K, V)], open: &str, close: &str) -> String
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    if pairs.is_empty() || open.is_empty() || close.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(open) {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + open.len()..];
+        let Some(end) = after_open.find(close) else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let key = &after_open[..end];
+        if let Some((_, value)) = pairs.iter().find(|(k, _)| k.as_ref() == key) {
+            out.push_str(value.as_ref());
+        } else {
+            out.push_str(&rest[start..start + open.len() + end + close.len()]);
+        }
+        rest = &after_open[end + close.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +195,34 @@ mod tests {
             vec!["a@x.com", "b@x.com", "c@x.com"]
         );
         assert!(split_mail_addresses("  ;  ").is_empty());
+    }
+
+    #[test]
+    fn phone_numbers_split_and_dedupe_in_order() {
+        assert_eq!(
+            split_phone_numbers("13800138000, 13800138000；13900139000|13800138000"),
+            vec!["13800138000", "13900139000"]
+        );
+        assert!(split_phone_numbers("  ; , ").is_empty());
+    }
+
+    #[test]
+    fn replace_named_single_pass_and_keeps_unknown() {
+        let pairs = [("code", "123456"), ("minutes", "5")];
+        assert_eq!(
+            replace_named(
+                "验证码 {%code%}，{%minutes%} 分钟；{%unknown%}",
+                &pairs,
+                "{%",
+                "%}"
+            ),
+            "验证码 123456，5 分钟；{%unknown%}"
+        );
+        assert_eq!(
+            replace_named("没有占位符", &pairs, "{%", "%}"),
+            "没有占位符"
+        );
+        // 没有闭合符时原样保留剩余文本
+        assert_eq!(replace_named("前 {%code", &pairs, "{%", "%}"), "前 {%code");
     }
 }

@@ -62,6 +62,49 @@ impl Default for HttpClientOptions {
     }
 }
 
+/// 同步请求重试策略（传输错误 + 指定 HTTP 状态码）。
+#[derive(Debug, Clone)]
+pub struct RetryPolicy {
+    /// 总尝试次数（含首次；`0` 按 1 处理）。
+    pub attempts: u32,
+    /// 两次尝试之间的等待（0 = 不等待）。
+    pub delay: Duration,
+    /// 需要重试的 HTTP 状态码；最后一次尝试仍命中时返回该响应（不报错）。
+    pub retry_status: Vec<u16>,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            attempts: 3,
+            delay: Duration::from_millis(200),
+            retry_status: vec![408, 425, 429, 500, 502, 503, 504],
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// 指定总尝试次数（默认 200ms 间隔 + 常见 5xx/429 状态码）。
+    pub fn new(attempts: u32) -> Self {
+        Self {
+            attempts: attempts.max(1),
+            ..Self::default()
+        }
+    }
+
+    /// 设置重试间隔。
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+
+    /// 设置需要重试的状态码。
+    pub fn with_statuses(mut self, statuses: impl IntoIterator<Item = u16>) -> Self {
+        self.retry_status = statuses.into_iter().collect();
+        self
+    }
+}
+
 /// 全量响应。
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
@@ -312,6 +355,52 @@ pub fn blocking_request_auto_with(
     } else {
         blocking_request_with(method, url, headers, content_type, body, &options)
     }
+}
+
+/// 同步请求 + 重试（传输错误与 [`RetryPolicy::retry_status`] 命中的状态码）。
+///
+/// - 每次尝试都使用 [`blocking_request_auto_with`]（非 tokio 上下文直接调用）；
+/// - 最后一次尝试仍返回可重试状态时，返回该响应而不是错误，便于调用方解析错误体；
+/// - `body` 会在每次尝试时克隆（大请求体可考虑自行包 `Arc`，当前接口保持简单）。
+pub fn blocking_request_with_retry(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    content_type: Option<&str>,
+    body: Vec<u8>,
+    options: HttpClientOptions,
+    policy: &RetryPolicy,
+) -> Result<HttpResponse, HttpClientError> {
+    let attempts = policy.attempts.max(1);
+    let mut last_error = None;
+    for attempt in 0..attempts {
+        match blocking_request_auto_with(
+            method,
+            url,
+            headers,
+            content_type,
+            body.clone(),
+            options.clone(),
+        ) {
+            Ok(response) => {
+                let retryable = policy.retry_status.contains(&response.status);
+                if retryable && attempt + 1 < attempts {
+                    if !policy.delay.is_zero() {
+                        std::thread::sleep(policy.delay);
+                    }
+                    continue;
+                }
+                return Ok(response);
+            }
+            Err(error) => {
+                last_error = Some(error);
+                if attempt + 1 < attempts && !policy.delay.is_zero() {
+                    std::thread::sleep(policy.delay);
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| HttpClientError::new("请求失败（未执行）")))
 }
 
 /// 通用请求（同步版，**可在 tokio 运行时线程内安全调用**）：
@@ -1009,6 +1098,49 @@ mod tests {
         .unwrap();
         assert_eq!(rsp.status, 200);
         assert_eq!(rsp.body_text(), "OK");
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn retry_policy_retries_5xx_then_returns_success() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_attempts = std::sync::Arc::clone(&attempts);
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 1024];
+                use std::io::{Read, Write};
+                let _ = stream.read(&mut buf);
+                server_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let response = if server_attempts.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbusy".to_vec()
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK".to_vec()
+                };
+                let _ = stream.write_all(&response);
+            }
+        });
+
+        let policy = RetryPolicy::new(2).with_delay(Duration::from_millis(1));
+        let rsp = blocking_request_with_retry(
+            "GET",
+            &format!("http://{addr}/"),
+            &[],
+            None,
+            Vec::new(),
+            HttpClientOptions {
+                timeout: Duration::from_secs(3),
+                ..Default::default()
+            },
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(rsp.status, 200);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
         let _ = handle.join();
     }
 
