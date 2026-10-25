@@ -199,6 +199,42 @@ pub fn latest_file_by_ext<P: AsRef<Path>>(dir: P, extension: &str) -> Option<std
     best.map(|(_, path)| path)
 }
 
+/// 文件名安全校验（**用户输入的文件/目录名**用：上传、新建目录、重命名）。
+///
+/// 拒绝：空名、`.`/`..`、任何 `..` 片段、路径分隔符、Windows 非法字符
+/// （`:` `*` `?` `"` `<` `>` `|` 与 NUL）、超过 `max_chars` 个字符（`0` = 不限）。
+/// 通过时返回**去首尾空白后**的名字。
+///
+/// 覆盖 HLZX.EIP 文档管理与供应商附件两套口径；`dhrust::fileman::validate_name`
+/// 是更宽松的通用校验（只拦路径分隔符），本函数用于"落盘名必须干净"的场景。
+pub fn safe_file_name(raw: &str, max_chars: usize) -> Result<String, String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err("名称不能为空".to_string());
+    }
+    if max_chars > 0 && name.chars().count() > max_chars {
+        return Err(format!("名称过长（最多 {max_chars} 字）"));
+    }
+    if name == "." || name == ".." || name.contains("..") {
+        return Err("名称不合法".to_string());
+    }
+    for c in ['/', '\\', ':', '*', '?', '"', '<', '>', '|', '\0'] {
+        if name.contains(c) {
+            return Err(format!("名称不能包含字符 {c}"));
+        }
+    }
+    Ok(name.to_string())
+}
+
+/// 朴素文件名：仅 ASCII 字母数字与 `.-_`，且不含 `..`（对外下载/附件名白名单用）。
+pub fn is_plain_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,5 +504,33 @@ mod safe_replace_tests {
         assert!(!bak.exists(), "回滚后备份不应残留");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 文件名安全校验（用户输入落盘名）。
+    #[test]
+    fn safe_file_name_rejects_traversal_and_illegal_chars() {
+        assert_eq!(safe_file_name("  报表.xlsx ", 200).unwrap(), "报表.xlsx");
+        assert!(safe_file_name("", 200).is_err());
+        assert!(safe_file_name("   ", 200).is_err());
+        assert!(safe_file_name(".", 200).is_err());
+        assert!(safe_file_name("..", 200).is_err());
+        assert!(safe_file_name("a..b", 200).is_err(), "含 .. 一律拒绝");
+        for bad in ["a/b", "a\\b", "a:b", "a*b", "a?b", "a\"b", "a<b", "a>b", "a|b"] {
+            assert!(safe_file_name(bad, 200).is_err(), "应拒绝：{bad}");
+        }
+        // 长度按字符计（中文 1 字 = 1）
+        assert!(safe_file_name("一二三四五", 5).is_ok());
+        assert!(safe_file_name("一二三四五六", 5).is_err());
+        assert!(safe_file_name("任意长度", 0).is_ok(), "0 = 不限长度");
+    }
+
+    /// 朴素文件名（对外附件名白名单）。
+    #[test]
+    fn plain_file_name_allows_only_ascii_word_chars() {
+        assert!(is_plain_file_name("license-2026_01.png"));
+        assert!(!is_plain_file_name(""));
+        assert!(!is_plain_file_name("../a.png"));
+        assert!(!is_plain_file_name("a b.png"), "空格不允许");
+        assert!(!is_plain_file_name("附件.png"), "非 ASCII 不允许");
     }
 }

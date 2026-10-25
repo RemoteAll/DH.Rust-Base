@@ -137,6 +137,80 @@ where
     out
 }
 
+/// 中国大陆手机号：忽略首尾空白，11 位且全为数字、以 `1` 开头。
+///
+/// （HLZX.EIP 的账号体系下沉；只做格式判断，不校验号段真实性。）
+pub fn is_mobile_cn(text: &str) -> bool {
+    let t = text.trim();
+    t.len() == 11 && t.chars().all(|c| c.is_ascii_digit()) && t.starts_with('1')
+}
+
+/// 手机号脱敏（日志/提示用）：11 位时保留前 3 后 4（`183****5593`），其它原样返回。
+pub fn mask_mobile(text: &str) -> String {
+    let t = text.trim();
+    if t.len() == 11 && t.chars().all(|c| c.is_ascii_digit()) {
+        // 已确认是 11 位 ASCII 数字，按字节切安全
+        format!("{}****{}", &t[..3], &t[7..])
+    } else {
+        t.to_string()
+    }
+}
+
+/// 邮箱脱敏：本地部分保留前 2 位（`ab***@example.com`）；本地部分过短或无 `@` 时原样返回。
+pub fn mask_email(text: &str) -> String {
+    let t = text.trim();
+    match t.split_once('@') {
+        Some((user, domain)) if user.chars().count() > 2 => {
+            let head: String = user.chars().take(2).collect();
+            format!("{head}***@{domain}")
+        }
+        _ => t.to_string(),
+    }
+}
+
+/// 宽松邮箱校验：有 `@`、域名含点、无空白，总长 ≥6。
+///
+/// 用于「注册/登录」这类先放行、真伪靠验证邮件或人工审核的场景；
+/// 需要严格口径（各级长度/字符集）时用 [`is_email`]。
+pub fn is_email_lenient(text: &str) -> bool {
+    let t = text.trim();
+    if t.chars().count() < 6 || t.contains(char::is_whitespace) {
+        return false;
+    }
+    match t.split_once('@') {
+        Some((user, domain)) => {
+            !user.is_empty()
+                && domain.contains('.')
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
+        }
+        None => false,
+    }
+}
+
+/// 连接串脱敏（**日志/展示**用）：把 `pwd` / `password` / `user password` 的值替换成 `***`，
+/// 其余键值原样保留（键名大小写不敏感）。
+///
+/// 与「白名单摘要」的区别：本函数**不丢弃**非敏感键，适合排查问题时打日志；
+/// 需要只暴露少数键时（如列表展示）由调用方自行挑选键。
+pub fn mask_connection_string(conn: &str) -> String {
+    conn.split(';')
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| {
+            let key = p.split('=').next().unwrap_or_default().trim();
+            if key.eq_ignore_ascii_case("pwd")
+                || key.eq_ignore_ascii_case("password")
+                || key.eq_ignore_ascii_case("user password")
+            {
+                format!("{key}=***")
+            } else {
+                p.trim().to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +298,47 @@ mod tests {
         );
         // 没有闭合符时原样保留剩余文本
         assert_eq!(replace_named("前 {%code", &pairs, "{%", "%}"), "前 {%code");
+    }
+
+    /// 手机号/邮箱：格式判断 + 脱敏（HLZX.EIP 账号体系下沉）。
+    #[test]
+    fn mobile_and_email_helpers() {
+        assert!(is_mobile_cn("18307555593"));
+        assert!(is_mobile_cn(" 18307555593 "), "忽略首尾空白");
+        assert!(!is_mobile_cn("1830755559"), "10 位不接受");
+        assert!(!is_mobile_cn("28307555593"), "不以 1 开头");
+        assert!(!is_mobile_cn("1830755559a"));
+
+        assert_eq!(mask_mobile("18307555593"), "183****5593");
+        assert_eq!(mask_mobile("12345"), "12345", "非 11 位原样");
+        assert_eq!(mask_mobile(""), "");
+
+        assert_eq!(mask_email("berin@hlktech.com"), "be***@hlktech.com");
+        assert_eq!(mask_email("ab@x.com"), "ab@x.com", "本地部分过短原样");
+        assert_eq!(mask_email("不是邮箱"), "不是邮箱");
+        // 中文/Unicode 本地部分按字符截取（不能按字节切）
+        assert_eq!(mask_email("张三李四@x.com"), "张三***@x.com");
+
+        assert!(is_email_lenient("a@b.cn"), "宽松口径放行短域名");
+        assert!(!is_email_lenient("a b@c.com"), "含空白拒绝");
+        assert!(!is_email_lenient("ab@cd"), "域名无点拒绝");
+        assert!(!is_email_lenient("@cd.com"));
+        assert!(!is_email_lenient("ab@.com"), "域名以点开头拒绝");
+    }
+
+    /// 连接串脱敏：只遮蔽口令类键，其余原样（日志排查用）。
+    #[test]
+    fn connection_string_masking() {
+        let conn = "Server=db.local;Database=erp;Uid=root;Pwd=secret123;Provider=MySQL";
+        let masked = mask_connection_string(conn);
+        assert!(!masked.contains("secret123"), "{masked}");
+        assert!(masked.contains("Pwd=***"), "{masked}");
+        assert!(masked.contains("Server=db.local"), "非敏感键保留：{masked}");
+        assert!(masked.contains("Database=erp"), "{masked}");
+        // 大小写不敏感 + `Password` / `User Password`
+        let m2 = mask_connection_string("Password=x;user password=y;Host=z");
+        assert_eq!(m2, "Password=***;user password=***;Host=z");
+        // 空段忽略
+        assert_eq!(mask_connection_string("A=1;;"), "A=1");
     }
 }
