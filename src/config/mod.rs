@@ -10,7 +10,9 @@
 //! - [`toml`] 子模块（`feature = "toml"`）：TOML 配置维护管线——保注释补齐、类型修正回写、
 //!   未知项识别、备份写入（tcp-scanner-server 实践沉淀，供现场可编辑配置复用）。//! - [`TomlConfig<T>`]（`feature = "toml"`）：[`Config<T>`] 的 **TOML 版**（同样语义：缺失生成、
 //!   缺键带注释补齐、类型容错、损坏备份重建、外部改动热加载），并**自动迁移同目录同名旧版 `.json`**
-//!   （写 TOML + 旧文件改名 `.json.bak`，各项目无需写迁移代码）。需要运维手工改的配置用它。//! - Rust 读取 C# 写的配置文件、C# 读取 Rust 写的配置文件均保持兼容。
+//!   （写 TOML + 旧文件改名 `.json.bak`，各项目无需写迁移代码）。需要运维手工改的配置用它。
+//! - [`TomlConfigStore<T>`]（`feature = "toml"`）：在 `TomlConfig<T>` 之上补上**共享快照 + 文件句柄**
+//!   的常用编排（打开/保存/热加载/纯内存模式），供服务 Facade 直接复用。//! - Rust 读取 C# 写的配置文件、C# 读取 Rust 写的配置文件均保持兼容。
 //!
 //! # 示例
 //!
@@ -33,9 +35,13 @@ mod xml;
 pub mod toml;
 #[cfg(feature = "toml")]
 mod toml_config;
+#[cfg(feature = "toml")]
+mod toml_store;
 
 #[cfg(feature = "toml")]
 pub use toml_config::TomlConfig;
+#[cfg(feature = "toml")]
+pub use toml_store::TomlConfigStore;
 
 pub use file_config::{
     coerce_json, file_stamp, save_if_changed, save_value, Config, ConfigOptions, FileStamp,
