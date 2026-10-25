@@ -11,15 +11,46 @@
 /// 说明：空格编码为 `%20`（非 `+`）；表单风格（空格→`+`）请在上层对结果自行处理。
 pub fn url_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
-    for b in value.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(*b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
+    push_url_encoded(&mut out, value);
+    out
+}
+
+/// `application/x-www-form-urlencoded` 键值对编码（`k=v&k=v`，RFC 3986 百分号编码）。
+///
+/// 保持传入顺序（不排序）；阿里巴巴/连陆等表单签名场景可直接复用。
+pub fn form_encode<I, K, V>(pairs: I) -> String
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let mut out = String::new();
+    for (key, value) in pairs {
+        if !out.is_empty() {
+            out.push('&');
         }
+        push_url_encoded(&mut out, key.as_ref());
+        out.push('=');
+        push_url_encoded(&mut out, value.as_ref());
     }
     out
+}
+
+/// 追加 RFC 3986 编码（避免每个字段/字节单独创建 String）。
+fn push_url_encoded(out: &mut String, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &b in value.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
+        }
+    }
 }
 
 /// JSON 字符串转义（去掉两端引号；结果可直接嵌入 JSON 字符串字面量内部）。
@@ -130,6 +161,15 @@ mod tests {
         assert_eq!(url_encode("abc-_.~"), "abc-_.~");
         assert_eq!(url_encode("中 文"), "%E4%B8%AD%20%E6%96%87");
         assert_eq!(url_encode("a b&c"), "a%20b%26c");
+    }
+
+    #[test]
+    fn form_encode_preserves_order_and_encodes() {
+        assert_eq!(
+            form_encode([("a", "b c"), ("中", "文")]),
+            "a=b%20c&%E4%B8%AD=%E6%96%87"
+        );
+        assert_eq!(form_encode::<_, &str, &str>([]), "");
     }
 
     #[test]

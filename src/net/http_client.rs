@@ -175,11 +175,7 @@ pub async fn post_form(
     headers: &[(&str, &str)],
     options: &HttpClientOptions,
 ) -> Result<HttpResponse, HttpClientError> {
-    let body = form
-        .iter()
-        .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
-        .collect::<Vec<_>>()
-        .join("&");
+    let body = crate::web::form_encode(form.iter().map(|(k, v)| (*k, v.as_str())));
     execute(
         Method::POST,
         url,
@@ -296,6 +292,26 @@ pub fn blocking_request_with(
         .map_err(|e| HttpClientError::new(format!("创建 tokio 运行时失败: {e}")))?;
 
     rt.block_on(request(method, url, headers, content_type, body, options))
+}
+
+/// 通用请求（同步版，**自动选择直接/offthread**）。
+///
+/// - 当前线程不在 tokio 运行时内：直接 [`blocking_request_with`]（少一次线程 + 运行时转发）；
+/// - 当前线程在 tokio 运行时内：转 [`blocking_request_offthread_with`]，避免“运行时内 block_on”恐慌。
+///
+pub fn blocking_request_auto_with(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    content_type: Option<&str>,
+    body: Vec<u8>,
+    options: HttpClientOptions,
+) -> Result<HttpResponse, HttpClientError> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        blocking_request_offthread_with(method, url, headers, content_type, body, options)
+    } else {
+        blocking_request_with(method, url, headers, content_type, body, &options)
+    }
 }
 
 /// 通用请求（同步版，**可在 tokio 运行时线程内安全调用**）：
@@ -961,6 +977,39 @@ mod tests {
 
         // 不可达：返回错误而非 panic
         assert!(blocking_get_text("http://127.0.0.1:1/", Duration::from_millis(300)).is_err());
+    }
+
+    #[tokio::test]
+    async fn blocking_request_auto_works_inside_runtime() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                use std::io::{Read, Write};
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                );
+            }
+        });
+
+        let options = HttpClientOptions {
+            timeout: Duration::from_secs(3),
+            ..Default::default()
+        };
+        let rsp = blocking_request_auto_with(
+            "GET",
+            &format!("http://{addr}/"),
+            &[],
+            None,
+            Vec::new(),
+            options,
+        )
+        .unwrap();
+        assert_eq!(rsp.status, 200);
+        assert_eq!(rsp.body_text(), "OK");
+        let _ = handle.join();
     }
 
     #[test]
