@@ -118,6 +118,28 @@ pub fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
     to_hex_lower(&hmac_sha256(key, data))
 }
 
+/// HMAC-SHA1（对齐 C# `new HMACSHA1(key).ComputeHash(data)`；20 字节）。
+///
+/// 阿里云短信/OpenAPI 签名（`HMAC-SHA1` + Base64）等场景使用。
+pub fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
+    let mut mac = Hmac::<Sha1>::new_from_slice(key).expect("HMAC 接受任意长度密钥");
+    mac.update(data);
+    let out = mac.finalize().into_bytes();
+    let mut result = [0u8; 20];
+    result.copy_from_slice(&out);
+    result
+}
+
+/// HMAC-SHA1 → 40 位小写十六进制。
+pub fn hmac_sha1_hex(key: &[u8], data: &[u8]) -> String {
+    to_hex_lower(&hmac_sha1(key, data))
+}
+
+/// HMAC-SHA1 → Base64（阿里云 `Signature` 口径：等价于十六进制摘要再转字节后 Base64）。
+pub fn hmac_sha1_base64(key: &[u8], data: &[u8]) -> String {
+    base64_encode(&hmac_sha1(key, data))
+}
+
 /// 字节数组 → 小写十六进制字符串（自 `plugin::hex_encode` 迁入，2026-10-09；
 /// plugin 内保留同名转发，原调用路径不变）。
 pub fn hex_encode(bytes: &[u8]) -> String {
@@ -284,6 +306,20 @@ mod tests {
             "900150983cd24fb0d6963f7d28e17f72"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn hmac_sha1_rfc2202_case1() {
+        // RFC 2202 Test Case 1: key=0x0b*20, data="Hi There"
+        let key = [0x0bu8; 20];
+        assert_eq!(
+            hmac_sha1_hex(&key, b"Hi There"),
+            "b617318655057264e28bc0b6fb378c8ef146be00"
+        );
+        assert_eq!(
+            hmac_sha1_base64(&key, b"Hi There"),
+            base64_encode(&hex_decode("b617318655057264e28bc0b6fb378c8ef146be00").unwrap())
+        );
     }
 
     #[test]

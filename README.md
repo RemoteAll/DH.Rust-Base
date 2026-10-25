@@ -10,7 +10,7 @@ Pek 生态的 Rust 基础库，对应 C# 的 **DH.NCore**：为 Rust 项目提�
 |------|------|----------------|
 | `times` | 时间戳、与 C# 兼容的时间文本格式化/解析 | `Runtime` / `Convert.Trim` 等 |
 | `io` | 文本文件读写（含 BOM 处理） | `File.ReadAllText/WriteAllText` 语义 |
-| `sign` | 签名（SHA1 排序拼接）、随机串、MD5、FNV-1a | `Security` 扩展 |
+| `sign` | 签名（SHA1 排序拼接）、随机串、MD5/SHA-256/HMAC-SHA1/HMAC-SHA256、FNV-1a | `Security` 扩展 |
 | `random` | 安全随机（OS 熵）：URL 安全令牌、十六进制短标识 | — |
 | `threading` | 不可重入定时器、调度器、Cron 表达式 | `NewLife.Threading`（`TimerX`/`TimerScheduler`/`Cron`） |
 | `config` | 核心设置 `Setting`，读写 `Config/Core.config`（XML）/ `Core.json`；TOML 配置 `TomlConfig<T>`（feature `toml`，含 `save_with_arrays` 数组表同步） | `NewLife.Setting` / `Configuration` |
