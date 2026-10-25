@@ -41,6 +41,15 @@ pub fn md5_hex(text: &str) -> String {
     md5_hex_bytes(text.as_bytes())
 }
 
+/// MD5 短值（16 位十六进制）：完整 32 位摘要的第 8~24 位。
+///
+/// 对齐 C# `DH.RateLimter.Common.EncryptMD5Short`（`Substring(8, 16)`），
+/// 用于限流键等需要短哈希的场景；调用方负责确认截断长度足够抗碰撞。
+pub fn md5_short(text: &str) -> String {
+    let full = md5_hex(text);
+    full.get(8..24).unwrap_or(&full).to_string()
+}
+
 /// 计算字节数组的 MD5 摘要（16 字节）。
 pub fn md5_bytes(data: &[u8]) -> [u8; 16] {
     let digest = Md5::digest(data);
@@ -251,6 +260,13 @@ mod tests {
     fn md5_hex_matches_newlife() {
         assert_eq!(md5_hex("abc"), "900150983cd24fb0d6963f7d28e17f72");
         assert_eq!(md5_hex(""), "d41d8cd98f00b204e9800998ecf8427e");
+    }
+
+    #[test]
+    fn md5_short_matches_dotnet_substring() {
+        // C# `EncryptMD5Short` = MD5(value).Substring(8, 16)
+        assert_eq!(md5_short("abc"), "3cd24fb0d6963f7d");
+        assert_eq!(md5_short("").len(), 16);
     }
 
     #[test]

@@ -127,6 +127,41 @@ fn probe_port(host: &str, port: u16) -> bool {
         .is_ok()
 }
 
+/// IP 文本 → 十进制数字字符串（IPv4/IPv6 均按大端无符号整数解释）。
+///
+/// 对齐 C# `DH.RateLimter.Common.IpToNum`（`GetAddressBytes` 反转 + 补 0 后
+/// `BigInteger` 转十进制），例如 `127.0.0.1` → `2130706433`、`::1` → `1`。
+/// 容忍 `[::1]` / `[::1]:80` / `1.2.3.4:80` 形式；解析失败返回 `None`。
+///
+/// 用于限流键压缩等场景（IP 字符串含冒号/点，直接作键占空间且不宜做哈希前缀）。
+pub fn ip_to_num(ip: &str) -> Option<String> {
+    let text = ip.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let text = text.trim_start_matches('[');
+    let text = match text.find(']') {
+        // `[::1]:80` / `[::1]`
+        Some(end) => &text[..end],
+        None => match text.rsplit_once(':') {
+            // 仅对「IPv4 + 端口」剥离端口；裸 IPv6 的最后一个冒号属于地址本身
+            Some((host, port))
+                if !port.is_empty()
+                    && port.bytes().all(|b| b.is_ascii_digit())
+                    && host.parse::<std::net::Ipv4Addr>().is_ok() =>
+            {
+                host
+            }
+            _ => text,
+        },
+    };
+    match text.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => Some(u32::from_be_bytes(v4.octets()).to_string()),
+        Ok(std::net::IpAddr::V6(v6)) => Some(u128::from_be_bytes(v6.octets()).to_string()),
+        Err(_) => None,
+    }
+}
+
 /// 拆分 `host:port` 文本（按最后一个 `:` 切分；端口非法或缺省时回退 `default_port`）。
 ///
 /// IPv6 字面量请使用 `[::1]:80` 形式（与 URL 惯例一致）。
@@ -184,6 +219,24 @@ mod tests {
         assert_eq!(split_host_port("host:abc", 80), ("host".to_string(), 80));
         // IPv6 字面量：按最后一个冒号切分（`[::1]:80`）
         assert_eq!(split_host_port("[::1]:80", 0), ("[::1]".to_string(), 80));
+    }
+
+    #[test]
+    fn ip_to_num_matches_dotnet_big_integer() {
+        assert_eq!(ip_to_num("127.0.0.1").as_deref(), Some("2130706433"));
+        assert_eq!(ip_to_num("192.168.1.1").as_deref(), Some("3232235777"));
+        assert_eq!(ip_to_num("0.0.0.0").as_deref(), Some("0"));
+        // 端口/方括号形式容忍
+        assert_eq!(ip_to_num("1.2.3.4:8080").as_deref(), Some("16909060"));
+        assert_eq!(ip_to_num("[::1]:8080").as_deref(), Some("1"));
+        // IPv6 按 128 位大端整数
+        assert_eq!(ip_to_num("::1").as_deref(), Some("1"));
+        assert_eq!(
+            ip_to_num("2001:db8::1").as_deref(),
+            Some("42540766411282592856903984951653826561")
+        );
+        assert_eq!(ip_to_num("not-an-ip"), None);
+        assert_eq!(ip_to_num(""), None);
     }
 
     #[test]

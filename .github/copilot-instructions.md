@@ -14,6 +14,7 @@
 
 - **与 C# 语义对齐是最高红线**：时间文本格式、配置读写（XML/JSON 字段与写回顺序）、Cron 求值、日志行格式与列序——均与 DH.NCore 逐字符对齐；动这些之前先读 `scripts/interop.ps1` 覆盖的三项互通断言。
 - **不轻增依赖**：新依赖一律 `optional = true` + 独立 feature；重依赖面（hyper/tokio/rustls 等）只挂在 `net` / `net-tls` / `http-client` 等特性后，勿进默认路径。
+- **限流计数统一用 `ratelimit`**：固定窗口/接口限流用 `dhrust::ratelimit`（`WindowLimiter` + `CounterStore`），不要在项目里自写 `Mutex<HashMap>` 计数器；多实例共享计数实现 `CounterStore`（如 Redis）注入。
 - **改公共 API 必须复测消费方编译**（至少 Pek.RCode / Pek.RCard / Pek.RAgent 中受影响者），本库是它们的编译期上游。
 - **文档即规范**：`Doc/`（Razor 子集引擎架构/需求、SPA 与 MVC 一体化）是设计依据，改行为先改文档。
 - 中文 `.ps1` 必须 **UTF-8 with BOM**；跑 python 前设 `$env:PYTHONIOENCODING='utf-8'`。

@@ -12,6 +12,7 @@ Pek 生态的 Rust 基础库，对应 C# 的 **DH.NCore**：为 Rust 项目提�
 | `io` | 文本文件读写（含 BOM 处理） | `File.ReadAllText/WriteAllText` 语义 |
 | `sign` | 签名（SHA1 排序拼接）、随机串、MD5/SHA-256/HMAC-SHA1/HMAC-SHA256、FNV-1a | `Security` 扩展 |
 | `random` | 安全随机（OS 熵）：URL 安全令牌、十六进制短标识 | — |
+| `ratelimit` | 固定窗口限流：`CounterStore` 抽象 + `WindowLimiter` + 分片进程内 `FixedWindowStore`（首次创建过期、可注入 Redis 共享计数） | `DH.RateLimter`（计数器部分） |
 | `threading` | 不可重入定时器、调度器、Cron 表达式 | `NewLife.Threading`（`TimerX`/`TimerScheduler`/`Cron`） |
 | `config` | 核心设置 `Setting`，读写 `Config/Core.config`（XML）/ `Core.json`；TOML 配置 `TomlConfig<T>`（feature `toml`，含 `save_with_arrays` 数组表同步） | `NewLife.Setting` / `Configuration` |
 | `logs` | 分级日志：控制台/文本文件/复合输出、全局门面与 `info!` 等宏 | `NewLife.Log`（`XTrace`/`ILog`/`TextFileLog`/`ConsoleLog`/`CompositeLog`） |
@@ -91,6 +92,26 @@ router.fallback(route(move |ctx| {
 
 `net::tcp_check(host, port, timeout)`：TCP 探活（连接成功即 `Ok`）；`net::split_host_port` 解析 `host:port`。
 `io::lexical_normalize`：词法路径归一化（不访问文件系统）。
+
+## 限流（ratelimit）
+
+通用固定窗口计数引擎，不依赖 HTTP；HTTP 接口级多策略限流见 `pek_rwaf::throttle`。
+
+```rust
+use std::time::Duration;
+use dhrust::ratelimit::WindowLimiter;
+
+let limiter = WindowLimiter::new();
+let d = limiter.hit("api:login:1.2.3.4", 5, Duration::from_secs(60));
+if !d.allowed {
+    // 返回 429；d.reset_in 可直接用于 Retry-After
+}
+```
+
+- 每个键首次命中开始独立窗口；窗口内后续命中**不会延长**过期时间；
+- 正好放行 `limit` 次，第 `limit + 1` 次超限；`limit == 0` 或窗口为 0 视为关闭且不计数；
+- 进程内存储按 CPU 并行度分片（4~16），每片键数有上限并自动清理过期键，防止内存无界增长；
+- 多实例全局限流：实现 `CounterStore`（如 `Pek.RRedis`）并通过 `WindowLimiter::with_store` 注入。
 
 ## 定时与 Cron（threading）
 

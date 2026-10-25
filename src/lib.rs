@@ -11,6 +11,7 @@ pub mod patch;
 #[cfg(feature = "plugin")]
 pub mod plugin; // 插件包格式 + 插件源目录签名（Ed25519；Pek.RAgent 与 Pek.RPanlServer 共用）
 pub mod random; // 安全随机（OS 熵；令牌/密钥等安全凭证）
+pub mod ratelimit; // 固定窗口限流（通用计数引擎；进程内存储可替换 Redis；HTTP 策略见 pek_rwaf::throttle）
 #[cfg(feature = "secret")]
 pub mod secret; // 可逆加密（AES-256-GCM；敏感值“防直读”存储；配置密码/凭据场景，见模块文档）
 #[cfg(feature = "service")]
