@@ -252,9 +252,50 @@ pub fn is_plain_file_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
 
+/// 清洗为安全文件名：路径分隔符/控制字符等替换为 `_`，`..` 替换为 `__`，空名返回 `_`。
+///
+/// 与 [`safe_file_name`]（**拒绝**非法名）不同，本函数用于“必须生成一个名字”的场景
+/// （如按类型名/标题落盘），保证结果无目录穿越风险。
+pub fn sanitize_file_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => out.push('_'),
+            c if c.is_control() => out.push('_'),
+            c => out.push(c),
+        }
+    }
+    while out.contains("..") {
+        out = out.replace("..", "__");
+    }
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
+}
+
+/// 可执行文件所在目录（对齐 C# `AppDomain.CurrentDomain.BaseDirectory`；失败返回当前目录）。
+pub fn exe_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_file_name_replaces_illegal_chars() {
+        assert_eq!(sanitize_file_name("Demo.User"), "Demo.User");
+        assert_eq!(sanitize_file_name("a/b\\c:d"), "a_b_c_d");
+        assert_eq!(sanitize_file_name(".."), "__");
+        assert_eq!(sanitize_file_name("a..b"), "a__b");
+        assert_eq!(sanitize_file_name(""), "_");
+        assert_eq!(sanitize_file_name("a\nb"), "a_b");
+        assert!(!exe_dir().as_os_str().is_empty());
+    }
 
     #[test]
     fn text_roundtrip_and_bom_strip() {

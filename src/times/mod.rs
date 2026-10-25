@@ -134,6 +134,60 @@ pub fn from_unix_timestamp(value: i64) -> Option<NaiveDateTime> {
     })
 }
 
+/// 解析“年 / 年月 / 年月日”模式并返回**闭区间**（按日精度；供日志/报表分组查询）。
+///
+/// 例：`2024` → `[2024-01-01 00:00:00, 2024-12-31 23:59:59]`；
+/// `2024-02`、`2024-01-31` 同理；格式不符或日期越界返回 `None`。
+pub fn date_range_of(pattern: &str) -> Option<(NaiveDateTime, NaiveDateTime)> {
+    let pattern = pattern.trim();
+    let parts: Vec<&str> = pattern.split('-').collect();
+    let (start, end) = match parts.as_slice() {
+        [year] if year.len() == 4 && year.chars().all(|c| c.is_ascii_digit()) => {
+            let year: i32 = year.parse().ok()?;
+            (
+                chrono::NaiveDate::from_ymd_opt(year, 1, 1)?,
+                chrono::NaiveDate::from_ymd_opt(year, 12, 31)?,
+            )
+        }
+        [year, month]
+            if year.len() == 4
+                && month.len() == 2
+                && year.chars().all(|c| c.is_ascii_digit())
+                && month.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            let year: i32 = year.parse().ok()?;
+            let month: u32 = month.parse().ok()?;
+            let first = chrono::NaiveDate::from_ymd_opt(year, month, 1)?;
+            let next = if month == 12 {
+                chrono::NaiveDate::from_ymd_opt(year + 1, 1, 1)?
+            } else {
+                chrono::NaiveDate::from_ymd_opt(year, month + 1, 1)?
+            };
+            (first, next.pred_opt()?)
+        }
+        [year, month, day]
+            if year.len() == 4
+                && month.len() == 2
+                && day.len() == 2
+                && year.chars().all(|c| c.is_ascii_digit())
+                && month.chars().all(|c| c.is_ascii_digit())
+                && day.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            let date = chrono::NaiveDate::from_ymd_opt(
+                year.parse().ok()?,
+                month.parse().ok()?,
+                day.parse().ok()?,
+            )?;
+            (date, date)
+        }
+        _ => return None,
+    };
+    Some((
+        start.and_hms_opt(0, 0, 0)?,
+        end.and_hms_opt(23, 59, 59)?,
+    ))
+}
+
 /// 现在（UTC 朴素时间）。
 pub fn now_utc() -> NaiveDateTime {
     chrono::Utc::now().naive_utc()
@@ -333,6 +387,26 @@ mod tests {
         );
         assert_eq!(parse_datetime_lax(""), None);
         assert_eq!(parse_datetime_lax("abc"), None);
+    }
+
+    #[test]
+    fn date_range_of_year_month_day() {
+        let (start, end) = date_range_of("2024").unwrap();
+        assert_eq!(start.format("%Y-%m-%d %H:%M:%S").to_string(), "2024-01-01 00:00:00");
+        assert_eq!(end.format("%Y-%m-%d %H:%M:%S").to_string(), "2024-12-31 23:59:59");
+
+        let (start, end) = date_range_of("2024-02").unwrap();
+        assert_eq!(start.format("%Y-%m-%d").to_string(), "2024-02-01");
+        assert_eq!(end.format("%Y-%m-%d").to_string(), "2024-02-29");
+
+        let (start, end) = date_range_of("2024-01-31").unwrap();
+        assert_eq!(start.format("%Y-%m-%d %H:%M:%S").to_string(), "2024-01-31 00:00:00");
+        assert_eq!(end.format("%Y-%m-%d %H:%M:%S").to_string(), "2024-01-31 23:59:59");
+
+        assert!(date_range_of("2024-1").is_none());
+        assert!(date_range_of("abc").is_none());
+        assert!(date_range_of("2024-13").is_none());
+        assert!(date_range_of("2024-02-30").is_none());
     }
 
     #[test]

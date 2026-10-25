@@ -227,9 +227,58 @@ fn trim2(v: f64) -> String {
     }
 }
 
+/// 分页结果（与 C# `PagedResult<T>` 字段口径一致：`PageIndex/PageSize/TotalCount/TotalPages`）。
+///
+/// 供内存数据库/列表接口复用；`total_pages` 由构造器按 `total_count.div_ceil(page_size)` 计算
+/// （`page_size = 0` 按 1 处理，避免除零）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Paged<T> {
+    /// 当前页数据。
+    pub items: Vec<T>,
+    /// 页索引（从 0 开始）。
+    pub page_index: usize,
+    /// 页大小。
+    pub page_size: usize,
+    /// 总记录数。
+    pub total_count: usize,
+    /// 总页数。
+    pub total_pages: usize,
+}
+
+impl<T> Paged<T> {
+    /// 按数据与分页参数构造（自动计算总页数）。
+    pub fn new(items: Vec<T>, page_index: usize, page_size: usize, total_count: usize) -> Self {
+        let page_size = page_size.max(1);
+        Self {
+            items,
+            page_index,
+            page_size,
+            total_count,
+            total_pages: total_count.div_ceil(page_size),
+        }
+    }
+
+    /// 是否为空页。
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paged_computes_total_pages() {
+        let page = Paged::new(vec![1, 2, 3], 0, 2, 5);
+        assert_eq!(page.total_pages, 3);
+        assert_eq!(page.page_size, 2);
+        assert!(!page.is_empty());
+        let empty = Paged::<i32>::new(Vec::new(), 0, 0, 0);
+        assert_eq!(empty.page_size, 1);
+        assert_eq!(empty.total_pages, 0);
+        assert!(empty.is_empty());
+    }
 
     #[test]
     fn url_encode_is_rfc3986() {
