@@ -147,9 +147,9 @@ struct Entry {
 /// 进程内固定窗口存储（分片 `Mutex<HashMap>`，降低高并发争用）。
 ///
 /// 每个分片有键数上限（默认 [`Self::DEFAULT_MAX_ENTRIES_PER_SHARD`]）：
-/// 达到上限时先清理过期键；若仍满，移除**最早开始**的键再插入，保证内存有界
-/// （被移除的键计数归零，属于内存安全优先的取舍；限流键应使用 IP / 哈希短值等
-/// 低基数输入，避免被大量唯一键冲刷）。
+/// 达到上限时 **O(1)** 移除任意一个键再插入，保证内存有界且热路径不扫描全表
+/// （被移除的键计数归零，属于内存安全优先的取舍；限流键应使用 IP / 哈希短值等低基数输入）。
+/// 如需批量回收过期键，可显式调用 [`Self::prune_expired`]。
 pub struct FixedWindowStore {
     shards: Vec<Mutex<HashMap<String, Entry>>>,
     max_entries_per_shard: usize,
@@ -248,17 +248,14 @@ impl CounterStore for FixedWindowStore {
             };
         }
 
-        // 新键：分片满时先清理过期键；仍满则移除最早开始的键，保证内存有界
+        // 新键：分片满时 O(1) 淘汰一个键，保证内存有界。
+        // 不在插入热路径做 O(n) 全表扫描——唯一键攻击下（大量伪造 IP/头值）会变成 CPU 热点；
+        // 过期键由 `prune_expired()` 或后续覆盖逐步清理。被淘汰的键计数归零，
+        // 属于「内存安全优先」的取舍（限流键应使用 IP/哈希短值等低基数输入）。
         if map.len() >= self.max_entries_per_shard {
-            map.retain(|_, e| now.saturating_duration_since(e.start) < e.window);
-            if map.len() >= self.max_entries_per_shard {
-                let oldest = map
-                    .iter()
-                    .min_by_key(|(_, e)| e.start)
-                    .map(|(k, _)| k.clone());
-                if let Some(oldest) = oldest {
-                    map.remove(&oldest);
-                }
+            let victim = map.keys().next().cloned();
+            if let Some(victim) = victim {
+                map.remove(&victim);
             }
         }
 
