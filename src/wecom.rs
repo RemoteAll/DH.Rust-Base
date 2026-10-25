@@ -8,6 +8,8 @@
 //!   `markdown_v2` 不支持颜色与 @群成员
 //! - 注意（实测）：markdown 类消息在**微信端无法查看**（显示“不支持的内容”），需要全端可见时请用 [`WeComBot::send_text`]
 //! - 响应按 `errcode` 判定：0 成功；非 0（如 93000 无效 key）返回 [`WeComError`] 并附带 errmsg
+//! - 同步入口：`send_text_blocking` / `send_markdown_blocking` / `send_markdown_v2_blocking`
+//!   （供面板保存、脚本、定时任务等阻塞上下文使用；异步上下文请用对应 async 方法）
 //! - 载荷构造与响应解析为纯函数（[`text_payload`] / [`markdown_payload`] / [`markdown_v2_payload`] /
 //!   [`parse_response`]），便于组合复用与单元测试
 
@@ -121,11 +123,39 @@ impl WeComBot {
     /// 供阻塞上下文低频调用（告警/日报任务线程等）；异步上下文请直接用
     /// [`send_markdown_v2`]。
     pub fn send_markdown_v2_blocking(&self, content: &str) -> Result<WeComResult, WeComError> {
+        self.send_value_blocking(markdown_v2_payload(content))
+    }
+
+    /// 发送文本消息（同步版；内部创建临时 tokio 运行时）。
+    ///
+    /// 与 [`send_text`] 等价，供阻塞上下文（面板保存、脚本、定时任务线程）调用。
+    pub fn send_text_blocking(
+        &self,
+        content: &str,
+        mentioned_list: &[&str],
+        mentioned_mobile_list: &[&str],
+    ) -> Result<WeComResult, WeComError> {
+        self.send_value_blocking(text_payload(content, mentioned_list, mentioned_mobile_list))
+    }
+
+    /// 发送 Markdown 消息（同步版；内部创建临时 tokio 运行时）。
+    ///
+    /// 注意：markdown 类消息在**微信端**无法查看（见模块文档），全端可见请用
+    /// [`send_text_blocking`]。
+    pub fn send_markdown_blocking(&self, content: &str) -> Result<WeComResult, WeComError> {
+        self.send_value_blocking(markdown_payload(content))
+    }
+
+    /// 发送已构造好的消息载荷（同步版）。
+    ///
+    /// 供阻塞上下文低频调用；异步上下文请直接用 [`Self::send_value`] 对应的
+    /// `send_text` / `send_markdown` / `send_markdown_v2`。
+    pub fn send_value_blocking(&self, payload: Value) -> Result<WeComResult, WeComError> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| WeComError::new(format!("创建 tokio 运行时失败: {e}")))?;
-        rt.block_on(self.send_markdown_v2(content))
+        rt.block_on(self.send_value(payload))
     }
 
     /// 发送已构造好的消息载荷（`msgtype` 已在载荷中）。
@@ -262,6 +292,16 @@ mod tests {
         let bot = WeComBot::new("  ");
         let err = bot.send_text("hi", &[], &[]).await.unwrap_err();
         assert!(err.to_string().contains("为空"), "{err}");
+    }
+
+    #[test]
+    fn blocking_send_rejects_empty_webhook() {
+        // 同步入口与异步入口共用同一套校验；空地址在本地失败、不发网络请求
+        let bot = WeComBot::new("");
+        let err = bot.send_text_blocking("hi", &[], &[]).unwrap_err();
+        assert!(err.to_string().contains("为空"), "{err}");
+        assert!(bot.send_markdown_blocking("hi").is_err());
+        assert!(bot.send_markdown_v2_blocking("hi").is_err());
     }
 
     /// 启动单连接 HTTP 桩：返回（端口, 收到的请求体）；按给定响应体回 200。

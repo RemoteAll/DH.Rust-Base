@@ -1,6 +1,7 @@
 //! Web 辅助（对应 DH.NCore `NewLife.Web` 系列工具；收编自 DHDeploy.Agent / tcp-scanner-server 等工程的重复实现）。
 //!
 //! - [`url_encode`]：RFC 3986 百分号编码（URL 查询串与 `application/x-www-form-urlencoded` 值）；
+//! - [`form_encode`] / [`url_with_query`]：表单键值对编码与 URL 查询串拼接（片段保持在末尾）；
 //! - [`json_escape`]：JSON 字符串转义（不含两端引号，供请求体模板内嵌 JSON 值）；
 //! - [`format_bytes`] / [`format_bytes_iec`] / [`format_speed`]：流量/速率可读格式化
 //!   （Pek 系面板与部署代理共用，口径分别对齐 C# `StarApi.FormatBytes` 与 `FormatBytes`）；
@@ -32,6 +33,46 @@ where
         push_url_encoded(&mut out, key.as_ref());
         out.push('=');
         push_url_encoded(&mut out, value.as_ref());
+    }
+    out
+}
+
+/// 为 URL 追加查询串（键值对按 RFC 3986 百分号编码，保持传入顺序）。
+///
+/// - `base` 已含 `?` 时用 `&` 续接（末尾已是 `?`/`&` 则不重复追加分隔符）；
+/// - `base` 含片段（`#...`）时查询串插在片段之前（片段必须留在末尾，如微信
+///   `connect/qrconnect` 的 `#wechat_redirect`）；
+/// - 键为空的条目跳过；值为空仍保留（部分接口用空值表达"取默认"）。
+///
+/// 收编自 Pek.Wechat 扫码登录 URL 构造；对参数顺序敏感的签名场景请改用
+/// [`form_encode`] 自行拼接。
+pub fn url_with_query(base: &str, query: &[(&str, &str)]) -> String {
+    let pairs: Vec<(&str, &str)> = query
+        .iter()
+        .copied()
+        .filter(|(key, _)| !key.is_empty())
+        .collect();
+    if pairs.is_empty() {
+        return base.to_string();
+    }
+
+    let (head, fragment) = match base.split_once('#') {
+        Some((head, fragment)) => (head, Some(fragment)),
+        None => (base, None),
+    };
+    let mut out = String::with_capacity(head.len() + 32 + fragment.map(|f| f.len()).unwrap_or(0));
+    out.push_str(head);
+    if head.contains('?') {
+        if !head.ends_with('?') && !head.ends_with('&') {
+            out.push('&');
+        }
+    } else {
+        out.push('?');
+    }
+    out.push_str(&form_encode(pairs));
+    if let Some(fragment) = fragment {
+        out.push('#');
+        out.push_str(fragment);
     }
     out
 }
@@ -204,6 +245,37 @@ mod tests {
             "a=b%20c&%E4%B8%AD=%E6%96%87"
         );
         assert_eq!(form_encode::<_, &str, &str>([]), "");
+    }
+
+    #[test]
+    fn url_with_query_keeps_fragment_last() {
+        // 微信扫码登录 URL 黄金样本：片段 `#wechat_redirect` 必须在查询串之后
+        let url = url_with_query(
+            "https://open.weixin.qq.com/connect/qrconnect",
+            &[
+                ("appid", "wx123"),
+                ("redirect_uri", "https://example.com/cb"),
+                ("response_type", "code"),
+                ("scope", "snsapi_login"),
+                ("state", "st/1"),
+                ("", "ignored"),
+            ],
+        );
+        assert_eq!(
+            url,
+            "https://open.weixin.qq.com/connect/qrconnect?appid=wx123&redirect_uri=https%3A%2F%2Fexample.com%2Fcb&response_type=code&scope=snsapi_login&state=st%2F1"
+        );
+        assert_eq!(
+            url_with_query("https://open.weixin.qq.com/x#wechat_redirect", &[("a", "1")]),
+            "https://open.weixin.qq.com/x?a=1#wechat_redirect"
+        );
+        // 已有查询串：续接；末尾已是 ?/& 不重复分隔符
+        assert_eq!(
+            url_with_query("https://a/b?x=1", &[("y", "2")]),
+            "https://a/b?x=1&y=2"
+        );
+        assert_eq!(url_with_query("https://a/b?", &[("y", "2")]), "https://a/b?y=2");
+        assert_eq!(url_with_query("https://a/b", &[]), "https://a/b");
     }
 
     #[test]
