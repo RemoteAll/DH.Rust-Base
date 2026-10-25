@@ -46,9 +46,10 @@ pub fn write_all_text<P: AsRef<Path>>(path: P, text: &str) -> io::Result<()> {
     fs::write(path, text)
 }
 
-/// 原子写文本文件：先写 `.tmp` 再改名替换，避免中途失败留下半截内容。
+/// 原子写文本文件：先写 `.tmp` 再原子替换，避免中途失败留下半截内容。
 ///
-/// 目标被占用等导致改名失败时降级为直接写入（尽力而为），并清理临时文件。
+/// 优先走 [`safe_replace_file`]（Windows 目标被占用时带重试）；
+/// 替换失败时降级为直接写入（尽力而为），并清理临时文件。
 pub fn write_all_text_atomic<P: AsRef<Path>>(path: P, text: &str) -> io::Result<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
@@ -58,7 +59,7 @@ pub fn write_all_text_atomic<P: AsRef<Path>>(path: P, text: &str) -> io::Result<
     let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
     fs::write(&tmp, text)?;
 
-    match fs::rename(&tmp, path) {
+    match safe_replace_file(&tmp, path) {
         Ok(()) => Ok(()),
         Err(_) => {
             // 目标被占用时降级为直接写入（尽力而为），并清理临时文件
@@ -69,23 +70,39 @@ pub fn write_all_text_atomic<P: AsRef<Path>>(path: P, text: &str) -> io::Result<
     }
 }
 
-/// 简单通配匹配：`*`（任意串）与 `?`（单字符），大小写不敏感。
+/// 简单通配匹配：`*`（任意串）与 `?`（单字符），ASCII 大小写不敏感。
+///
+/// 迭代 + 回溯实现（非线性递归）：多个 `*` 的长文本也不会指数级回溯。
 pub fn wildcard_match(pattern: &str, text: &str) -> bool {
-    fn matches(p: &[char], t: &[char]) -> bool {
-        if p.is_empty() {
-            return t.is_empty();
-        }
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let mut pi = 0usize;
+    let mut ti = 0usize;
+    let mut star: Option<usize> = None;
+    let mut mark = 0usize;
 
-        match p[0] {
-            '*' => (0..=t.len()).any(|i| matches(&p[1..], &t[i..])),
-            '?' => !t.is_empty() && matches(&p[1..], &t[1..]),
-            c => !t.is_empty() && c.eq_ignore_ascii_case(&t[0]) && matches(&p[1..], &t[1..]),
+    while ti < text.len() {
+        if pi < pattern.len()
+            && (pattern[pi] == '?' || pattern[pi].eq_ignore_ascii_case(&text[ti]))
+        {
+            pi += 1;
+            ti += 1;
+        } else if pi < pattern.len() && pattern[pi] == '*' {
+            star = Some(pi);
+            pi += 1;
+            mark = ti;
+        } else if let Some(star_pos) = star {
+            pi = star_pos + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
         }
     }
-
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    matches(&p, &t)
+    while pi < pattern.len() && pattern[pi] == '*' {
+        pi += 1;
+    }
+    pi == pattern.len()
 }
 
 /// 拆分命令行参数字符串（支持双引号包裹；与 C# ProcessStartInfo 的常见用法对齐）。

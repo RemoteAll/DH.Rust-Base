@@ -49,15 +49,14 @@ pub fn value_to_bool(value: &Value) -> Option<bool> {
         Value::Bool(flag) => Some(*flag),
         Value::Number(number) => number.as_i64().map(|n| n != 0),
         Value::String(text) => {
-            let text = text.trim();
             if ["true", "1", "yes", "on"]
                 .iter()
-                .any(|v| text.eq_ignore_ascii_case(v))
+                .any(|v| text.trim().eq_ignore_ascii_case(v))
             {
                 Some(true)
             } else if ["false", "0", "no", "off"]
                 .iter()
-                .any(|v| text.eq_ignore_ascii_case(v))
+                .any(|v| text.trim().eq_ignore_ascii_case(v))
             {
                 Some(false)
             } else {
@@ -178,14 +177,7 @@ impl JsonValue {
             JsonValue::Bool(value) => Some(*value),
             JsonValue::Int(value) => Some(*value != 0),
             JsonValue::Float(value) => Some(*value != 0.0),
-            JsonValue::Text(text) => {
-                let text = text.trim().to_ascii_lowercase();
-                match text.as_str() {
-                    "true" | "1" | "yes" | "on" => Some(true),
-                    "false" | "0" | "no" | "off" => Some(false),
-                    _ => None,
-                }
-            }
+            JsonValue::Text(text) => crate::text::parse_bool(text),
             _ => None,
         }
     }
@@ -237,6 +229,22 @@ pub fn write_quoted(out: &mut String, text: &str) {
         }
     }
     out.push('"');
+}
+
+/// 浮点数字文本（C# `double.ToString()` 口径）：
+/// 整数值不带 `.0`；非有限值输出 `NaN` / `Infinity` / `-Infinity`。
+pub fn format_number(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_string()
+    } else if value == f64::INFINITY {
+        "Infinity".to_string()
+    } else if value == f64::NEG_INFINITY {
+        "-Infinity".to_string()
+    } else if value == value.trunc() && value.abs() < 1e15 {
+        format!("{}", value as i64)
+    } else {
+        format!("{value}")
+    }
 }
 
 struct LaxParser<'a> {
@@ -595,6 +603,24 @@ mod tests {
         let mut out = String::new();
         write_quoted(&mut out, "a\"b\\c\r\nd\t");
         assert_eq!(out, "\"a\\\"b\\\\cd\"");
+    }
+
+    #[test]
+    fn format_number_matches_csharp_double_default() {
+        assert_eq!(format_number(1.0), "1");
+        assert_eq!(format_number(1.5), "1.5");
+        assert_eq!(format_number(-0.0), "0");
+        assert_eq!(format_number(1e20), "100000000000000000000");
+        assert_eq!(format_number(f64::NAN), "NaN");
+        assert_eq!(format_number(f64::INFINITY), "Infinity");
+        assert_eq!(format_number(f64::NEG_INFINITY), "-Infinity");
+    }
+
+    #[test]
+    fn bool_text_reuses_shared_parser() {
+        assert_eq!(JsonValue::Text("是".into()).to_bool(), Some(true));
+        assert_eq!(JsonValue::Text(" 否 ".into()).to_bool(), Some(false));
+        assert_eq!(value_to_bool(&json!("OFF")), Some(false));
     }
 
     #[test]

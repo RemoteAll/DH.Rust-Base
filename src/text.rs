@@ -211,6 +211,33 @@ pub fn mask_connection_string(conn: &str) -> String {
         .join(";")
 }
 
+/// 解析智能布尔文本（大小写不敏感）：
+/// `true/1/yes/on/是` → `true`，`false/0/no/off/否` → `false`，其余 `None`。
+///
+/// 供 JSON 宽松取值（`JsonValue::to_bool` / `value_to_bool`）与内存数据库字段值共用。
+pub fn parse_bool(text: &str) -> Option<bool> {
+    let text = text.trim();
+    if text == "是" {
+        return Some(true);
+    }
+    if text == "否" {
+        return Some(false);
+    }
+    if ["true", "1", "yes", "on"]
+        .iter()
+        .any(|value| text.eq_ignore_ascii_case(value))
+    {
+        Some(true)
+    } else if ["false", "0", "no", "off"]
+        .iter()
+        .any(|value| text.eq_ignore_ascii_case(value))
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,6 +250,18 @@ mod tests {
         assert_eq!(truncate_chars("abcdef", 5), "abcde…");
         // UTF-8 边界安全（emoji 为多字节）
         assert_eq!(truncate_chars("🙂🙂🙂", 2), "🙂🙂…");
+    }
+
+    #[test]
+    fn parse_bool_accepts_smart_values() {
+        for yes in ["true", "TRUE", "1", "yes", "On", " 是 "] {
+            assert_eq!(parse_bool(yes), Some(true), "应识别为 true：{yes}");
+        }
+        for no in ["false", "FALSE", "0", "no", "Off", " 否 "] {
+            assert_eq!(parse_bool(no), Some(false), "应识别为 false：{no}");
+        }
+        assert_eq!(parse_bool("maybe"), None);
+        assert_eq!(parse_bool(""), None);
     }
 
     #[test]

@@ -85,6 +85,55 @@ pub fn parse_datetime(text: &str) -> Option<NaiveDateTime> {
         .and_then(|d| d.and_hms_opt(0, 0, 0))
 }
 
+/// 宽松时间解析：`parse_datetime` + C# `Convert.ToDateTime` 常见斜杠格式 + Unix 秒/毫秒数字。
+///
+/// 用于读取 C# 写出的数据文件（中文文化下 `DateTime.ToString()` 输出 `2024/1/5 14:30:00`）。
+pub fn parse_datetime_lax(text: &str) -> Option<NaiveDateTime> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Some(value) = parse_datetime(text) {
+        return Some(value);
+    }
+
+    const DATETIME_FORMATS: [&str; 4] = [
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%Y/%m/%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.3f",
+    ];
+    for fmt in DATETIME_FORMATS {
+        if let Ok(value) = NaiveDateTime::parse_from_str(text, fmt) {
+            return Some(value);
+        }
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(text, "%Y/%m/%d") {
+        return date.and_hms_opt(0, 0, 0);
+    }
+    text.parse::<i64>().ok().and_then(from_unix_timestamp)
+}
+
+/// Unix 秒/毫秒 → 本地时间（`|value| ≥ 1e11` 视为毫秒；越界返回 `None`）。
+pub fn from_unix_timestamp(value: i64) -> Option<NaiveDateTime> {
+    let (secs, nanos) = if value.abs() >= 100_000_000_000 {
+        (
+            value.div_euclid(1000),
+            value.rem_euclid(1000) as u32 * 1_000_000,
+        )
+    } else {
+        (value, 0)
+    };
+    chrono::DateTime::from_timestamp(secs, nanos).map(|utc| {
+        use chrono::TimeZone;
+        chrono::Local
+            .timestamp_opt(utc.timestamp(), utc.timestamp_subsec_nanos())
+            .single()
+            .map(|local| local.naive_local())
+            .unwrap_or_else(|| utc.naive_utc())
+    })
+}
+
 /// 现在（UTC 朴素时间）。
 pub fn now_utc() -> NaiveDateTime {
     chrono::Utc::now().naive_utc()
@@ -257,6 +306,33 @@ mod tests {
         assert!(parse_datetime("2026-09-26").is_some());
         assert!(parse_datetime("").is_none());
         assert!(parse_datetime("不是时间").is_none());
+    }
+
+    #[test]
+    fn parse_datetime_lax_covers_csharp_formats_and_timestamps() {
+        let expected = chrono::NaiveDate::from_ymd_opt(2024, 1, 5)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        assert_eq!(parse_datetime_lax("2024/1/5 14:30:00"), Some(expected));
+        assert_eq!(parse_datetime_lax("2024/01/05 14:30:00"), Some(expected));
+        assert_eq!(
+            parse_datetime_lax("2024/1/5"),
+            Some(chrono::NaiveDate::from_ymd_opt(2024, 1, 5).unwrap().and_hms_opt(0, 0, 0).unwrap())
+        );
+        // 原格式仍可用
+        assert_eq!(parse_datetime_lax("2024-01-05 14:30:00"), Some(expected));
+        // Unix 秒 / 毫秒 → 同一本地时刻（时区无关断言）
+        let secs = expected.and_utc().timestamp();
+        let expected_local = from_unix_timestamp(secs).unwrap();
+        assert_eq!(parse_datetime_lax(&secs.to_string()), Some(expected_local));
+        let millis = expected.and_utc().timestamp_millis();
+        assert_eq!(
+            parse_datetime_lax(&millis.to_string()),
+            Some(from_unix_timestamp(millis).unwrap())
+        );
+        assert_eq!(parse_datetime_lax(""), None);
+        assert_eq!(parse_datetime_lax("abc"), None);
     }
 
     #[test]
