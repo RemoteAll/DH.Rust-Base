@@ -13,8 +13,9 @@ Pek 生态的 Rust 基础库，对应 C# 的 **DH.NCore**：为 Rust 项目提�
 | `sign` | 签名（SHA1 排序拼接）、随机串、MD5、FNV-1a | `Security` 扩展 |
 | `random` | 安全随机（OS 熵）：URL 安全令牌、十六进制短标识 | — |
 | `threading` | 不可重入定时器、调度器、Cron 表达式 | `NewLife.Threading`（`TimerX`/`TimerScheduler`/`Cron`） |
-| `config` | 核心设置 `Setting`，读写 `Config/Core.config`（XML）/ `Core.json` | `NewLife.Setting` / `Configuration` |
+| `config` | 核心设置 `Setting`，读写 `Config/Core.config`（XML）/ `Core.json`；TOML 配置 `TomlConfig<T>`（feature `toml`，含 `save_with_arrays` 数组表同步） | `NewLife.Setting` / `Configuration` |
 | `logs` | 分级日志：控制台/文本文件/复合输出、全局门面与 `info!` 等宏 | `NewLife.Log`（`XTrace`/`ILog`/`TextFileLog`/`ConsoleLog`/`CompositeLog`） |
+| `text` | 通用文本：`truncate_chars`、`is_email`、`email_suffix`、`split_mail_addresses` | `ValidFormatHelper.IsEmail` / `MailHelper.GetEmailSuffix` |
 | `zip` | 极简 ZIP 打包器（store 法；内存 + 流式落盘） | — |
 | `sys` | 系统信息与进程管理：磁盘过滤/网卡流量（第一批）；进程管理/指标采集/机器事实（第二批，[`process`/`monitor`/`machine`]） | — |
 | `net` | 网络内核：HTTP 服务端/客户端、WebSocket（文本/二进制、可选服务端 Ping 保活与慢消费者断开）、RPC、**HTTP 控制器（MVC 风格动作分发 + 视图约定）与静态文件服务（目录/嵌入/SPA 回退）**、TCP 探活（`tcp_check`/`split_host_port`，零依赖）（feature `net`） | `Http` / `Net` / `Remoting`（部分）/ `MapController` / `MapEmbedded` |
@@ -151,6 +152,34 @@ setting.save().unwrap();
 - 默认文件与 C# 一致：`Config/Core.config`（XML），同时支持 `Config/Core.json`（JSON）；
 - 兼容 C# `Description` 注释、空元素、大小写差异，以及 JSON 中的注释与“全字符串值”；
 - 支持 C# `Setting.OnLoaded` 的目录补全逻辑（`Web/Api/Server/Service/Job` 应用共享上级目录）。
+
+### TOML 配置（`TomlConfig<T>`，feature `toml`）
+
+- 缺失生成、缺键带注释补齐、类型容错、损坏备份重建、外部修改热加载；
+- 含**数组表**（`[[Data]]` 多账号、`[[Apps]]` 多应用等）的配置保存用 `save_with_arrays`：
+  先写标量，再按条目同步数组表（更新同索引、删除多余、追加新增，字段注释沿用）。
+
+```rust
+use dhrust::config::TomlConfig;
+
+let mut cfg = TomlConfig::<Cfg>::load("Config/Demo.toml", TEMPLATE);
+cfg.value_mut().data = new_entries;
+let entries: Vec<serde_json::Value> = /* 序列化后的数组条目 */;
+cfg.save_with_arrays(&[("Data", &entries)])?;
+```
+
+## 文本（text）
+
+```rust
+use dhrust::text::{email_suffix, is_email, split_mail_addresses};
+
+assert!(is_email("user.name+tag@example.com"));
+assert_eq!(email_suffix("a@example.com"), Some("example.com"));
+assert_eq!(split_mail_addresses("a@x.com; b@x.com"), vec!["a@x.com", "b@x.com"]);
+```
+
+`is_email` 对齐 C# `ValidFormatHelper.IsEmail` 的正则语义，但要求**整个字符串**是邮箱（C# 用
+`Regex.Matches` 会接受前后带文本的输入）；`email_suffix` 对齐 `MailHelper.GetEmailSuffix`。
 
 ## 日志（logs）
 

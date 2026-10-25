@@ -125,8 +125,8 @@ where
                     stamp: file_stamp(&path),
                 });
             }
-            let value = value_of_template::<T>(&template_text, &mut notes)
-                .map_err(ConfigError::Parse)?;
+            let value =
+                value_of_template::<T>(&template_text, &mut notes).map_err(ConfigError::Parse)?;
             if options.create_on_missing {
                 save_if_changed(&path, |_| Ok(template_text.clone()))?;
                 notes.push(format!("已生成默认配置：{}", path.display()));
@@ -206,6 +206,29 @@ where
             }
         }
         self.stamp = file_stamp(&self.path);
+        Ok(())
+    }
+
+    /// 保存并同步数组表（TOML `[[Name]]`），保留文件里已有的注释与排版。
+    ///
+    /// `save` 只负责标量/子表（`apply_type_fixes` 不处理数组表）；含数组表字段（如
+    /// `[[Data]]` 多账号、`[[Apps]]` 多应用）的配置在保存时应改用本方法：
+    /// 先按 `save` 写标量，再逐张数组表按 `entries` 同步（更新同索引条目、删除多余、
+    /// 追加新增；字段级注释沿用）。
+    ///
+    /// `arrays` 的每个元素为 `(数组表名, 条目列表)`；条目是 `serde_json::Value` 对象，
+    /// 键名需与序列化输出的字段名一致。返回后版本戳已刷新，可继续 `reload_if_changed`。
+    pub fn save_with_arrays(&mut self, arrays: &[(&str, &[Value])]) -> Result<(), ConfigError> {
+        self.save()?;
+        if !arrays.is_empty() {
+            let text = std::fs::read_to_string(&self.path).map_err(ConfigError::Io)?;
+            let mut doc = dtoml::parse_document(&text).map_err(ConfigError::Parse)?;
+            for (name, entries) in arrays {
+                dtoml::sync_array_of_tables(&mut doc, name, entries);
+            }
+            save_if_changed(&self.path, |_| Ok(doc.to_string()))?;
+            self.stamp = file_stamp(&self.path);
+        }
         Ok(())
     }
 
@@ -366,9 +389,8 @@ where
     let mut merged = tpl_json.clone();
     merge_over(&mut merged, &over);
     let (coerced, _) = super::coerce_json(merged, &tpl_json);
-    let value: T = serde_json::from_value(coerced.clone()).map_err(|e| {
-        format!("旧版配置 {} 与结构体不匹配：{e}", legacy.display())
-    })?;
+    let value: T = serde_json::from_value(coerced.clone())
+        .map_err(|e| format!("旧版配置 {} 与结构体不匹配：{e}", legacy.display()))?;
     let rendered = render(template, &coerced, None)?;
     Ok(Some((value, rendered, legacy)))
 }
@@ -391,7 +413,11 @@ fn merge_over(base: &mut Value, over: &Value) {
 }
 
 /// 解析文件文本：以模板补齐缺失键、修正类型，返回 `(值, 是否需要回写, 回写文本)`。
-fn load_text<T>(template: &str, text: &str, notes: &mut Vec<String>) -> Result<(T, bool, String), String>
+fn load_text<T>(
+    template: &str,
+    text: &str,
+    notes: &mut Vec<String>,
+) -> Result<(T, bool, String), String>
 where
     T: DeserializeOwned,
 {
@@ -414,7 +440,10 @@ where
     // 3) 未知键：保留并告警（不静默删除运维手写的扩展项）
     let unknown = dtoml::unknown_keys(&file_json, &tpl_json, &[]);
     if !unknown.is_empty() {
-        notes.push(format!("存在未识别配置项（已保留）：{}", unknown.join(", ")));
+        notes.push(format!(
+            "存在未识别配置项（已保留）：{}",
+            unknown.join(", ")
+        ));
     }
 
     let value: T = serde_json::from_value(coerced).map_err(|e| e.to_string())?;
@@ -464,7 +493,13 @@ mod tests {
         let file = dir.join("a.toml");
         let mut cfg = TomlConfig::<Demo>::load(&file, TPL);
         assert!(cfg.is_new());
-        assert_eq!(cfg.value(), &Demo { value: 7, name: String::new() });
+        assert_eq!(
+            cfg.value(),
+            &Demo {
+                value: 7,
+                name: String::new()
+            }
+        );
         let text = std::fs::read_to_string(&file).expect("已生成");
         assert!(text.contains("# 示例配置"), "模板注释应保留：{text}");
         assert!(cfg.take_notes().iter().any(|n| n.contains("生成默认配置")));
@@ -510,7 +545,13 @@ mod tests {
         // 旧文件只写了部分键：缺失的键必须继承**模板**（调用方预设），不能用结构体默认值
         std::fs::write(&legacy, r#"{ "value": 3 }"#).expect("写旧配置");
         let mut cfg = TomlConfig::<Demo>::load(&file, TPL);
-        assert_eq!(cfg.value(), &Demo { value: 3, name: String::new() });
+        assert_eq!(
+            cfg.value(),
+            &Demo {
+                value: 3,
+                name: String::new()
+            }
+        );
         let notes = cfg.take_notes();
         assert!(notes.iter().any(|n| n.contains("已迁移")), "{notes:?}");
         assert!(file.is_file(), "应生成 TOML");
@@ -568,6 +609,64 @@ mod tests {
         let notes = cfg.reload_if_changed();
         assert!(notes.iter().any(|n| n.contains("热加载")), "{notes:?}");
         assert_eq!(cfg.value().value, 42);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_with_arrays_syncs_array_of_tables_and_keeps_comments() {
+        const ARR_TPL: &str = "# 示例\nvalue = 1\n# 账号列表\n[[Data]]\nName = \"\"\nPort = 25\n";
+        #[derive(Debug, Default, PartialEq, Serialize, serde::Deserialize)]
+        #[serde(default)]
+        struct Entry {
+            #[serde(rename = "Name")]
+            name: String,
+            #[serde(rename = "Port")]
+            port: u16,
+        }
+        #[derive(Debug, Default, Serialize, serde::Deserialize)]
+        #[serde(default)]
+        struct WithArray {
+            value: i64,
+            #[serde(rename = "Data")]
+            data: Vec<Entry>,
+        }
+
+        let dir = temp("arrays");
+        let file = dir.join("a.toml");
+        let mut cfg = TomlConfig::<WithArray>::load(&file, ARR_TPL);
+        cfg.value_mut().value = 5;
+        cfg.value_mut().data = vec![
+            Entry {
+                name: "a".into(),
+                port: 465,
+            },
+            Entry {
+                name: "b".into(),
+                port: 25,
+            },
+        ];
+        let entries: Vec<Value> = cfg
+            .value()
+            .data
+            .iter()
+            .map(|e| serde_json::to_value(e).expect("序列化"))
+            .collect();
+        cfg.save_with_arrays(&[("Data", &entries)]).expect("保存");
+        let text = std::fs::read_to_string(&file).expect("读");
+        assert!(text.contains("# 示例"), "标量注释保留：{text}");
+        assert!(text.contains("# 账号列表"), "数组表注释保留：{text}");
+        assert!(text.contains("value = 5"), "{text}");
+        assert_eq!(text.matches("[[Data]]").count(), 2, "{text}");
+        assert!(
+            text.contains("Name = \"a\"") && text.contains("Port = 465"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Name = \"b\"") && text.contains("Port = 25"),
+            "{text}"
+        );
+        // 同步后可继续热加载（版本戳已刷新，不应误判为外部修改）
+        assert!(cfg.reload_if_changed().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
