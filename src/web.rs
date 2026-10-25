@@ -53,6 +53,40 @@ fn push_url_encoded(out: &mut String, value: &str) {
     }
 }
 
+/// 从 URL 提取 authority（`host[:port]`）：去掉 userinfo、路径、查询与片段。
+///
+/// 支持带/不带 scheme；空字符串或空 authority 返回 `None`。
+pub fn url_authority(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    if authority.is_empty() {
+        None
+    } else {
+        Some(authority.to_string())
+    }
+}
+
+/// 从 URL 提取 host：去掉 userinfo 与端口；IPv6 保留方括号（`[::1]`）。
+pub fn url_host(url: &str) -> Option<String> {
+    let authority = url_authority(url)?;
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let inner = &rest[..end];
+        if inner.is_empty() {
+            return None;
+        }
+        format!("[{inner}]")
+    } else {
+        authority.split(':').next().unwrap_or("").to_string()
+    };
+    (!host.is_empty()).then_some(host)
+}
+
 /// JSON 字符串转义（去掉两端引号；结果可直接嵌入 JSON 字符串字面量内部）。
 ///
 /// 转义规则与 `serde_json` 一致（非 ASCII 字符原样保留）；空输入返回空串。
@@ -170,6 +204,30 @@ mod tests {
             "a=b%20c&%E4%B8%AD=%E6%96%87"
         );
         assert_eq!(form_encode::<_, &str, &str>([]), "");
+    }
+
+    #[test]
+    fn url_authority_and_host() {
+        assert_eq!(
+            url_authority("https://user:pass@[::1]:8443/path").as_deref(),
+            Some("[::1]:8443")
+        );
+        assert_eq!(
+            url_authority("sms.example.com/api").as_deref(),
+            Some("sms.example.com")
+        );
+        assert_eq!(
+            url_authority("https://host/path?x=1#frag").as_deref(),
+            Some("host")
+        );
+        assert_eq!(url_authority(""), None);
+
+        assert_eq!(
+            url_host("http://user@127.0.0.1:8080/x").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(url_host("http://[::1]:8080").as_deref(), Some("[::1]"));
+        assert_eq!(url_host("http://:8080"), None);
     }
 
     #[test]

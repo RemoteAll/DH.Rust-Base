@@ -95,6 +95,15 @@ macro_rules! warn {
     };
 }
 
+/// 每个调用点只写一次警告（配置项非法等重复场景；不同调用点各自独立）。
+#[macro_export]
+macro_rules! warn_once {
+    ($($arg:tt)*) => {{
+        static WARN_ONCE: ::std::sync::Once = ::std::sync::Once::new();
+        WARN_ONCE.call_once(|| $crate::warn!($($arg)*));
+    }};
+}
+
 /// 写错误日志（延迟格式化：未达级别时不格式化、不分配）
 #[macro_export]
 macro_rules! error {
@@ -375,7 +384,7 @@ pub(crate) fn format_line(_level: LogLevel, message: &str) -> LogLine {
 
 // ————— 宏路径导出（`dhrust::logs::info!` 等） —————
 
-pub use crate::{debug, error, fatal, info, warn};
+pub use crate::{debug, error, fatal, info, warn, warn_once};
 
 #[cfg(test)]
 mod tests {
