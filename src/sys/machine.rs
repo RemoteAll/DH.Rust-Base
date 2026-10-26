@@ -530,6 +530,123 @@ pub fn memory_info() -> Option<(u64, u64)> {
     }
 }
 
+/// 交换区条目（虚拟内存；Linux 读 `/proc/swaps`，其它平台为空）。
+#[derive(Clone, Debug, Default)]
+pub struct SwapEntry {
+    /// 交换设备/文件路径
+    pub path: String,
+    /// 类型（`file` / `partition`）
+    pub kind: String,
+    /// 总大小（字节）
+    pub size_bytes: u64,
+    /// 已使用（字节）
+    pub used_bytes: u64,
+    /// 优先级（越大越先用）
+    pub priority: i32,
+}
+
+/// 交换区总览（虚拟内存）。
+#[derive(Clone, Debug, Default)]
+pub struct SwapInfo {
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub entries: Vec<SwapEntry>,
+    /// 当前 `vm.swappiness`（Linux；其它平台 `None`）
+    pub swappiness: Option<u32>,
+    /// 本平台是否支持**在线**创建/启停交换文件（Linux 支持；Windows 需改注册表并重启）
+    pub configurable: bool,
+}
+
+/// 读取交换区信息。
+///
+/// - Linux：`/proc/meminfo`（SwapTotal/SwapFree）+ `/proc/swaps`（逐条）+ `/proc/sys/vm/swappiness`
+/// - Windows：`GlobalMemoryStatusEx` 的页面文件容量（`TotalPageFile - TotalPhys`；
+///   `TotalPageFile` 本身含物理内存，是提交上限口径），明细与修改需 WMI/注册表且**重启生效**
+/// - 其它平台：返回空
+pub fn swap_info() -> SwapInfo {
+    #[cfg(target_os = "linux")]
+    {
+        let mut info = SwapInfo {
+            configurable: true,
+            ..Default::default()
+        };
+        let mut free_kb = 0u64;
+        if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
+            for line in text.lines() {
+                let Some((key, rest)) = line.split_once(':') else {
+                    continue;
+                };
+                let Some(kb) = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok())
+                else {
+                    continue;
+                };
+                match key {
+                    "SwapTotal" => info.total_bytes = kb * 1024,
+                    "SwapFree" => free_kb = kb,
+                    _ => {}
+                }
+            }
+        }
+        info.used_bytes = info.total_bytes.saturating_sub(free_kb * 1024);
+
+        // 明细：Filename Type Size Used Priority（Size/Used 单位为 KiB）
+        if let Ok(text) = std::fs::read_to_string("/proc/swaps") {
+            for line in text.lines().skip(1) {
+                let mut it = line.split_whitespace();
+                let (Some(path), Some(kind), Some(size)) = (it.next(), it.next(), it.next()) else {
+                    continue;
+                };
+                let Ok(size) = size.parse::<u64>() else {
+                    continue;
+                };
+                let used = it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                let priority = it.next().and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
+                info.entries.push(SwapEntry {
+                    path: path.to_string(),
+                    kind: kind.to_string(),
+                    size_bytes: size * 1024,
+                    used_bytes: used * 1024,
+                    priority,
+                });
+            }
+        }
+
+        if let Ok(text) = std::fs::read_to_string("/proc/sys/vm/swappiness") {
+            info.swappiness = text.trim().parse().ok();
+        }
+        info
+    }
+
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        unsafe {
+            let mut status: MEMORYSTATUSEX = std::mem::zeroed();
+            status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+            if GlobalMemoryStatusEx(&mut status) != 0 {
+                // TotalPageFile 含物理内存（提交上限），减去物理内存即为页面文件容量
+                let total = status.ullTotalPageFile.saturating_sub(status.ullTotalPhys);
+                let avail = status.ullAvailPageFile.saturating_sub(status.ullAvailPhys);
+                return SwapInfo {
+                    total_bytes: total,
+                    used_bytes: total.saturating_sub(avail),
+                    configurable: false,
+                    ..Default::default()
+                };
+            }
+        }
+        SwapInfo::default()
+    }
+
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        SwapInfo::default()
+    }
+}
+
 /// MAC 地址格式（`xx-xx-xx-xx-xx-xx`）。
 #[cfg_attr(not(windows), allow(dead_code))]
 fn format_mac(bytes: &[u8]) -> String {
