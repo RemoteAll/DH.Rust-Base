@@ -240,6 +240,11 @@ pub struct HttpServerOptions {
     /// 请求处理超时（`None` = 不限）：覆盖「读请求体 + 业务处理」阶段，超时返回 408；
     /// 防慢速上传 body / 业务卡死占着连接不放
     pub request_timeout: Option<std::time::Duration>,
+    /// 连接线程栈大小（`0` = 系统默认，通常 2 MB）。
+    ///
+    /// `thread_per_connection` 模式下「连接数 × 栈大小」就是虚拟内存下限
+    /// （512 连接 × 2 MB ≈ 1 GB 虚拟地址）；纯文本 JSON/静态资源服务取 512 KB 足够。
+    pub conn_stack_size: usize,
 }
 
 impl std::fmt::Debug for HttpServerOptions {
@@ -255,6 +260,7 @@ impl std::fmt::Debug for HttpServerOptions {
             .field("max_connections", &self.max_connections)
             .field("header_timeout", &self.header_timeout)
             .field("request_timeout", &self.request_timeout)
+            .field("conn_stack_size", &self.conn_stack_size)
             .finish()
     }
 }
@@ -272,6 +278,7 @@ impl Default for HttpServerOptions {
             max_connections: 0,
             header_timeout: None,
             request_timeout: None,
+            conn_stack_size: 0,
         }
     }
 }
@@ -420,8 +427,11 @@ impl HttpServer {
                     Err(_) => continue,
                 };
                 let _ = std_tcp.set_nonblocking(true);
-                let _ = std::thread::Builder::new()
-                    .name("dhrust-conn".to_string())
+                let mut tb = std::thread::Builder::new().name("dhrust-conn".to_string());
+                if options.conn_stack_size > 0 {
+                    tb = tb.stack_size(options.conn_stack_size);
+                }
+                let _ = tb
                     .spawn(move || {
                         let rt = match tokio::runtime::Builder::new_current_thread()
                             .enable_all()
