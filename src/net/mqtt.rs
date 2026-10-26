@@ -92,7 +92,7 @@ impl MqttVersion {
 }
 
 /// 连接参数。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MqttOptions {
     /// 服务端地址（IP 或域名）
     pub host: String,
@@ -112,6 +112,42 @@ pub struct MqttOptions {
     pub reconnect: Duration,
     /// 建连与握手超时
     pub connect_timeout: Duration,
+    /// **每次建连前重算凭据**（`None` = 用上面的静态 `client_id`/`username`/`password`）。
+    ///
+    /// 用于「登录凭据带时间戳/签名、重连等同重新登录」的场景（C# `RetryConnectAsync` 口径）：
+    /// 心跳/网关客户端每次重连都要重新签名，否则时间窗校验会拒绝连接。
+    pub credentials: Option<CredentialsFactory>,
+}
+
+/// 建连凭据（由 [`CredentialsFactory`] 每次重连前生成）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MqttCredentials {
+    /// 客户端标识（空串 = 沿用 `MqttOptions::client_id`）
+    pub client_id: String,
+    /// 用户名
+    pub username: String,
+    /// 密码
+    pub password: String,
+}
+
+/// 凭据工厂（每次建连前调用一次）。
+pub type CredentialsFactory = Arc<dyn Fn() -> MqttCredentials + Send + Sync>;
+
+impl std::fmt::Debug for MqttOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MqttOptions")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("version", &self.version)
+            .field("client_id", &self.client_id)
+            .field("username", &self.username)
+            .field("password", &if self.password.is_empty() { "" } else { "***" })
+            .field("keepalive", &self.keepalive)
+            .field("reconnect", &self.reconnect)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("credentials", &self.credentials.as_ref().map(|_| "<factory>"))
+            .finish()
+    }
 }
 
 impl Default for MqttOptions {
@@ -126,6 +162,7 @@ impl Default for MqttOptions {
             keepalive: Duration::from_secs(60),
             reconnect: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(5),
+            credentials: None,
         }
     }
 }
@@ -301,7 +338,17 @@ async fn supervisor(
     let mut subs: Vec<(String, u8)> = Vec::new();
 
     loop {
-        match connect_and_handshake(&opts).await {
+        // 每次建连前可重算凭据（重连 = 重新登录；心跳/网关客户端签名带时间戳）
+        let mut attempt = opts.clone();
+        if let Some(factory) = &opts.credentials {
+            let fresh = factory();
+            if !fresh.client_id.is_empty() {
+                attempt.client_id = fresh.client_id;
+            }
+            attempt.username = fresh.username;
+            attempt.password = fresh.password;
+        }
+        match connect_and_handshake(&attempt).await {
             Ok(stream) => {
                 shared.set(true, format!("{}:{} 已连接", opts.host, opts.port));
                 session(stream, &mut rx, &opts, &mut subs, &messages).await;
@@ -817,6 +864,7 @@ mod tests {
             keepalive: Duration::ZERO,
             reconnect: Duration::from_millis(100),
             connect_timeout: Duration::from_secs(2),
+            credentials: None,
         }
     }
 

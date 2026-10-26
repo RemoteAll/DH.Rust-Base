@@ -87,6 +87,61 @@ pub fn unregister(config_path: &Path, name: &str) -> Result<String, String> {
     }
 }
 
+/// 星尘 CLI 的统一处理（`--RegisterAgent` / `--UnregisterAgent` / `--AgentName`）。
+///
+/// 各服务的命令行样板完全一致：命中注册/注销参数时打印结果并退出，否则继续走业务逻辑。
+/// 把这段样板收到库里，服务侧只剩**一次调用**（HlktechIoT 四个服务、Pek.RPanlServer、
+/// Pek.RAgent 等共用）。
+///
+/// # 参数
+/// - `register_path`：`--RegisterAgent <StarAgent.config>` 的值（`None` = 未提供）。
+/// - `unregister_path`：`--UnregisterAgent <StarAgent.config>` 的值。
+/// - `name`：`--AgentName <条目名>`（同机多实例时区分；`None`/空串 = 用 `service_name`）。
+/// - `service_name`：默认条目名（如 `HlktechIotHeartbeat`）。
+/// - `base_env`：注入的数据目录环境变量名（如 `Some("HLKTECH_IOT_BASE")`）。
+///
+/// # 返回值
+/// `Some(exit_code)` 表示命令已处理完（调用方直接 `exit(code)`）；
+/// `None` 表示未命中，继续正常业务逻辑。
+pub fn handle_cli(
+    register_path: Option<&str>,
+    unregister_path: Option<&str>,
+    name: Option<&str>,
+    service_name: &str,
+    base_env: Option<&str>,
+) -> Option<i32> {
+    let entry_name = name.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(service_name);
+    if let Some(path) = register_path {
+        return Some(match register(Path::new(path), &Entry {
+            name: entry_name,
+            base_env,
+            health_check: "",
+        }) {
+            Ok(msg) => {
+                println!("{msg}");
+                0
+            }
+            Err(e) => {
+                eprintln!("注册失败：{e}");
+                1
+            }
+        });
+    }
+    if let Some(path) = unregister_path {
+        return Some(match unregister(Path::new(path), entry_name) {
+            Ok(msg) => {
+                println!("{msg}");
+                0
+            }
+            Err(e) => {
+                eprintln!("注销失败：{e}");
+                1
+            }
+        });
+    }
+    None
+}
+
 // ———— 内部实现 ————
 
 fn read_config(path: &Path) -> Result<String, String> {

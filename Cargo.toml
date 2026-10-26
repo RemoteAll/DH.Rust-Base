@@ -43,6 +43,12 @@ zip = { version = "9", default-features = false, features = ["deflate"], optiona
 
 # ———— feature `patch`（zstd 字典差分补丁：以旧文件为字典压缩新文件；增量升级，Pek.RAgent ↔ DHDeploy.Agent.Rust 共用）————
 zstd = { version = "0.13", optional = true }
+# ———— feature `log-bridge` / `tracing-bridge`：日志门面桥接（log / tracing → dhrust::logs）————
+# 业务代码用 `log::info!`、引擎（如 rmqtt）用 `tracing::info!`，而 dhrust 自身**不安装全局 logger**，
+# 不桥接就会静默丢弃。桥接实现已收编到这里（原先各项目各写一份、逐字同构）。
+log = { version = "0.4", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
 
 # ———— feature `http-client` / `net`（DHDeploy.Agent Rust 迁移网络内核；版本与 bench-net 已验证一致）————
 # 运行时（多线程调度/网络/定时/同步）
@@ -139,6 +145,12 @@ http-tls = [
 ]
 # 网络内核（DHDeploy.Agent Rust 迁移；选型与红线见 DHDeploy 仓库 Doc/网络层选型复核.md）
 net = ["http-client", "dep:fastwebsockets", "stun", "dep:flate2"]
+# 日志门面桥接：`log` 门面 → dhrust::logs（业务代码用 log::info! 的场合）
+log-bridge = ["dep:log"]
+# 日志门面桥接：`tracing` 门面 → dhrust::logs（引掣如 rmqtt 用 tracing::info!）
+tracing-bridge = ["dep:tracing", "dep:tracing-subscriber"]
+# 两种桥接一起开（服务端常见组合）
+logs-bridge = ["log-bridge", "tracing-bridge"]
 # wss/TLS（在 net 之上追加；含 HTTPS 客户端与服务端证书能力）
 net-tls = [
     "net",

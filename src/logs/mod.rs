@@ -34,6 +34,7 @@ mod console_setup;
 mod text_file_log;
 mod xtrace;
 
+pub mod bridge;
 pub mod style;
 
 pub use composite_log::CompositeLog;

@@ -42,6 +42,8 @@ pub mod openai;
 #[cfg(feature = "net")]
 pub mod panel_auth;
 #[cfg(feature = "net")]
+pub mod panel;
+#[cfg(feature = "net")]
 pub mod reply;
 #[cfg(feature = "net")]
 pub mod router;

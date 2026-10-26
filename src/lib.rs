@@ -1,4 +1,5 @@
 pub mod audit; // 审计日志脱敏与摘要（敏感字段 *** / 动作名 / 参数摘要；多消费方收编）
+pub mod cache; // 进程内 TTL 缓存（热路径元数据缓存；HlktechIoT 心跳/鉴权实测沉底）
 pub mod cert; // 证书与域名工具（PEM 拆包 / 最小 X.509 解析 / 通配符匹配；证书下发与部署共用）
 pub mod config; // 配置项（对应 DH.NCore Setting/Configuration）
 #[cfg(feature = "fileman")]
