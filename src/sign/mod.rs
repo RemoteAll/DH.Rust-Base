@@ -8,6 +8,9 @@ use sha2::Sha256;
 /// 支持 md5 / sha1 / sha512 / md5+sha1 / md5+sha512，含旧式 MD5 自动升级）。
 pub mod password;
 
+/// 挑战式登录（`nonce` + `response`）：IP+端口直连、无 TLS 场景下防「明文过网 / 摘要重放」。
+pub mod challenge;
+
 /// 根据参数生成校验值
 /// timestamp1: 毫秒时间戳
 /// nonce: 随机数
