@@ -530,6 +530,79 @@ pub fn memory_info() -> Option<(u64, u64)> {
     }
 }
 
+/// 内存明细（字节）。口径对齐 `free` / psutil / 宝塔：
+/// `available = MemFree + Buffers + Cached + SReclaimable`，`used = total - available`。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryDetail {
+    /// 物理内存总量
+    pub total_bytes: u64,
+    /// 完全空闲（`MemFree`）
+    pub free_bytes: u64,
+    /// 内核缓冲（`Buffers`）
+    pub buffers_bytes: u64,
+    /// 页缓存（`Cached + SReclaimable`）
+    pub cached_bytes: u64,
+    /// 可用（空闲 + 缓冲 + 缓存；可回收）
+    pub available_bytes: u64,
+    /// 已用（总量 - 可用）
+    pub used_bytes: u64,
+}
+
+/// 读取内存明细（Linux 有 buff/cache；Windows/macOS 只有总量与可用）。
+pub fn memory_detail() -> Option<MemoryDetail> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{
+            GlobalMemoryStatusEx, MEMORYSTATUSEX,
+        };
+        unsafe {
+            let mut status: MEMORYSTATUSEX = std::mem::zeroed();
+            status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+            if GlobalMemoryStatusEx(&mut status) != 0 {
+                let total = status.ullTotalPhys;
+                let avail = status.ullAvailPhys;
+                return Some(MemoryDetail {
+                    total_bytes: total,
+                    free_bytes: avail,
+                    buffers_bytes: 0,
+                    cached_bytes: 0,
+                    available_bytes: avail,
+                    used_bytes: total.saturating_sub(avail),
+                });
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let (total, free, buffers, cached) = parse_meminfo_bytes(&text)?;
+        let mut avail = free + buffers + cached;
+        if avail > total {
+            avail = free;
+        }
+        return Some(MemoryDetail {
+            total_bytes: total,
+            free_bytes: free,
+            buffers_bytes: buffers,
+            cached_bytes: cached,
+            available_bytes: avail,
+            used_bytes: total.saturating_sub(avail),
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let text = run_capture("sysctl", &["-n", "hw.memsize"])?;
+        let bytes: u64 = text.trim().parse().ok()?;
+        return Some(MemoryDetail {
+            total_bytes: bytes,
+            ..Default::default()
+        });
+    }
+}
+
 /// 交换区条目（虚拟内存；Linux 读 `/proc/swaps`，其它平台为空）。
 #[derive(Clone, Debug, Default)]
 pub struct SwapEntry {
