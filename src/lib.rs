@@ -36,4 +36,10 @@ pub mod net; // 网络模块（基础：本机 IP + 字节流分帧；http-clien
 pub mod sys; // 系统信息采集（磁盘挂载过滤 / 网卡累计流量；跨平台）
 
 #[cfg(feature = "http-client")]
+pub mod alert; // 告警中心（企业微信 + 钉钉双通道；异步派发 / 冷却去重 / 统计；多项目收编）
+
+#[cfg(feature = "http-client")]
+pub mod dingtalk; // 钉钉群机器人（Webhook 推送：text/markdown；支持「加签」）
+
+#[cfg(feature = "http-client")]
 pub mod wecom; // 企业微信机器人（Webhook 推送：文本/Markdown/Markdown V2；对应 C# Pek.WebHook 的 WeChatWorkRobot）

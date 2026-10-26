@@ -1,88 +1,88 @@
 [package]
 name = "dhrust"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-authors = ["Berin <100538511@qq.com>", "湖北登灏科技有限公司 <dingchuan@deng-hao.com>"]
+authors = ["Berin <100538511@qq.com>", "婀栧寳鐧荤亸绉戞妧鏈夐檺鍏徃 <dingchuan@deng-hao.com>"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-# 时间文本格式/解析（与 C# 兼容的 yyyy-MM-dd HH:mm:ss 系列）
+# 鏃堕棿鏂囨湰鏍煎紡/瑙ｆ瀽锛堜笌 C# 鍏煎鐨?yyyy-MM-dd HH:mm:ss 绯诲垪锛?
 chrono = "0.4"
-# MD5 摘要（NewLife `MD5()` 扩展等价实现）
+# MD5 鎽樿锛圢ewLife `MD5()` 鎵╁睍绛変环瀹炵幇锛?
 md-5 = "0.10"
 rand = "0.8.5"
 sha1 = "0.10.5"
-# SHA-256 / HMAC-SHA256（Agent 令牌校验与签名；RustCrypto 同族，与 md-5/sha1 一致）
+# SHA-256 / HMAC-SHA256锛圓gent 浠ょ墝鏍￠獙涓庣鍚嶏紱RustCrypto 鍚屾棌锛屼笌 md-5/sha1 涓€鑷达級
 sha2 = "0.10"
 hmac = "0.12"
-# Base64 编解码（标准与 URL 安全；令牌/签名/传输场景）
+# Base64 缂栬В鐮侊紙鏍囧噯涓?URL 瀹夊叏锛涗护鐗?绛惧悕/浼犺緭鍦烘櫙锛?
 base64 = "0.22"
-# 可逆加密（AES-256-GCM；feature `secret`）——RustCrypto 同族，纯 Rust、可 zig 交叉编 musl
+# 鍙€嗗姞瀵嗭紙AES-256-GCM锛沠eature `secret`锛夆€斺€擱ustCrypto 鍚屾棌锛岀函 Rust銆佸彲 zig 浜ゅ弶缂?musl
 aes-gcm = { version = "0.10", optional = true }
-# 配置序列化（JSON 配置读写，与 C# JsonConfigProvider 对应）
+# 閰嶇疆搴忓垪鍖栵紙JSON 閰嶇疆璇诲啓锛屼笌 C# JsonConfigProvider 瀵瑰簲锛?
 serde = { version = "1", features = ["derive"] }
-# preserve_order：保持字段声明顺序，生成与 C# 一致的配置文件
+# preserve_order锛氫繚鎸佸瓧娈靛０鏄庨『搴忥紝鐢熸垚涓?C# 涓€鑷寸殑閰嶇疆鏂囦欢
 serde_json = { version = "1", features = ["preserve_order"] }
-# XML 配置读取（与 C# XmlConfigProvider 生成的文件互通）
+# XML 閰嶇疆璇诲彇锛堜笌 C# XmlConfigProvider 鐢熸垚鐨勬枃浠朵簰閫氾級
 quick-xml = "0.36"
 
-# ———— feature `plugin`（插件包格式 + 插件源目录 Ed25519 签名；Pek.RAgent ↔ Pek.RPanlServer 共用）————
+# 鈥斺€斺€斺€?feature `plugin`锛堟彃浠跺寘鏍煎紡 + 鎻掍欢婧愮洰褰?Ed25519 绛惧悕锛汸ek.RAgent 鈫?Pek.RPanlServer 鍏辩敤锛夆€斺€斺€斺€?
 ed25519-dalek = { version = "2", optional = true }
 
-# ———— feature `toml`（TOML 配置维护管线：保注释补齐/类型修正回写/未知项识别/备份写入）————
+# 鈥斺€斺€斺€?feature `toml`锛圱OML 閰嶇疆缁存姢绠＄嚎锛氫繚娉ㄩ噴琛ラ綈/绫诲瀷淇鍥炲啓/鏈煡椤硅瘑鍒?澶囦唤鍐欏叆锛夆€斺€斺€斺€?
 toml = { version = "1", optional = true }
 toml_edit = { version = "0.25", optional = true }
 
-# ———— feature `zip-extract`（ZIP 解压；版本/特性与 Pek.RAgent 一致）————
-# 上游把 `zip` 历史版本**几乎全部 yank**（crates.io 索引里仅 9.0.3 / 9.0.4 非 yanked）；
-# 停在 `^2` 时既有项目靠 Cargo.lock 里已锁的 2.4.2 仍可续编，但**新建项目**解析依赖会失败
-# （`failed to select a version for the requirement zip = "^2"`）。故对齐上游唯一可用线 9.x
-# （zip 文件格式向下兼容，读写互通；2026-10-16 由 2.x 升级）。
+# 鈥斺€斺€斺€?feature `zip-extract`锛圸IP 瑙ｅ帇锛涚増鏈?鐗规€т笌 Pek.RAgent 涓€鑷达級鈥斺€斺€斺€?
+# 涓婃父鎶?`zip` 鍘嗗彶鐗堟湰**鍑犱箮鍏ㄩ儴 yank**锛坈rates.io 绱㈠紩閲屼粎 9.0.3 / 9.0.4 闈?yanked锛夛紱
+# 鍋滃湪 `^2` 鏃舵棦鏈夐」鐩潬 Cargo.lock 閲屽凡閿佺殑 2.4.2 浠嶅彲缁紪锛屼絾**鏂板缓椤圭洰**瑙ｆ瀽渚濊禆浼氬け璐?
+# 锛坄failed to select a version for the requirement zip = "^2"`锛夈€傛晠瀵归綈涓婃父鍞竴鍙敤绾?9.x
+# 锛坺ip 鏂囦欢鏍煎紡鍚戜笅鍏煎锛岃鍐欎簰閫氾紱2026-10-16 鐢?2.x 鍗囩骇锛夈€?
 zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
 
-# ———— feature `patch`（zstd 字典差分补丁：以旧文件为字典压缩新文件；增量升级，Pek.RAgent ↔ DHDeploy.Agent.Rust 共用）————
+# 鈥斺€斺€斺€?feature `patch`锛坺std 瀛楀吀宸垎琛ヤ竵锛氫互鏃ф枃浠朵负瀛楀吀鍘嬬缉鏂版枃浠讹紱澧為噺鍗囩骇锛孭ek.RAgent 鈫?DHDeploy.Agent.Rust 鍏辩敤锛夆€斺€斺€斺€?
 zstd = { version = "0.13", optional = true }
 
-# ———— feature `http-client` / `net`（DHDeploy.Agent Rust 迁移网络内核；版本与 bench-net 已验证一致）————
-# 运行时（多线程调度/网络/定时/同步）
+# 鈥斺€斺€斺€?feature `http-client` / `net`锛圖HDeploy.Agent Rust 杩佺Щ缃戠粶鍐呮牳锛涚増鏈笌 bench-net 宸查獙璇佷竴鑷达級鈥斺€斺€斺€?
+# 杩愯鏃讹紙澶氱嚎绋嬭皟搴?缃戠粶/瀹氭椂/鍚屾锛?
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "fs"], optional = true }
-# HTTP 服务端/客户端（连接层；语义层（路由/上下文）在 dhrust::net::http 自研）
+# HTTP 鏈嶅姟绔?瀹㈡埛绔紙杩炴帴灞傦紱璇箟灞傦紙璺敱/涓婁笅鏂囷級鍦?dhrust::net::http 鑷爺锛?
 hyper = { version = "1", features = ["http1", "server", "client"], optional = true }
-# Tokio IO 适配
+# Tokio IO 閫傞厤
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
-# 响应体工具
+# 鍝嶅簲浣撳伐鍏?
 http-body-util = { version = "0.1", optional = true }
-# 响应压缩（gzip；net 特性内建——面板 HTML/JSON 轮询出网流量削减；
-# 纯 Rust 后端（miniz_oxide），可全平台 zig 交叉编译）
+# 鍝嶅簲鍘嬬缉锛坓zip锛沶et 鐗规€у唴寤衡€斺€旈潰鏉?HTML/JSON 杞鍑虹綉娴侀噺鍓婂噺锛?
+# 绾?Rust 鍚庣锛坢iniz_oxide锛夛紝鍙叏骞冲彴 zig 浜ゅ弶缂栬瘧锛?
 flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
-# WebSocket 帧层（Apache-2.0，小体量可 fork；会话/心跳/重连语义在 dhrust::net::ws 自研）
-# unstable-split：读写半部分离（客户端读任务/写任务结构，见 src/net/ws.rs）
+# WebSocket 甯у眰锛圓pache-2.0锛屽皬浣撻噺鍙?fork锛涗細璇?蹇冭烦/閲嶈繛璇箟鍦?dhrust::net::ws 鑷爺锛?
+# unstable-split锛氳鍐欏崐閮ㄥ垎绂伙紙瀹㈡埛绔浠诲姟/鍐欎换鍔＄粨鏋勶紝瑙?src/net/ws.rs锛?
 fastwebsockets = { version = "0.8", optional = true, features = ["unstable-split"] }
-# TLS（wss；rustls + ring——迁移文档选型：性能优、可 zig 交叉编 musl）
+# TLS锛坵ss锛況ustls + ring鈥斺€旇縼绉绘枃妗ｉ€夊瀷锛氭€ц兘浼樸€佸彲 zig 浜ゅ弶缂?musl锛?
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12", "logging"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = { version = "0.8", optional = true }
 webpki-roots = { version = "0.26", optional = true }
-# PEM 证书/私钥解析（HTTPS 服务端证书加载）
+# PEM 璇佷功/绉侀挜瑙ｆ瀽锛圚TTPS 鏈嶅姟绔瘉涔﹀姞杞斤級
 rustls-pemfile = { version = "2", optional = true }
-# 自签证书生成（Agent HTTPS 监听开箱即用；纯 Rust，ring 后端）
+# 鑷璇佷功鐢熸垚锛圓gent HTTPS 鐩戝惉寮€绠卞嵆鐢紱绾?Rust锛宺ing 鍚庣锛?
 rcgen = { version = "0.13", optional = true, default-features = false, features = ["pem", "ring"] }
 
 [target.'cfg(unix)'.dependencies]
-# 进程管理/系统采集：signal、sysconf、statvfs、malloc_trim、clock_settime 等
+# 杩涚▼绠＄悊/绯荤粺閲囬泦锛歴ignal銆乻ysconf銆乻tatvfs銆乵alloc_trim銆乧lock_settime 绛?
 libc = "0.2"
-# 真 PTY（term 特性；openpty；0.9 的 nix 0.28 支持 loongarch64 等全架构交叉编译）
+# 鐪?PTY锛坱erm 鐗规€э紱openpty锛?.9 鐨?nix 0.28 鏀寔 loongarch64 绛夊叏鏋舵瀯浜ゅ弶缂栬瘧锛?
 portable-pty = { version = "0.9", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-# 真 PTY（term 特性；ConPTY）——0.8：实测可用（0.9 的 PSUEDOCONSOLE_INHERIT_CURSOR 标志下无输出）
+# 鐪?PTY锛坱erm 鐗规€э紱ConPTY锛夆€斺€?.8锛氬疄娴嬪彲鐢紙0.9 鐨?PSUEDOCONSOLE_INHERIT_CURSOR 鏍囧織涓嬫棤杈撳嚭锛?
 portable-pty = { version = "0.8", optional = true }
-# 系统运行时长（日志头 `#SystemStarted`，对齐 C# Environment.TickCount64 → GetTickCount64）
-# 网卡累计流量（sys::net::net_totals → GetIfTable2；IpHelper + Ndis + WinSock）
-# 进程管理/指标采集（sys::process / sys::monitor）：Threading、ProcessStatus、ToolHelp
-# 机器事实（sys::machine）：Registry（CPU 型号/MachineGuid）、Storage_FileSystem（磁盘）
-# Security/IO（校时特权、磁盘 IOCTL；CreateFileW 依赖 Security）
+# 绯荤粺杩愯鏃堕暱锛堟棩蹇楀ご `#SystemStarted`锛屽榻?C# Environment.TickCount64 鈫?GetTickCount64锛?
+# 缃戝崱绱娴侀噺锛坰ys::net::net_totals 鈫?GetIfTable2锛汭pHelper + Ndis + WinSock锛?
+# 杩涚▼绠＄悊/鎸囨爣閲囬泦锛坰ys::process / sys::monitor锛夛細Threading銆丳rocessStatus銆乀oolHelp
+# 鏈哄櫒浜嬪疄锛坰ys::machine锛夛細Registry锛圕PU 鍨嬪彿/MachineGuid锛夈€丼torage_FileSystem锛堢鐩橈級
+# Security/IO锛堟牎鏃剁壒鏉冦€佺鐩?IOCTL锛汣reateFileW 渚濊禆 Security锛?
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_SystemInformation",
@@ -97,38 +97,38 @@ windows-sys = { version = "0.59", features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
 ] }
-# Windows 服务运行时（service 特性：与 SCM 交互 StartServiceCtrlDispatcher/HandlerEx/SetServiceStatus；
-# 版本与 Pek.RAgent 一致）
+# Windows 鏈嶅姟杩愯鏃讹紙service 鐗规€э細涓?SCM 浜や簰 StartServiceCtrlDispatcher/HandlerEx/SetServiceStatus锛?
+# 鐗堟湰涓?Pek.RAgent 涓€鑷达級
 windows-service = { version = "0.7", optional = true }
 
 [features]
-# TOML 配置维护管线（tcp-scanner-server 实践沉淀；启用后提供 config::toml 模块）
+# TOML 閰嶇疆缁存姢绠＄嚎锛坱cp-scanner-server 瀹炶返娌夋穩锛涘惎鐢ㄥ悗鎻愪緵 config::toml 妯″潡锛?
 toml = ["dep:toml", "dep:toml_edit"]
-# Razor 子集模板引擎（方案 C，零新依赖；规约见 Doc/Razor子集模板引擎架构.md）
+# Razor 瀛愰泦妯℃澘寮曟搸锛堟柟妗?C锛岄浂鏂颁緷璧栵紱瑙勭害瑙?Doc/Razor瀛愰泦妯℃澘寮曟搸鏋舵瀯.md锛?
 razor = []
-# 可逆加密（AES-256-GCM；配置中敏感值“防直读”存储，如登录密码——HlkProductTool 实践沉淀）
+# 鍙€嗗姞瀵嗭紙AES-256-GCM锛涢厤缃腑鏁忔劅鍊尖€滈槻鐩磋鈥濆瓨鍌紝濡傜櫥褰曞瘑鐮佲€斺€擧lkProductTool 瀹炶返娌夋穩锛?
 secret = ["dep:aes-gcm"]
-# 跨平台服务管理（Windows SCM / systemd / procd / SysV / launchd；Pek.RAgent 下沉）
+# 璺ㄥ钩鍙版湇鍔＄鐞嗭紙Windows SCM / systemd / procd / SysV / launchd锛汸ek.RAgent 涓嬫矇锛?
 service = ["dep:windows-service"]
-# ZIP 解压（防目录穿越/占用文件安全替换；Pek.RAgent 与 DHDeploy.Agent 共用）
+# ZIP 瑙ｅ帇锛堥槻鐩綍绌胯秺/鍗犵敤鏂囦欢瀹夊叏鏇挎崲锛汸ek.RAgent 涓?DHDeploy.Agent 鍏辩敤锛?
 zip-extract = ["dep:zip"]
-# 文件管理（面板浏览/上传下载/编辑/压缩解压/搜索；Pek.RAgent 与 Pek.RPanlServer 共用）
+# 鏂囦欢绠＄悊锛堥潰鏉挎祻瑙?涓婁紶涓嬭浇/缂栬緫/鍘嬬缉瑙ｅ帇/鎼滅储锛汸ek.RAgent 涓?Pek.RPanlServer 鍏辩敤锛?
 fileman = ["zip-extract"]
-# zstd 字典差分补丁（增量升级：生成/还原；Pek.RAgent 与 DHDeploy.Agent.Rust 共用）
+# zstd 瀛楀吀宸垎琛ヤ竵锛堝閲忓崌绾э細鐢熸垚/杩樺師锛汸ek.RAgent 涓?DHDeploy.Agent.Rust 鍏辩敤锛?
 patch = ["dep:zstd"]
-# 插件包格式 + 插件源目录签名（Ed25519；含 zip-extract）——Pek.RAgent（安装/发布）与 Pek.RPanlServer（平台）共用
+# 鎻掍欢鍖呮牸寮?+ 鎻掍欢婧愮洰褰曠鍚嶏紙Ed25519锛涘惈 zip-extract锛夆€斺€擯ek.RAgent锛堝畨瑁?鍙戝竷锛変笌 Pek.RPanlServer锛堝钩鍙帮級鍏辩敤
 plugin = ["zip-extract", "dep:ed25519-dalek"]
-# 真 PTY 会话引擎（Windows ConPTY / Unix openpty；在线终端等服务端能力共用）
+# 鐪?PTY 浼氳瘽寮曟搸锛圵indows ConPTY / Unix openpty锛涘湪绾跨粓绔瓑鏈嶅姟绔兘鍔涘叡鐢級
 term = ["dep:portable-pty"]
-# STUN 服务（RFC 5389 Binding；UDP，仅依赖 tokio；net 特性自动包含）
+# STUN 鏈嶅姟锛圧FC 5389 Binding锛沀DP锛屼粎渚濊禆 tokio锛沶et 鐗规€ц嚜鍔ㄥ寘鍚級
 stun = ["dep:tokio"]
-# MQTT 客户端（MQTT 3.1.1：连接认证 / QoS0·1 发布 / 保活 / 断线重连；
-# tcp-scanner-server 对接 WMSMqttServer 现场收编）
+# MQTT 瀹㈡埛绔紙MQTT 3.1.1锛氳繛鎺ヨ璇?/ QoS0路1 鍙戝竷 / 淇濇椿 / 鏂嚎閲嶈繛锛?
+# tcp-scanner-server 瀵规帴 WMSMqttServer 鐜板満鏀剁紪锛?
 mqtt = ["dep:tokio"]
-# HTTP 客户端（hyper 连接层 + tokio；tcp-scanner-server 等“仅需 client”的消费方使用）
+# HTTP 瀹㈡埛绔紙hyper 杩炴帴灞?+ tokio锛泃cp-scanner-server 绛夆€滀粎闇€ client鈥濈殑娑堣垂鏂逛娇鐢級
 http-client = ["dep:tokio", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
-# HTTPS 客户端 TLS（在 http-client 之上追加；不打 WS/服务端证书工具——企业微信推送等 config 驱动场景）
-# 根证书优先系统存储，为空时回退 webpki-roots
+# HTTPS 瀹㈡埛绔?TLS锛堝湪 http-client 涔嬩笂杩藉姞锛涗笉鎵?WS/鏈嶅姟绔瘉涔﹀伐鍏封€斺€斾紒涓氬井淇℃帹閫佺瓑 config 椹卞姩鍦烘櫙锛?
+# 鏍硅瘉涔︿紭鍏堢郴缁熷瓨鍌紝涓虹┖鏃跺洖閫€ webpki-roots
 http-tls = [
     "http-client",
     "dep:tokio-rustls",
@@ -137,9 +137,9 @@ http-tls = [
     "dep:webpki-roots",
     "dep:rustls-pemfile",
 ]
-# 网络内核（DHDeploy.Agent Rust 迁移；选型与红线见 DHDeploy 仓库 Doc/网络层选型复核.md）
+# 缃戠粶鍐呮牳锛圖HDeploy.Agent Rust 杩佺Щ锛涢€夊瀷涓庣孩绾胯 DHDeploy 浠撳簱 Doc/缃戠粶灞傞€夊瀷澶嶆牳.md锛?
 net = ["http-client", "dep:fastwebsockets", "stun", "dep:flate2"]
-# wss/TLS（在 net 之上追加；含 HTTPS 客户端与服务端证书能力）
+# wss/TLS锛堝湪 net 涔嬩笂杩藉姞锛涘惈 HTTPS 瀹㈡埛绔笌鏈嶅姟绔瘉涔﹁兘鍔涳級
 net-tls = [
     "net",
     "http-tls",
@@ -148,10 +148,10 @@ net-tls = [
 ]
 
 [profile.release]
-# 发布构建启用全量 LTO 与单代码元：模板引擎等热路径可跨模块内联（基准见 tools/bench-view）
+# 鍙戝竷鏋勫缓鍚敤鍏ㄩ噺 LTO 涓庡崟浠ｇ爜鍏冿細妯℃澘寮曟搸绛夌儹璺緞鍙法妯″潡鍐呰仈锛堝熀鍑嗚 tools/bench-view锛?
 lto = true
 codegen-units = 1
 
 [dev-dependencies]
-# 集成测试（tests/razor_cases.rs）读取用例数据；与主依赖同 crate 同版本（零新增供应链）
+# 闆嗘垚娴嬭瘯锛坱ests/razor_cases.rs锛夎鍙栫敤渚嬫暟鎹紱涓庝富渚濊禆鍚?crate 鍚岀増鏈紙闆舵柊澧炰緵搴旈摼锛?
 serde_json = { version = "1", features = ["preserve_order"] }

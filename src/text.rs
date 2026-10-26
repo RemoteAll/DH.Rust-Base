@@ -238,6 +238,42 @@ pub fn parse_bool(text: &str) -> Option<bool> {
     }
 }
 
+/// CSV 单元格转义（含逗号/引号/换行时加引号并双写引号）。
+///
+/// **防公式注入**：Excel/WPS 会把以 `= + - @`、制表符/回车开头的单元格当公式执行，
+/// 导出前统一加一个前导单引号（CSV 里显式为文本）。
+///
+/// 面板「导出 CSV」（审计、日志、列表）都应走它，避免各项目各写一份、漏掉注入防护。
+pub fn csv_cell(value: &str) -> String {
+    // 只跳过普通空格再判断（不能 `trim_start()`：它会把 `\t`、`\r` 一起吃掉，
+    // 而制表符/回车开头的单元格同样会被 Excel 当公式执行）
+    let probe = value.trim_start_matches(' ');
+    let needs_formula_guard = probe.starts_with(['=', '+', '-', '@', '\t', '\r']);
+    let text = if needs_formula_guard {
+        format!("'{value}")
+    } else {
+        value.to_string()
+    };
+    if text.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        text
+    }
+}
+
+/// 把一行字段拼成 CSV 行（每个字段走 [`csv_cell`]；行尾不加换行）。
+pub fn csv_row<I, S>(fields: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    fields
+        .into_iter()
+        .map(|f| csv_cell(f.as_ref()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +415,28 @@ mod tests {
         assert_eq!(m2, "Password=***;user password=***;Host=z");
         // 空段忽略
         assert_eq!(mask_connection_string("A=1;;"), "A=1");
+    }
+
+    /// CSV 单元格：常规/引号/换行 + **公式注入防护**。
+    #[test]
+    fn csv_cell_escapes_and_guards_formulas() {
+        assert_eq!(csv_cell("普通"), "普通");
+        assert_eq!(csv_cell("含,逗号"), "\"含,逗号\"");
+        assert_eq!(csv_cell("含\"引号"), "\"含\"\"引号\"");
+        assert_eq!(csv_cell("两行\n文本"), "\"两行\n文本\"");
+        // 公式注入：加前导单引号
+        assert_eq!(csv_cell("=1+1"), "'=1+1");
+        assert_eq!(csv_cell("+86"), "'+86");
+        assert_eq!(csv_cell("-5"), "'-5");
+        assert_eq!(csv_cell("@cmd"), "'@cmd");
+        assert_eq!(csv_cell("\tx"), "'\tx");
+        // 注入 + 需要引号时两者叠加
+        assert_eq!(csv_cell("=a,b"), "\"'=a,b\"");
+    }
+
+    #[test]
+    fn csv_row_joins_escaped_fields() {
+        assert_eq!(csv_row(["a", "b,c", "=x"]), "a,\"b,c\",'=x");
+        assert_eq!(csv_row(Vec::<String>::new()), "");
     }
 }
