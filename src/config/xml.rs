@@ -53,10 +53,16 @@ pub(crate) fn read_fields(text: &str) -> Result<Vec<(String, String)>, ConfigErr
             }
             Ok(Event::Text(t)) => {
                 if depth == 2 {
-                    let unescaped = t
-                        .unescape()
-                        .map_err(|e| ConfigError::Parse(format!("XML 文本解析失败: {e}")))?;
-                    value.push_str(&unescaped);
+                    let raw = t
+                        .decode()
+                        .map_err(|e| ConfigError::Parse(format!("XML 文本解码失败: {e}")))?;
+                    value.push_str(&raw);
+                }
+            }
+            // quick-xml 0.41：实体引用（`&amp;` / `&#38;`）单独成事件，不再包在 Text 里
+            Ok(Event::GeneralRef(r)) => {
+                if depth == 2 {
+                    value.push_str(&resolve_reference(&r));
                 }
             }
             Ok(Event::CData(t)) => {
@@ -126,8 +132,9 @@ pub fn read_to_json(text: &str) -> Result<serde_json::Value, ConfigError> {
         let mut attrs = Map::new();
         for attr in e.attributes().flatten() {
             let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+            // 0.41：`unescape_value` 已废弃，实体解码 + 换行/属性值规范化改用 `normalized_value`
             let value = attr
-                .unescape_value()
+                .normalized_value(quick_xml::XmlVersion::Explicit1_0)
                 .map(|v| v.to_string())
                 .unwrap_or_default();
             attrs.insert(key, Value::String(value));
@@ -206,9 +213,15 @@ pub fn read_to_json(text: &str) -> Result<serde_json::Value, ConfigError> {
             }
             Ok(Event::Text(t)) => {
                 if let Some(frame) = stack.last_mut() {
-                    if let Ok(unescaped) = t.unescape() {
-                        frame.text.push_str(&unescaped);
+                    if let Ok(raw) = t.decode() {
+                        frame.text.push_str(&raw);
                     }
+                }
+            }
+            // quick-xml 0.41：实体引用单独成事件
+            Ok(Event::GeneralRef(r)) => {
+                if let Some(frame) = stack.last_mut() {
+                    frame.text.push_str(&resolve_reference(&r));
                 }
             }
             Ok(Event::End(_)) => {
@@ -267,7 +280,7 @@ pub fn upsert_root_values(
     let mut reader = Reader::from_str(text);
     reader.config_mut().trim_text(false);
     let mut writer = Writer::new(Vec::new());
-    let write_err = |e: quick_xml::Error| ConfigError::Parse(format!("XML 写入失败: {e}"));
+    let write_err = |e: std::io::Error| ConfigError::Parse(format!("XML 写入失败: {e}"));
 
     // 输入文本的根结束标签前是否粘接（缺换行）；重写时统一规范化
     let needs_nl = needs_trailing_newline(text);
@@ -409,7 +422,7 @@ pub fn replace_root_section(text: &str, name: &str, inner: &str) -> Result<Strin
     let mut reader = Reader::from_str(text);
     reader.config_mut().trim_text(false);
     let mut writer = Writer::new(Vec::new());
-    let write_err = |e: quick_xml::Error| ConfigError::Parse(format!("XML 写入失败: {e}"));
+    let write_err = |e: std::io::Error| ConfigError::Parse(format!("XML 写入失败: {e}"));
 
     fn write_section(
         writer: &mut Writer<Vec<u8>>,
@@ -417,7 +430,7 @@ pub fn replace_root_section(text: &str, name: &str, inner: &str) -> Result<Strin
         inner: &str,
         indent: &str,
     ) -> Result<(), ConfigError> {
-        let err = |e: quick_xml::Error| ConfigError::Parse(format!("XML 写入失败: {e}"));
+        let err = |e: std::io::Error| ConfigError::Parse(format!("XML 写入失败: {e}"));
         writer
             .write_event(Event::Start(BytesStart::new(name)))
             .map_err(err)?;
@@ -542,6 +555,37 @@ pub fn replace_root_section(text: &str, name: &str, inner: &str) -> Result<Strin
 
 fn name_of(e: &quick_xml::events::BytesStart<'_>) -> String {
     String::from_utf8_lossy(e.name().as_ref()).to_string()
+}
+
+/// 还原实体引用（`&amp;` / `&#38;` / `&#x26;`）。
+///
+/// quick-xml 0.41 起实体引用是独立的 `Event::GeneralRef`（不再是 `Text` 的一部分），
+/// 若不处理会**静默丢掉字符**（`http://a&amp;b/` 读成 `http://ab/`）。
+/// 未知实体按字面保留为 `&name;`（比丢弃安全，也便于排障）。
+fn resolve_reference(r: &quick_xml::events::BytesRef<'_>) -> String {
+    let Ok(name) = r.decode() else {
+        return String::new();
+    };
+    let name = name.as_ref();
+    if let Some(number) = name.strip_prefix('#') {
+        let code = match number.strip_prefix(['x', 'X']) {
+            Some(hex) => u32::from_str_radix(hex, 16),
+            None => number.parse::<u32>(),
+        };
+        return code
+            .ok()
+            .and_then(char::from_u32)
+            .map(|c| c.to_string())
+            .unwrap_or_default();
+    }
+    match name {
+        "amp" => "&".to_string(),
+        "lt" => "<".to_string(),
+        "gt" => ">".to_string(),
+        "quot" => "\"".to_string(),
+        "apos" => "'".to_string(),
+        other => format!("&{other};"),
+    }
 }
 
 /// 文本的根结束标签（最后一个 `</`）之前是否缺换行（存在 `...</Key></Root>` 粘接格式）。

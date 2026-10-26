@@ -1,6 +1,6 @@
-﻿[package]
+[package]
 name = "dhrust"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 authors = ["Berin <100538511@qq.com>", "婀栧寳鐧荤亸绉戞妧鏈夐檺鍏徃 <dingchuan@deng-hao.com>"]
 
@@ -25,7 +25,7 @@ serde = { version = "1", features = ["derive"] }
 # preserve_order锛氫繚鎸佸瓧娈靛０鏄庨『搴忥紝鐢熸垚涓?C# 涓€鑷寸殑閰嶇疆鏂囦欢
 serde_json = { version = "1", features = ["preserve_order"] }
 # XML 閰嶇疆璇诲彇锛堜笌 C# XmlConfigProvider 鐢熸垚鐨勬枃浠朵簰閫氾級
-quick-xml = "0.36"
+quick-xml = "0.41"
 
 # 鈥斺€斺€斺€?feature `plugin`锛堟彃浠跺寘鏍煎紡 + 鎻掍欢婧愮洰褰?Ed25519 绛惧悕锛汸ek.RAgent 鈫?Pek.RPanlServer 鍏辩敤锛夆€斺€斺€斺€?
 ed25519-dalek = { version = "2", optional = true }
@@ -155,3 +155,4 @@ codegen-units = 1
 [dev-dependencies]
 # 闆嗘垚娴嬭瘯锛坱ests/razor_cases.rs锛夎鍙栫敤渚嬫暟鎹紱涓庝富渚濊禆鍚?crate 鍚岀増鏈紙闆舵柊澧炰緵搴旈摼锛?
 serde_json = { version = "1", features = ["preserve_order"] }
+
