@@ -1,7 +1,15 @@
 //! TLS 服务端支持（feature `net-tls`）：自签证书生成、PEM 加载与服务端配置构建。
 //!
 //! 场景：Agent 对齐 C# Kestrel 的 `https://*:8283` 能力——控制面 HTTPS 监听。
-//! 证书策略：缺失自动生成自签（10 年、SAN 含 localhost/回环 + 调用方附加名）；
+//! 证书策略：缺失自动生成自签**叶子**证书（`CA:FALSE`，10 年）；
+//! SAN 自动包含 `localhost` / `127.0.0.1` / `::1` + **本机全部网卡 IPv4** + 调用方附加名，
+//! 因此浏览器直接用 `https://内网IP:端口` 访问也能匹配（仅需导入一次证书信任）。
+//!
+//! 安全取舍：
+//! - 叶子证书 `CA:FALSE`：即使私钥泄露，也**无法签发其他站点证书**（比自建 CA 安全得多）；
+//! - 私钥文件在 Unix 上权限 `0600`；
+//! - 不做自动续签：到期前由面板提示「重新签发」（避免运行中重建监听带来的故障面）。
+//!
 //! 调用方（DHDeploy Client/Server）均忽略证书校验（对齐 C#
 //! `ServerCertificateCustomValidationCallback`），自签即可全链路互通。
 
@@ -9,12 +17,17 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use chrono::Datelike;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::ServerConfig;
 
+/// 自签证书有效期（天）；`3653` ≈ 10 年（含闰日）。
+const SELF_SIGNED_DAYS: i64 = 3653;
+
 /// 确保证书/私钥文件存在（缺失则生成自签）；返回是否本次新生成。
 ///
-/// SAN 基础项：`localhost`、`127.0.0.1`、`::1`；`extra_sans` 追加主机名/IP。
+/// SAN 基础项：`localhost`、`127.0.0.1`、`::1` + **本机全部网卡 IPv4**；
+/// `extra_sans` 追加主机名/IP（去重）。
 pub fn ensure_self_signed_cert(
     cert_path: &Path,
     key_path: &Path,
@@ -35,9 +48,16 @@ pub fn ensure_self_signed_cert(
         "127.0.0.1".to_string(),
         "::1".to_string(),
     ];
+    // 本机全部网卡 IPv4：浏览器按内网 IP 直访问时必须写入 SAN（现代浏览器不看 CN）
+    for ip in local_ipv4() {
+        if !sans.contains(&ip) {
+            sans.push(ip);
+        }
+    }
     for s in extra_sans {
-        if !s.trim().is_empty() && !sans.contains(s) {
-            sans.push(s.clone());
+        let s = s.trim();
+        if !s.is_empty() && !sans.iter().any(|x| x == s) {
+            sans.push(s.to_string());
         }
     }
 
@@ -48,7 +68,9 @@ pub fn ensure_self_signed_cert(
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "dhdeploy-agent");
-    params.not_after = rcgen::date_time_ymd(2036, 1, 1);
+    // 有效期从**签发时刻**起算（此前硬编码 2036 年，到期后将无法再生成有效证书）
+    let expire = chrono::Utc::now() + chrono::Duration::days(SELF_SIGNED_DAYS);
+    params.not_after = rcgen::date_time_ymd(expire.year(), expire.month() as u8, expire.day() as u8);
 
     let cert = params
         .self_signed(&key_pair)
@@ -56,7 +78,50 @@ pub fn ensure_self_signed_cert(
 
     std::fs::write(cert_path, cert.pem())?;
     std::fs::write(key_path, key_pair.serialize_pem())?;
+    // 私钥仅属主可读（Unix；Windows 依赖目录 ACL）
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(true)
+}
+
+/// 本机全部 IPv4（含回环；去重）；枚举失败时返回空（不影响生成）。
+fn local_ipv4() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for itf in crate::sys::machine::network_interfaces() {
+        for ip in itf.ips {
+            if !out.iter().any(|x| x == &ip) {
+                out.push(ip);
+            }
+        }
+    }
+    out
+}
+
+/// 现有证书是否覆盖指定主机（域名**或** IP）。
+///
+/// 用途：换了网卡/网段后判断旧证书是否需重签（不覆盖时浏览器会报“证书名称不匹配”）。
+pub fn cert_covers(cert_path: &Path, host: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(cert_path) else {
+        return false;
+    };
+    crate::cert::parse_certificate_pem(&text)
+        .map(|info| info.covers_host(host))
+        .unwrap_or(false)
+}
+
+/// 删除证书与私钥（“重新签发”用；下次启动/下次加载时自动重建）。
+pub fn reset_cert(cert_path: &Path, key_path: &Path) -> io::Result<()> {
+    for p in [cert_path, key_path] {
+        match std::fs::remove_file(p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// 加载 PEM 证书链与私钥（原始字节，供 [`crate::net::http::HttpServer::bind_tls`] 使用）。
@@ -112,6 +177,45 @@ mod tests {
         // 加载 + 构建服务端配置
         let (cert_pem, key_pem) = load_pem(&cert, &key).unwrap();
         assert!(server_config(&cert_pem, &key_pem).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 自签**叶子**证书：SAN 含本机网卡 IP、非 CA、有效期≈10 年；覆盖判定与重新签发可用。
+    ///
+    /// 这些性质直接决定“浏览器用 `https://内网IP:端口` 打开是否报证书错误”。
+    #[test]
+    fn self_signed_cert_covers_local_ip_and_is_not_ca() {
+        let dir = std::env::temp_dir().join(format!("tls-sans-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("c.pem");
+        let key = dir.join("c.key");
+        let _ = std::fs::remove_file(&cert);
+        let _ = std::fs::remove_file(&key);
+
+        assert!(ensure_self_signed_cert(&cert, &key, &[]).unwrap());
+
+        let text = std::fs::read_to_string(&cert).unwrap();
+        let info = crate::cert::parse_certificate_pem(&text).expect("证书应可解析");
+        assert!(!info.is_ca, "自签必须是叶子证书（CA:FALSE），私钥泄露也无法签其他站点");
+        assert!(info.covers_host("127.0.0.1"));
+        assert!(info.covers_host("localhost"));
+        for ip in local_ipv4() {
+            assert!(info.covers_ip(&ip), "SAN 应包含本机 IP {ip}");
+            assert!(cert_covers(&cert, &ip), "cert_covers 应判定覆盖 {ip}");
+        }
+        assert!(!cert_covers(&cert, "10.99.99.99"), "未写入 SAN 的 IP 不应判定覆盖");
+
+        let days = (info.not_after - chrono::Utc::now().timestamp()) / 86_400;
+        assert!(
+            (3600..=3700).contains(&days),
+            "有效期应约 10 年，实际 {days} 天"
+        );
+
+        // 重新签发：删除后再次生成（面板「重新签发」走同一路径）
+        reset_cert(&cert, &key).unwrap();
+        assert!(!cert.exists() && !key.exists());
+        assert!(ensure_self_signed_cert(&cert, &key, &[]).unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
