@@ -25,6 +25,7 @@ pub mod text; // 通用文本小工具（按字符截断等；多消费方收编
 pub mod threading; // 线程与定时调度（对应 DH.NCore Threading）
 pub mod times;
 pub mod upgrade; // 自升级管线·应用层（识别/静置/自检/原子替换/交接重启；Pek.RAgent、Pek.RPanlServer、HLZX.EIP 三套实现收编）
+pub mod verify_code; // 一次性验证码仓库（有效期 + 重发间隔 + 错误上限 + 一次性消费；短信/邮件/图形通用）
 pub mod version; // 版本号工具（数字段比较：Agent 自动升级的版本判断）
 pub mod web; // Web 辅助（URL 编码 / JSON 转义；对应 DH.NCore NewLife.Web 系列）
 pub mod zip; // 极简 ZIP 打包器（store 法；内存 + 流式落盘两种形态） // zstd 字典差分补丁（增量升级：生成/还原；Pek.RAgent 与 DHDeploy.Agent.Rust 共用）
