@@ -236,13 +236,13 @@ impl PanelSession {
         let account = self.account();
         if !user.eq_ignore_ascii_case(account.user.trim()) || password != account.password {
             self.logins.record_failure(&ip);
-            log::warn!("面板登录失败：user={user} ip={ip}");
+            crate::logs::warn!("面板登录失败：user={user} ip={ip}");
             return json_error(401, "用户名或密码错误");
         }
         self.logins.record_success(&ip);
         let token = self.tokens.issue_with(account.user.clone());
         self.save_sessions();
-        log::info!("面板登录成功：user={} ip={ip}", account.user);
+        crate::logs::info!("面板登录成功：user={} ip={ip}", account.user);
         json_result(
             0,
             "",
@@ -311,14 +311,14 @@ impl PanelSession {
             return;
         };
         let Ok(list) = serde_json::from_str::<Vec<SessionRec>>(&text) else {
-            log::warn!("面板会话文件解析失败（{}），忽略", path.display());
+            crate::logs::warn!("面板会话文件解析失败（{}），忽略", path.display());
             return;
         };
         let items: Vec<(String, i64, String)> =
             list.into_iter().map(|r| (r.token, r.expire, r.user)).collect();
         let count = self.tokens.restore(items);
         if count > 0 {
-            log::info!("面板会话已恢复 {count} 个（重启/升级后仍保持登录）：{}", path.display());
+            crate::logs::info!("面板会话已恢复 {count} 个（重启/升级后仍保持登录）：{}", path.display());
         }
     }
 
@@ -336,7 +336,7 @@ impl PanelSession {
         };
         if let Some(dir) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(dir) {
-                log::warn!("面板会话目录创建失败（{}）：{e}", dir.display());
+                crate::logs::warn!("面板会话目录创建失败（{}）：{e}", dir.display());
                 return;
             }
         }
@@ -348,7 +348,7 @@ impl PanelSession {
             .collect();
         let text = serde_json::to_string_pretty(&list).unwrap_or_else(|_| "[]".to_string());
         if let Err(e) = std::fs::write(&path, text) {
-            log::warn!("面板会话写入失败（{}）：{e}", path.display());
+            crate::logs::warn!("面板会话写入失败（{}）：{e}", path.display());
             return;
         }
         #[cfg(unix)]
