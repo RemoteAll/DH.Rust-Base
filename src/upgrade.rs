@@ -207,6 +207,277 @@ fn find_file(dir: &Path, name: &str, limit: usize) -> Option<PathBuf> {
     None
 }
 
+// ————— 版本化升级包仓库 —————
+
+/// 版本号是否合法（字母数字与 `.` `_` `+` `-`，最长 40 字符）。
+pub fn valid_version(text: &str) -> bool {
+    let t = text.trim();
+    !t.is_empty()
+        && t.len() <= 40
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+}
+
+/// 从文件名 / 路径里识别 `vX.Y.Z` 版本号（**至少三段数字**才认为命中，避免把 `v2` 当版本）。
+///
+/// 例：`pek-rpanlserver-v0.1.62-x86_64-unknown-linux-musl.tar.gz` → `0.1.62`。
+pub fn version_from_name(name: &str) -> Option<String> {
+    let chars: Vec<char> = name.chars().collect();
+    let mut i = 0;
+    while i + 1 < chars.len() {
+        if (chars[i] == 'v' || chars[i] == 'V') && chars[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            let mut out = String::new();
+            let mut dots = 0;
+            while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == '.') {
+                if chars[j] == '.' {
+                    dots += 1;
+                }
+                out.push(chars[j]);
+                j += 1;
+            }
+            let trimmed = out.trim_end_matches('.').to_string();
+            if dots >= 2 && !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// 升级包元数据（落盘为 `<目录>/<文件名>.json`）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Package {
+    /// 存储文件名（`<前缀>-<版本>-<平台>`）
+    pub file: String,
+    /// 版本号（不含前导 `v`）
+    pub version: String,
+    /// 字节数
+    pub size: u64,
+    /// SHA-256（十六进制）
+    pub sha256: String,
+    /// 上传说明
+    pub notes: String,
+    /// 上传时间（`yyyy-MM-dd HH:mm:ss`）
+    pub uploaded_at: String,
+    /// 目标平台标签
+    pub platform: String,
+}
+
+impl Package {
+    /// 元数据 JSON（面板/接口直接用；不含 `current` / `prunable` 这类调用方语义）。
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "file": self.file,
+            "version": self.version,
+            "size": self.size,
+            "sha256": self.sha256,
+            "notes": self.notes,
+            "uploadedAt": self.uploaded_at,
+            "platform": self.platform,
+        })
+    }
+}
+
+/// 版本化升级包仓库：`<dir>/<前缀>-<版本>-<平台>` + 同名 `.json` 元数据。
+///
+/// 下沉自 Pek.RPanlServer 的 `Data/SelfUpgrade/`（面板上传 → 列出 → 删除 → 清理旧包），
+/// **落盘格式与既有完全兼容**（老包不用迁移），可直接给其它项目做「上传发布包 + 一键回退/清理」。
+///
+/// 目录由调用方给（各项目自己的 Data 目录），本类型只管「文件级」动作：不解析业务包、
+/// 不校验签名（签名策略属调用方）。
+#[derive(Clone, Debug)]
+pub struct PackageStore {
+    dir: PathBuf,
+    prefix: String,
+}
+
+impl PackageStore {
+    /// `prefix` = 程序名（包文件名前缀，如 `pek-rpanlserver`）。
+    pub fn new(dir: impl Into<PathBuf>, prefix: impl Into<String>) -> Self {
+        Self {
+            dir: dir.into(),
+            prefix: prefix.into(),
+        }
+    }
+
+    /// 仓库目录。
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// 包文件名前缀（程序名）。
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    /// 存储文件名白名单校验（防路径穿越）：必须以前缀开头，只允许字母数字与 `.` `_` `-` `+`。
+    pub fn safe_file_name(&self, name: &str) -> bool {
+        let n = name.trim();
+        !n.is_empty()
+            && n.len() <= 120
+            && n.starts_with(&self.prefix)
+            && n.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
+    }
+
+    /// 列出全部升级包（新 → 旧，按上传时间倒序）。
+    pub fn list(&self) -> Vec<Package> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<Package> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+            .filter_map(|e| {
+                let text = std::fs::read_to_string(e.path()).ok()?;
+                let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+                Some(Package {
+                    file: v.get("file")?.as_str()?.to_string(),
+                    version: v.get("version")?.as_str()?.to_string(),
+                    size: v.get("size").and_then(|x| x.as_u64()).unwrap_or(0),
+                    sha256: v
+                        .get("sha256")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    notes: v
+                        .get("notes")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    uploaded_at: v
+                        .get("uploadedAt")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    platform: v
+                        .get("platform")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| b.uploaded_at.cmp(&a.uploaded_at));
+        out
+    }
+
+    /// 按存储文件名查找包元数据。
+    pub fn find(&self, file: &str) -> Option<Package> {
+        let file = file.trim();
+        self.list().into_iter().find(|p| p.file == file)
+    }
+
+    /// 保存升级包（同版本覆盖）：写二进制 + 元数据，返回包信息。
+    ///
+    /// 版本号非法、写盘失败都返回可读错误；体积上限等策略由调用方在调用前判断。
+    pub fn save(
+        &self,
+        version: &str,
+        platform: &str,
+        data: &[u8],
+        notes: &str,
+    ) -> Result<Package, String> {
+        let version = version.trim().trim_start_matches('v');
+        if !valid_version(version) {
+            return Err(format!(
+                "版本号无效（示例：0.1.25；只能包含字母数字与 . _ + -）：{version}"
+            ));
+        }
+        if data.is_empty() {
+            return Err("升级包为空".to_string());
+        }
+        std::fs::create_dir_all(&self.dir).map_err(|e| format!("创建升级包目录失败：{e}"))?;
+        let platform = platform.trim();
+        let file = if platform.is_empty() {
+            format!("{}-{}", self.prefix, version)
+        } else {
+            format!("{}-{}-{}", self.prefix, version, platform)
+        };
+        let bin = self.dir.join(&file);
+        std::fs::write(&bin, data).map_err(|e| format!("写入升级包失败：{e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755));
+        }
+        let pkg = Package {
+            file: file.clone(),
+            version: version.to_string(),
+            size: data.len() as u64,
+            sha256: crate::sign::sha256_hex(data),
+            notes: notes.trim().chars().take(200).collect(),
+            uploaded_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            platform: platform.to_string(),
+        };
+        std::fs::write(
+            self.dir.join(format!("{file}.json")),
+            serde_json::to_vec_pretty(&pkg.to_json()).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("写入元数据失败：{e}"))?;
+        Ok(pkg)
+    }
+
+    /// 删除升级包（二进制与元数据一并删除）。
+    pub fn delete(&self, file: &str) -> Result<(), String> {
+        let file = file.trim();
+        if !self.safe_file_name(file) {
+            return Err("文件名无效".to_string());
+        }
+        let bin = self.dir.join(file);
+        if !bin.is_file() {
+            return Err("升级包不存在".to_string());
+        }
+        let _ = std::fs::remove_file(&bin);
+        let _ = std::fs::remove_file(self.dir.join(format!("{file}.json")));
+        Ok(())
+    }
+
+    /// 读取升级包二进制内容（文件名同样过白名单校验）。
+    pub fn read(&self, file: &str) -> Result<Vec<u8>, String> {
+        let file = file.trim();
+        if !self.safe_file_name(file) {
+            return Err("文件名无效".to_string());
+        }
+        let bin = self.dir.join(file);
+        std::fs::read(&bin).map_err(|e| format!("读取升级包失败：{e}"))
+    }
+
+    /// 清理计划：**保留**版本高于 `current` 的包（还没升级到）与不高于 `current` 里最新
+    /// `keep_recent` 个（当前版本 + 上一版本，供回退），返回其余可清理的包（新 → 旧）。
+    pub fn plan_prune(&self, current: &str, keep_recent: usize) -> Vec<Package> {
+        let mut older: Vec<Package> = self
+            .list()
+            .into_iter()
+            .filter(|p| !crate::version::is_newer(&p.version, current))
+            .collect();
+        older.sort_by(|a, b| crate::version::compare_numeric(&b.version, &a.version));
+        older.into_iter().skip(keep_recent).collect()
+    }
+
+    /// 某包是否会被清理（面板「可清理」标记用）。
+    pub fn is_prunable(&self, current: &str, keep_recent: usize, file: &str) -> bool {
+        self.plan_prune(current, keep_recent)
+            .iter()
+            .any(|p| p.file == file)
+    }
+
+    /// 执行清理（口径见 [`Self::plan_prune`]），返回被删除的包（按删除顺序）。
+    pub fn prune(&self, current: &str, keep_recent: usize) -> Vec<Package> {
+        let mut removed = Vec::new();
+        for pkg in self.plan_prune(current, keep_recent) {
+            if self.delete(&pkg.file).is_ok() {
+                removed.push(pkg);
+            }
+        }
+        removed
+    }
+}
+
 // ————— 替换 —————
 
 /// 原子替换 `src` → `dst`（`dst` 可在运行中；Windows 先改名让位再写入）。
@@ -1003,6 +1274,71 @@ mod tests {
         assert!(extract_program(&zip_path, &dir.join("o2"), &["app.exe"], 1024).is_err());
         // 名字不存在
         assert!(extract_program(&zip_path, &dir.join("o3"), &["nope.exe"], 4).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn version_from_name_reads_three_segments() {
+        assert_eq!(
+            version_from_name("pek-rpanlserver-v0.1.62-x86_64-unknown-linux-musl.tar.gz").as_deref(),
+            Some("0.1.62")
+        );
+        assert_eq!(version_from_name("app/V1.2.3.zip").as_deref(), Some("1.2.3"));
+        // 不足三段 → 不认（避免把 v2 当版本）
+        assert_eq!(version_from_name("app-v2.zip"), None);
+        assert_eq!(version_from_name("no-version.zip"), None);
+        assert!(valid_version("0.1.62"));
+        assert!(!valid_version("0.1 62"));
+        assert!(!valid_version(""));
+    }
+
+    #[test]
+    fn package_store_crud_and_prune_keeps_recent() {
+        let dir = tmp_dir("pkgstore");
+        let store = PackageStore::new(dir.clone(), "app");
+        // 非法版本直接拒绝
+        assert!(store.save("bad/version", "win", b"x", "").is_err());
+        assert!(store.save("0.0.1", "win", b"", "").is_err());
+
+        let a = store.save("0.0.1", "win", b"one", "首个版本").unwrap();
+        assert_eq!(a.file, "app-0.0.1-win");
+        assert_eq!(a.notes, "首个版本");
+        let b = store.save("v0.0.2", "win", b"two", "").unwrap();
+        assert_eq!(b.version, "0.0.2");
+        let cur = store.save("0.0.3", "win", b"three", "").unwrap();
+        let next = store.save("9.9.9", "win", b"next", "").unwrap();
+        assert_eq!(store.list().len(), 4);
+        assert_eq!(store.read(&a.file).unwrap(), b"one");
+        assert_eq!(store.find(&b.file).map(|p| p.version), Some("0.0.2".to_string()));
+
+        // 文件名白名单：路径穿越 / 非前缀一律拒绝
+        assert!(store.read("../app-0.0.1-win").is_err());
+        assert!(store.delete("other.exe").is_err());
+        assert!(store.safe_file_name("app-0.0.1-win"));
+        assert!(!store.safe_file_name("app-0.0.1-win/../x"));
+
+        // 保留最近 2 个（当前 0.0.3 + 上一版 0.0.2）+ 更高的 9.9.9 → 只清 0.0.1
+        assert!(store.is_prunable("0.0.3", 2, &a.file));
+        assert!(!store.is_prunable("0.0.3", 2, &b.file));
+        assert!(!store.is_prunable("0.0.3", 2, &cur.file));
+        assert!(!store.is_prunable("0.0.3", 2, &next.file));
+
+        let removed = store.prune("0.0.3", 2);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].file, a.file);
+        // 幂等：保留区不动
+        assert!(store.prune("0.0.3", 2).is_empty());
+        let left: Vec<String> = store.list().into_iter().map(|p| p.version).collect();
+        assert_eq!(left.len(), 3);
+        assert!(left.contains(&cur.version));
+        assert!(left.contains(&b.version));
+        assert!(left.contains(&next.version));
+
+        // 删除到空
+        for p in store.list() {
+            store.delete(&p.file).expect("删除");
+        }
+        assert!(store.list().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
