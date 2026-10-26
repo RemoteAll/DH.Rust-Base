@@ -124,6 +124,85 @@ pub fn reset_cert(cert_path: &Path, key_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// 生成 **Windows 一键导入证书** 批处理脚本（`.cmd`，CRLF，证书以 base64 内嵌）。
+///
+/// 为什么需要它：自签证书的信任必须建立在**发起访问的那台电脑**上（操作系统安全边界，
+/// 服务端无法代劳）。把「找文件 → 双击 → 选存储 → 多步向导」压缩成"双击 + UAC 确认一次"。
+///
+/// 行为：先导入「当前用户 → 受信任的根证书颁发机构」（**无需管理员**），
+/// 再尝试「本机 → 受信任的根证书颁发机构」（需管理员，失败不影响第一步）。
+/// 末尾提醒 Firefox 使用独立证书库需单独导入。
+pub fn install_script_windows(cert_pem: &[u8]) -> String {
+    let b64 = crate::sign::base64_encode(cert_pem);
+    let body = format!(
+        r#"@echo off
+setlocal
+chcp 65001 >nul
+title 导入面板自签证书
+set "B64={b64}"
+set "CRT=%TEMP%\panel-cert-%RANDOM%.crt"
+echo 正在释放证书...
+powershell -NoProfile -Command "[IO.File]::WriteAllBytes('%CRT%', [Convert]::FromBase64String('%B64%'))"
+if not exist "%CRT%" (
+  echo [错误] 释放证书失败，请确认系统支持 PowerShell。
+  pause
+  exit /b 1
+)
+echo.
+echo [1/2] 导入到「当前用户 -^> 受信任的根证书颁发机构」（无需管理员）
+certutil -user -addstore -f Root "%CRT%" >nul 2>&1 && echo   完成 || echo   失败（可手动双击证书导入）
+echo.
+echo [2/2] 导入到「本机 -^> 受信任的根证书颁发机构」（需管理员；失败不影响第 1 步）
+certutil -addstore -f Root "%CRT%" >nul 2>&1 && echo   完成 || echo   未获得管理员权限（可右键以管理员身份运行本文件重试）
+del "%CRT%" >nul 2>&1
+echo.
+echo 全部完成。请**完全退出并重新启动浏览器**（Chrome / Edge）后再打开面板。
+echo 注意：Firefox 使用独立证书库，需在 设置 -^> 隐私与安全 -^> 证书 -^> 查看证书 -^> 导入 手动导入面板证书。
+echo.
+pause
+"#
+    );
+    // .cmd 必须 CRLF（混入 LF 会让批处理解析出错）
+    body.replace('\n', "\r\n")
+}
+
+/// 生成 **Linux/macOS 一键导入证书** 脚本（`.sh`，证书以 base64 内嵌）。
+///
+/// macOS 走 `security add-trusted-cert`（系统钥匙串），Linux 走
+/// `/usr/local/share/ca-certificates` + `update-ca-certificates`；两者都需要 sudo。
+pub fn install_script_unix(cert_pem: &[u8]) -> String {
+    let b64 = crate::sign::base64_encode(cert_pem);
+    format!(
+        r#"#!/bin/sh
+# 一键导入面板自签证书（单文件，证书已内嵌）
+set -e
+B64='{b64}'
+TMP="$(mktemp /tmp/panel-cert.XXXXXX.crt)"
+if base64 -d </dev/null >/dev/null 2>&1; then
+  DEC="base64 -d"
+else
+  DEC="base64 -D"
+fi
+printf '%s' "$B64" | $DEC > "$TMP"
+echo "证书已释放到 $TMP"
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo "需要管理员密码（导入到 macOS 系统钥匙串）..."
+  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$TMP"
+  echo "完成：已导入 macOS 系统钥匙串"
+else
+  echo "需要管理员密码（导入到系统 CA 目录）..."
+  sudo cp "$TMP" /usr/local/share/ca-certificates/panel-selfsigned.crt
+  sudo update-ca-certificates
+  echo "完成：已导入系统 CA（update-ca-certificates）"
+fi
+rm -f "$TMP"
+echo
+echo "请重新启动浏览器后再打开面板。"
+echo "注意：Firefox 使用独立证书库，需在 首选项 -> 隐私与安全 -> 证书 -> 查看证书 -> 导入 手动导入。"
+"#
+    )
+}
+
 /// 加载 PEM 证书链与私钥（原始字节，供 [`crate::net::http::HttpServer::bind_tls`] 使用）。
 pub fn load_pem(cert_path: &Path, key_path: &Path) -> io::Result<(Vec<u8>, Vec<u8>)> {
     let cert = std::fs::read(cert_path)?;
@@ -158,6 +237,37 @@ pub(crate) fn server_config(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<Serve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Windows 一键导入脚本：内嵌 base64 证书、双存储导入、CRLF、含 Firefox 提示。
+    #[test]
+    fn install_script_windows_is_valid_cmd() {
+        let s = install_script_windows(b"-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n");
+        assert!(s.contains("set \"B64="), "证书必须 base64 内嵌");
+        assert!(s.contains("certutil -user -addstore -f Root"), "先导入当前用户（免管理员）");
+        assert!(s.contains("certutil -addstore -f Root"), "再尝试本机级存储");
+        assert!(s.contains("Firefox"), "必须提醒 Firefox 用自己的证书库");
+        assert!(s.contains("\r\n"));
+        assert!(
+            !s.replace("\r\n", "").contains('\n'),
+            "存在裸 LF，.cmd 必须是 CRLF"
+        );
+    }
+
+    /// Linux/macOS 脚本：shebang、内嵌证书、双平台分支、macOS base64 -D 回退。
+    #[test]
+    fn install_script_unix_covers_darwin_and_linux() {
+        let s = install_script_unix(b"-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n");
+        assert!(s.starts_with("#!/bin/sh"));
+        assert!(s.contains("B64='"), "证书必须 base64 内嵌");
+        assert!(s.contains("security add-trusted-cert"), "macOS 导入系统钥匙串");
+        assert!(
+            s.contains("update-ca-certificates"),
+            "Linux 导入系统 CA"
+        );
+        assert!(s.contains("base64 -D"), "macOS 的 base64 是大写 -D");
+        assert!(s.contains("Firefox"));
+    }
+
 
     #[test]
     fn ensure_and_load_roundtrip() {
