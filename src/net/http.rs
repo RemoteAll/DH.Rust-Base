@@ -31,6 +31,42 @@ pub const DEFAULT_GZIP_MIN_SIZE: usize = 256;
 
 // ————— 请求 / 响应（自有类型）—————
 
+/// 请求头视图（**尚未读 body**）：供早拒钩子做「不需要 body 就能判断」的检查。
+///
+/// 用途：UA/路径/查询串/IP 这类判定在读完请求头后就能做，提前拒绝可省掉上传带宽
+/// （大 body 攻击不再需要先把数据收完）。
+#[derive(Debug, Clone)]
+pub struct HttpRequestHead {
+    /// 方法
+    pub method: String,
+    /// 路径（不含查询串）
+    pub path: String,
+    /// 查询串（原始形态）
+    pub query: String,
+    /// 请求头
+    pub headers: Vec<(String, String)>,
+    /// 客户端地址（`IP:Port`）
+    pub remote_addr: Option<String>,
+    /// 声明的请求体长度（`Content-Length`；分块传输/无头时为 `None`）
+    pub content_length: Option<u64>,
+}
+
+impl HttpRequestHead {
+    /// 头查询（大小写不敏感；首个匹配）。
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// 早拒钩子：**读完请求头、未读 body** 时调用；返回 `Some(响应)` 即立即响应并放弃读取 body。
+///
+/// 约定：只做「不需要 body」的判定（UA、IP、路径、查询串、`Content-Length`），
+/// 耗时必须是微秒级（它在每请求路径上）。
+pub type EarlyGuard = Arc<dyn Fn(&HttpRequestHead) -> Option<HttpResponse> + Send + Sync>;
+
 /// HTTP 请求（语义层类型；不暴露 hyper 泛型）。
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
@@ -167,8 +203,8 @@ where
 
 // ————— 服务端 —————
 
-/// 服务端配置。
-#[derive(Clone, Debug)]
+/// 服务端配置（Debug 手写：early_guard 是闭包，只标记有无）。
+#[derive(Clone)]
 pub struct HttpServerOptions {
     /// 请求体上限（超出返回 413）
     pub max_body_size: usize,
@@ -192,6 +228,22 @@ pub struct HttpServerOptions {
     pub gzip: bool,
     /// gzip 压缩的最小响应体长度（默认 [`DEFAULT_GZIP_MIN_SIZE`]）
     pub gzip_min_size: usize,
+    /// 早拒钩子（读 body 前；见 [`EarlyGuard`]）
+    pub early_guard: Option<EarlyGuard>,
+}
+
+impl std::fmt::Debug for HttpServerOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpServerOptions")
+            .field("max_body_size", &self.max_body_size)
+            .field("ws", &self.ws)
+            .field("thread_per_connection", &self.thread_per_connection)
+            .field("conn_shards", &self.conn_shards)
+            .field("gzip", &self.gzip)
+            .field("gzip_min_size", &self.gzip_min_size)
+            .field("early_guard", &self.early_guard.is_some())
+            .finish()
+    }
 }
 
 impl Default for HttpServerOptions {
@@ -203,6 +255,7 @@ impl Default for HttpServerOptions {
             conn_shards: 0,
             gzip: true,
             gzip_min_size: DEFAULT_GZIP_MIN_SIZE,
+            early_guard: None,
         }
     }
 }
@@ -523,6 +576,42 @@ async fn handle_http(
     };
 
     let (parts, body) = req.into_parts();
+
+    // ———— 早拒（不读 body）————
+    // ① 声明长度超限：直接 413（大 body 攻击一个字节都不用传）
+    let content_length = parts
+        .headers
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if let Some(len) = content_length {
+        if len > options.max_body_size as u64 {
+            return HttpResponse::text(
+                413,
+                format!("请求体过大（{len} > {} 字节）", options.max_body_size),
+            )
+            .into_hyper();
+        }
+    }
+    // ② 业务早拒钩子（UA/IP/路径/查询串等不需 body 的判定）
+    if let Some(guard) = &options.early_guard {
+        let head = HttpRequestHead {
+            method: parts.method.to_string(),
+            path: parts.uri.path().to_string(),
+            query: parts.uri.query().unwrap_or("").to_string(),
+            headers: parts
+                .headers
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+                .collect(),
+            remote_addr: remote.clone(),
+            content_length,
+        };
+        if let Some(resp) = guard(&head) {
+            return resp.into_hyper();
+        }
+    }
+
     let body_bytes = match collect_body(body, options.max_body_size).await {
         Ok(b) => b,
         Err(_) => return HttpResponse::text(413, "请求体过大").into_hyper(),
