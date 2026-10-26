@@ -5,6 +5,7 @@ pub mod config; // 配置项（对应 DH.NCore Setting/Configuration）
 pub mod fileman; // 文件管理（浏览/上传下载/编辑/压缩解压/搜索；Pek.RAgent 与 Pek.RPanlServer 共用）
 pub mod io; // 加了pub之后为公共模块可以为外部调用
 pub mod json; // JSON 值读取小工具（第三方接口响应解析；Option 语义）
+pub mod lock; // 键控锁（KeyedLock：主后端跨进程互斥 + 进程内兜底 + 故障自动降级/恢复通知；后端由使用方实现）
 pub mod logs;
 #[cfg(feature = "patch")]
 pub mod patch;

@@ -13,6 +13,7 @@ Pek 生态的 Rust 基础库，对应 C# 的 **DH.NCore**：为 Rust 项目提�
 | `sign` | 签名（SHA1 排序拼接）、随机串、MD5/SHA-256/HMAC-SHA1/HMAC-SHA256、FNV-1a | `Security` 扩展 |
 | `random` | 安全随机（OS 熵）：URL 安全令牌、十六进制短标识 | — |
 | `ratelimit` | 固定窗口限流：`CounterStore` 抽象 + `WindowLimiter` + 分片进程内 `FixedWindowStore`（首次创建过期、可注入 Redis 共享计数） | `DH.RateLimter`（计数器部分） |
+| `lock` | **键控锁** `KeyedLock`：主后端（`LockBackend` trait，谁有能力谁实现）+ 进程内 `MemoryLock` 兜底 + **故障自动降级/恢复事件**（`LockEvent`，可接告警）；非阻塞 `try_acquire`、`Drop` 即释放 | — |
 | `threading` | 不可重入定时器、调度器、Cron 表达式 | `NewLife.Threading`（`TimerX`/`TimerScheduler`/`Cron`） |
 | `config` | 核心设置 `Setting`，读写 `Config/Core.config`（XML）/ `Core.json`；TOML 配置 `TomlConfig<T>`（feature `toml`，含 `save_with_arrays` 数组表同步） | `NewLife.Setting` / `Configuration` |
 | `logs` | 分级日志：控制台/文本文件/复合输出、全局门面与 `info!` 等宏 | `NewLife.Log`（`XTrace`/`ILog`/`TextFileLog`/`ConsoleLog`/`CompositeLog`） |
