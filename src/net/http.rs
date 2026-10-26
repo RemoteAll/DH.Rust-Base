@@ -11,6 +11,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use http_body_util::{BodyExt, Full};
@@ -230,6 +231,15 @@ pub struct HttpServerOptions {
     pub gzip_min_size: usize,
     /// 早拒钩子（读 body 前；见 [`EarlyGuard`]）
     pub early_guard: Option<EarlyGuard>,
+    /// 最大并发连接数（`0` = 不限）。超出时直接丢弃新连接（不分配线程/任务）——
+    /// 防「连接洪水 / Slowloris」把线程与内存吃光；与 `thread_per_connection` 搭配时尤其必要
+    pub max_connections: usize,
+    /// 请求头读超时（`None` = 不限）：客户端连上后慢慢发请求头（Slowloris 典型手法）时，
+    /// 超过该时长仍未收齐请求头则断开
+    pub header_timeout: Option<std::time::Duration>,
+    /// 请求处理超时（`None` = 不限）：覆盖「读请求体 + 业务处理」阶段，超时返回 408；
+    /// 防慢速上传 body / 业务卡死占着连接不放
+    pub request_timeout: Option<std::time::Duration>,
 }
 
 impl std::fmt::Debug for HttpServerOptions {
@@ -242,6 +252,9 @@ impl std::fmt::Debug for HttpServerOptions {
             .field("gzip", &self.gzip)
             .field("gzip_min_size", &self.gzip_min_size)
             .field("early_guard", &self.early_guard.is_some())
+            .field("max_connections", &self.max_connections)
+            .field("header_timeout", &self.header_timeout)
+            .field("request_timeout", &self.request_timeout)
             .finish()
     }
 }
@@ -256,6 +269,9 @@ impl Default for HttpServerOptions {
             gzip: true,
             gzip_min_size: DEFAULT_GZIP_MIN_SIZE,
             early_guard: None,
+            max_connections: 0,
+            header_timeout: None,
+            request_timeout: None,
         }
     }
 }
@@ -369,6 +385,8 @@ impl HttpServer {
             None
         };
         let mut rr: usize = 0;
+        // 并发连接计数（每个连接持一个守卫， Drop 时归还名额）
+        let conn_count = Arc::new(AtomicUsize::new(0));
         tokio::pin!(shutdown);
         loop {
             let (tcp, _peer) = tokio::select! {
@@ -376,6 +394,15 @@ impl HttpServer {
                 accepted = self.listener.accept() => accepted?,
             };
             let _ = tcp.set_nodelay(true);
+            // 连接上限：超限直接丢弃（不分配线程/任务），防连接洪水/Slowloris 把线程与内存吃光
+            if options.max_connections > 0
+                && conn_count.load(Ordering::Relaxed) >= options.max_connections
+            {
+                drop(tcp);
+                continue;
+            }
+            conn_count.fetch_add(1, Ordering::Relaxed);
+            let guard = ConnGuard(conn_count.clone());
             let handler = handler.clone();
             let options = options.clone();
             let tls = clone_tls(&self.tls);
@@ -408,18 +435,18 @@ impl HttpServer {
                                 Ok(t) => t,
                                 Err(_) => return,
                             };
-                            run_connection(tcp, tls, handler, options).await;
+                            run_connection(tcp, tls, handler, options, guard).await;
                         });
                     });
             } else if let Some(shards) = &shards {
                 // 分片池：连接按轮次分发到分片线程（socket 脱钩后重注册到分片运行时）
                 if let Ok(std_tcp) = tcp.into_std() {
                     let _ = std_tcp.set_nonblocking(true);
-                    shards.dispatch(std_tcp, rr);
+                    shards.dispatch(std_tcp, rr, guard);
                     rr = rr.wrapping_add(1);
                 }
             } else {
-                tokio::spawn(run_connection(tcp, tls, handler, options));
+                tokio::spawn(run_connection(tcp, tls, handler, options, guard));
             }
         }
         Ok(())
@@ -432,7 +459,16 @@ impl HttpServer {
 /// 就是该分片线程本身（同线程任务调度，无跨线程 IPI）；线程数 = 分片数
 /// （而非连接数），高并发下 CPU 开销与尾时延同时占优。
 struct ShardPool {
-    senders: Vec<tokio::sync::mpsc::UnboundedSender<std::net::TcpStream>>,
+    senders: Vec<tokio::sync::mpsc::UnboundedSender<(std::net::TcpStream, ConnGuard)>>,
+}
+
+/// 连接计数守卫：`Drop` 时归还一个并发名额（超限即丢连接的实现基础）。
+struct ConnGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl ShardPool {
@@ -445,7 +481,7 @@ impl ShardPool {
     ) -> ShardPool {
         let mut senders = Vec::with_capacity(n);
         for i in 0..n {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<std::net::TcpStream>();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(std::net::TcpStream, ConnGuard)>();
             senders.push(tx);
             let handler = handler.clone();
             let options = options.clone();
@@ -463,14 +499,14 @@ impl ShardPool {
                     rt.block_on(async move {
                         // 收连接任务：std 流重注册到本分片运行时，再逐连接托管
                         tokio::spawn(async move {
-                            while let Some(std_tcp) = rx.recv().await {
+                            while let Some((std_tcp, guard)) = rx.recv().await {
                                 let _ = std_tcp.set_nonblocking(true);
                                 let handler = handler.clone();
                                 let options = options.clone();
                                 let tls = clone_tls(&tls);
                                 tokio::spawn(async move {
                                     if let Ok(tcp) = TcpStream::from_std(std_tcp) {
-                                        run_connection(tcp, tls, handler, options).await;
+                                        run_connection(tcp, tls, handler, options, guard).await;
                                     }
                                 });
                             }
@@ -484,9 +520,9 @@ impl ShardPool {
     }
 
     /// 分发连接（轮次由调用方维护）。
-    fn dispatch(&self, std_tcp: std::net::TcpStream, idx: usize) {
+    fn dispatch(&self, std_tcp: std::net::TcpStream, idx: usize, guard: ConnGuard) {
         if let Some(tx) = self.senders.get(idx % self.senders.len()) {
-            let _ = tx.send(std_tcp);
+            let _ = tx.send((std_tcp, guard));
         }
     }
 }
@@ -498,6 +534,7 @@ async fn run_connection(
     tls: Option<ServerTlsAcceptor>,
     handler: HttpHandler,
     options: HttpServerOptions,
+    _guard: ConnGuard,
 ) {
     // 客户端地址在 TLS 包装前取出（握手后从泛型流上无法再取）
     let remote = tcp.peer_addr().ok().map(|e| e.to_string());
@@ -530,16 +567,35 @@ async fn serve_connection<S>(
         Arc::new(Mutex::new(None));
     // 会话配置先取出（options 会被闭包 move）
     let ws_options = options.ws.clone();
+    let header_timeout = options.header_timeout;
+    let request_timeout = options.request_timeout;
     let slot = upgrade_slot.clone();
     let service = service_fn(move |req: Request<Incoming>| {
         let handler = handler.clone();
         let options = options.clone();
         let slot = slot.clone();
         let remote = remote.clone();
-        async move { Ok::<_, Infallible>(handle_http(req, handler, options, slot, remote).await) }
+        async move {
+            let fut = handle_http(req, handler, options, slot, remote);
+            let resp = match request_timeout {
+                // 「读请求体 + 业务处理」整体超时：防慢速上传 body / 业务卡死占着连接
+                Some(t) => match tokio::time::timeout(t, fut).await {
+                    Ok(r) => r,
+                    Err(_) => HttpResponse::text(408, "请求超时").into_hyper(),
+                },
+                None => fut.await,
+            };
+            Ok::<_, Infallible>(resp)
+        }
     });
     // 连接错误（含正常关闭）静默；升级路径由 with_upgrades 支撑
-    let _ = http1::Builder::new()
+    let mut builder = http1::Builder::new();
+    if let Some(t) = header_timeout {
+        // 需要 Timer 才能启用请求头读超时（防 Slowloris：连上后慢慢发请求头）
+        builder.timer(hyper_util::rt::TokioTimer::new());
+        builder.header_read_timeout(t);
+    }
+    let _ = builder
         .serve_connection(TokioIo::new(stream), service)
         .with_upgrades()
         .await;
