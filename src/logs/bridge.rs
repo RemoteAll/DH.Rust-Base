@@ -18,7 +18,9 @@
 //! 不会因为重复安装而 panic。
 
 use std::path::Path;
-use std::sync::{Arc, Once};
+use std::sync::Arc;
+#[cfg(any(feature = "log-bridge", feature = "tracing-bridge"))]
+use std::sync::Once;
 
 use crate::logs::{CompositeLog, ConsoleLog, ILog, LogLevel, TextFileLog};
 
