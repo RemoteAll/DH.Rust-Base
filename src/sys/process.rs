@@ -439,7 +439,20 @@ pub fn raise_priority() {
     }
 }
 
-/// 释放当前进程工作集（Windows `EmptyWorkingSet`；其它平台空操作）。
+/// 当前平台是否提供系统级内存回收接口。
+///
+/// - Windows：`EmptyWorkingSet`
+/// - glibc（Linux gnu）：`malloc_trim`
+/// - **musl（静态交叉编译的 Linux 包）、macOS 等：无**——只能靠释放大块内存时
+///   分配器自动归还，调用方应如实提示「本平台无系统级回收」，而不是假装成功。
+pub fn working_set_trim_supported() -> bool {
+    cfg!(any(windows, all(target_os = "linux", target_env = "gnu")))
+}
+
+/// 释放当前进程工作集（Windows `EmptyWorkingSet` / glibc `malloc_trim`）。
+///
+/// 返回值 = **是否真正执行了系统级回收**。musl 等无此能力的平台返回 `false`
+/// （2026-10-26 修正：此前 musl 分支返回 `true`，让调用方把「什么都没做」显示成成功）。
 pub fn empty_working_set() -> bool {
     #[cfg(windows)]
     {
@@ -468,8 +481,8 @@ pub fn empty_working_set() -> bool {
     #[cfg(target_os = "linux")]
     {
         // glibc 的 malloc_trim 将空闲堆归还系统（等价于 C# GC + 释放虚拟内存的尽力而为）；
-        // musl 无此扩展（交叉编译到 musl 目标时因缺符号失败过），按“空操作成功”处理
-        // （面板显示释放 0MB，而非误报失败）。
+        // musl 无此扩展（交叉编译到 musl 目标时因缺符号失败过）：返回 false 如实告知，
+        // 由调用方改为「清理自身缓存 + 等分配器自然归还」。
         #[cfg(target_env = "gnu")]
         {
             unsafe { libc::malloc_trim(0) != 0 }
@@ -477,7 +490,7 @@ pub fn empty_working_set() -> bool {
 
         #[cfg(not(target_env = "gnu"))]
         {
-            true
+            false
         }
     }
 
