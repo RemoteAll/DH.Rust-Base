@@ -245,6 +245,14 @@ pub struct HttpServerOptions {
     /// `thread_per_connection` 模式下「连接数 × 栈大小」就是虚拟内存下限
     /// （512 连接 × 2 MB ≈ 1 GB 虚拟地址）；纯文本 JSON/静态资源服务取 512 KB 足够。
     pub conn_stack_size: usize,
+    /// **同端口 HTTP → HTTPS 跳转**（仅 `bind_tls` 监听生效）：`Some(端口)` 时，
+    /// 若连上来的请求**不是 TLS**（首字节不是 `0x16` ClientHello，而是 `GET`/`POST` 等明文 HTTP），
+    /// 就回 301 到 `https://{host}:{端口}{path}`。
+    ///
+    /// 用途：单端口切 TLS 后旧书签（`http://ip:端口`）不会“连不上/协议错误”，
+    /// 而是被浏览器自动升级到加密地址（与宝塔面板开启 SSL 后的体验一致）。
+    /// 一般填与监听相同的端口号。
+    pub https_redirect_port: Option<u16>,
 }
 
 impl std::fmt::Debug for HttpServerOptions {
@@ -279,6 +287,7 @@ impl Default for HttpServerOptions {
             header_timeout: None,
             request_timeout: None,
             conn_stack_size: 0,
+            https_redirect_port: None,
         }
     }
 }
@@ -550,6 +559,40 @@ async fn run_connection(
     let remote = tcp.peer_addr().ok().map(|e| e.to_string());
     #[cfg(feature = "net-tls")]
     if let Some(acceptor) = tls {
+        // 同端口升级（宝塔式）：先 peek 首字节——TLS ClientHello 恒为 0x16；
+        // 否则视为明文 HTTP 请求，直接 301 到 https（旧书签不会“协议错误/连不上”）。
+        if let Some(https_port) = options.https_redirect_port {
+            let mut first = [0u8; 1];
+            // peek 不消费数据；读不到（对端已关）就别折腾了。
+            if let Ok(n) = tcp.peek(&mut first).await {
+                if n > 0 && first[0] != 0x16 {
+                    // 注意：参数名 `handler` 遮蔽了同名构造函数，这里必须走全路径；
+                    // 外层 `move` 复制 `https_port`（u16: Copy），闭包保持 `Fn` 可多次调用
+                    let redirect = crate::net::http::handler(move |req: HttpRequest| async move {
+                        let host = req.header("host").unwrap_or("127.0.0.1").trim().to_string();
+                        // 去掉 Host 里的原端口（否则会拼成 ip:5501:5501）
+                        let hostname = host
+                            .rsplit_once(':')
+                            .map(|(h, _)| h)
+                            .unwrap_or(&host)
+                            .to_string();
+                        let query = if req.query.is_empty() {
+                            String::new()
+                        } else {
+                            format!("?{}", req.query)
+                        };
+                        let location = format!("https://{hostname}:{https_port}{}{query}", req.path);
+                        HttpOutcome::Response(
+                            HttpResponse::text(301, "")
+                                .with_header("Location", &location)
+                                .with_header("Connection", "close"),
+                        )
+                    });
+                    serve_connection(tcp, remote, redirect, options).await;
+                    return;
+                }
+            }
+        }
         if let Ok(stream) = acceptor.accept(tcp).await {
             serve_connection(stream, remote, handler, options).await;
         }
