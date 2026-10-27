@@ -655,13 +655,34 @@ mod tests {
 /// - Unix 下保留可执行位（`mode & 0o111` 时 `| 0o755`）。
 #[cfg(feature = "zip-extract")]
 pub fn extract_zip(zip_path: &std::path::Path, target: &std::path::Path) -> Result<usize, String> {
+    extract_zip_limited(zip_path, target, u64::MAX, usize::MAX)
+}
+
+/// 解压 zip 到目标目录，并限制**实际解压字节数**与条目数（防 zip bomb）。
+///
+/// `max_unpacked_bytes` 按实际写入字节累计（不信任中央目录声明的 size）；
+/// 超过上限立即失败并删除当前临时文件。`max_entries` 为条目数上限。
+#[cfg(feature = "zip-extract")]
+pub fn extract_zip_limited(
+    zip_path: &std::path::Path,
+    target: &std::path::Path,
+    max_unpacked_bytes: u64,
+    max_entries: usize,
+) -> Result<usize, String> {
     let file = std::fs::File::open(zip_path)
         .map_err(|e| format!("打开压缩包失败 {}：{}", zip_path.display(), e))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("读取压缩包失败：{}", e))?;
+    if archive.len() > max_entries {
+        return Err(format!(
+            "压缩包条目过多（{}，上限 {max_entries}）",
+            archive.len()
+        ));
+    }
 
     std::fs::create_dir_all(target).map_err(|e| format!("创建目录失败：{}", e))?;
 
     let mut count = 0usize;
+    let mut total: u64 = 0;
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
@@ -676,21 +697,51 @@ pub fn extract_zip(zip_path: &std::path::Path, target: &std::path::Path) -> Resu
             std::fs::create_dir_all(&out_path).map_err(|e| format!("创建目录失败：{}", e))?;
             continue;
         }
+        // 符号链接条目不解压（避免后续写入被链接到目标目录之外）
+        if entry
+            .unix_mode()
+            .map(|m| m & 0o170000 == 0o120000)
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "压缩包包含符号链接（拒绝）：{}",
+                entry
+                    .name()
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|_| "?".to_string())
+            ));
+        }
 
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{}", e))?;
         }
 
-        let mut data = Vec::with_capacity(entry.size() as usize);
-        std::io::copy(&mut entry, &mut data).map_err(|e| format!("解压数据失败：{}", e))?;
-
+        let remaining = max_unpacked_bytes.saturating_sub(total);
         let tmp = std::path::PathBuf::from(format!(
             "{}.{}.{}.tmp",
             out_path.display(),
             std::process::id(),
             i
         ));
-        std::fs::write(&tmp, &data).map_err(|e| format!("写入临时文件失败：{}", e))?;
+        // 流式写入临时文件：不把整个条目读进内存；`Take` 上限为「剩余额度 + 1」，
+        // 超出即判定超限（声明的 size 不可信，按实际字节累计）。
+        let written = {
+            let mut out =
+                std::fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败：{e}"))?;
+            let mut limited = (&mut entry).take(remaining.saturating_add(1));
+            let n = std::io::copy(&mut limited, &mut out)
+                .map_err(|e| format!("解压数据失败：{}", e))?;
+            out.flush().map_err(|e| format!("刷新临时文件失败：{e}"))?;
+            n
+        };
+        if written > remaining {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "解压后总大小超过上限（{} 字节）",
+                max_unpacked_bytes
+            ));
+        }
+        total += written;
         crate::io::safe_replace_file(&tmp, &out_path)
             .map_err(|e| format!("替换文件失败 {}：{}", out_path.display(), e))?;
 
@@ -738,6 +789,18 @@ mod extract_tests {
         let n = extract_zip(&zip_path, &out).unwrap();
         assert_eq!(n, 1);
         assert_eq!(std::fs::read(out.join("sub/hello.txt")).unwrap(), b"hello");
+
+        // 实际解压字节限制：声明 size 不可信，超限必须失败（不留下半成品）
+        let out2 = dir.join("out2");
+        assert!(extract_zip_limited(&zip_path, &out2, 2, 10).is_err());
+        assert!(!out2.join("sub/hello.txt").exists());
+        // 条目数限制
+        assert!(extract_zip_limited(&zip_path, &dir.join("out3"), 1024, 0).is_err());
+        // 正常上限可通过
+        assert_eq!(
+            extract_zip_limited(&zip_path, &dir.join("out4"), 5, 10).unwrap(),
+            1
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
