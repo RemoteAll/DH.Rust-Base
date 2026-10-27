@@ -116,21 +116,27 @@ pub fn backup_file(path: &Path) -> Result<PathBuf, String> {
     Ok(bak)
 }
 
-/// 星尘影子模式判定（**纯函数**，便于测试）：程序路径里带 `shadow/` 且部署基目录已知 → 返回基目录。
+/// 星尘影子模式判定（**纯函数**，便于测试）：程序路径里带 `shadow/` → 返回部署基目录。
 ///
 /// 影子模式（Pek.RAgent 托管）下运行的是 `shadow/` 里的副本，**源程序文件不被占用**，
 /// 换完文件直接退出即可让星尘重建影子并拉起新版本——不需要助手、不需要等旧进程。
 ///
 /// - `exe`：当前程序路径；
 /// - `base_env`：部署基目录（各项目环境变量值，如 `PEK_RPANL_BASE` / `HLKTECH_IOT_BASE`）。
+///
+/// 环境变量缺失时**按路径推断**（`<实际目录>/shadow/<名称>-<hash>/<程序>` 上三级 = 实际目录）：
+/// 星尘 CLI 注册的子服务不一定注入环境变量，只按环境变量判定会把影子部署误判成普通部署，
+/// 从而走 `execv` 自重启（PID 不变、星尘仍认为原进程在跑，等于“重启没生效”）。
 pub fn shadow_deploy_base(exe: &Path, base_env: Option<&str>) -> Option<PathBuf> {
-    let base = base_env.map(str::trim).filter(|v| !v.is_empty())?;
     let normalized = exe.to_string_lossy().to_ascii_lowercase().replace('\\', "/");
-    if normalized.contains("/shadow/") {
-        Some(PathBuf::from(base))
-    } else {
-        None
+    if !normalized.contains("/shadow/") {
+        return None;
     }
+    if let Some(base) = base_env.map(str::trim).filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(base));
+    }
+    // shadow/<名称>-<hash>/<程序> → 上三级即实际目录
+    exe.parent()?.parent()?.parent().map(Path::to_path_buf)
 }
 
 /// 按**魔数**把升级包解到 `dest`：支持 `.zip` 与 `.tar.gz`（不看扩展名，改名也不会解错）。
@@ -1238,7 +1244,7 @@ mod tests {
         assert!(helper_job(&["-c".to_string()]).is_none());
     }
 
-    /// 影子模式判定：路径含 `shadow/` 且给了基目录才算（否则换文件后仍走助手/SCM）。
+    /// 影子模式判定：路径含 `shadow/` 即算（环境变量缺失时按路径推断基目录）。
     #[test]
     fn shadow_mode_detection() {
         let shadowed = PathBuf::from("/opt/app/shadow/app-1234/app");
@@ -1248,9 +1254,21 @@ mod tests {
         );
         // 非影子目录
         assert!(shadow_deploy_base(Path::new("/opt/app/app"), Some("/opt/app")).is_none());
-        // 没有部署基目录（未托管）
-        assert!(shadow_deploy_base(&shadowed, None).is_none());
-        assert!(shadow_deploy_base(&shadowed, Some("   ")).is_none());
+        // **环境变量缺失时按路径推断**（星尘 CLI 注册的子服务不注入环境变量，
+        // 旧逻辑会误判成普通部署 → execv 自重启 → 星尘仍认为原进程在跑）
+        assert_eq!(
+            shadow_deploy_base(&shadowed, None).as_deref(),
+            Some(Path::new("/opt/app"))
+        );
+        assert_eq!(
+            shadow_deploy_base(&shadowed, Some("   ")).as_deref(),
+            Some(Path::new("/opt/app"))
+        );
+        // 环境变量给了就以它为准（部署基目录可能与路径推断不同）
+        assert_eq!(
+            shadow_deploy_base(&shadowed, Some("/data/app")).as_deref(),
+            Some(Path::new("/data/app"))
+        );
         // Windows 风格路径也认
         let win = PathBuf::from(r"C:\App\shadow\app-1234\app.exe");
         assert!(shadow_deploy_base(&win, Some(r"C:\App")).is_some());

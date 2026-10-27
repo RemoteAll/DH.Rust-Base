@@ -142,6 +142,247 @@ pub fn handle_cli(
     None
 }
 
+// ———— 星尘本地控制（客户端）：查询子服务 / 启停重启 ————
+//
+// 与「注册自己」相反的方向：**作为托管方的一方**（各服务的 Web 面板、部署工具）
+// 需要「重启我这个服务」。规范通道是星尘本地 RPC（UDP，见 `crate::net::api_rpc`，
+// 与 C# StarAgent 字节级互通；HTTP `/RestartService` 只在星尘开了 Web 面板时才有）。
+//
+// 2026-10-27 现场教训：hlktech-iot-mqtt 面板自己写了 HTTP `/GetServices` + `/RestartService`
+// 一套，而 `api_rpc` 早已收编同一能力（DHDeploy.Agent.Rust 在用）——重复实现导致
+// 「换台机器（未开 Web 面板/端口不同）就重启失败」。统一收到这里。
+
+/// 需要执行的子服务动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceOp {
+    /// 启动。
+    Start,
+    /// 停止。
+    Stop,
+    /// 重启。
+    Restart,
+}
+
+impl ServiceOp {
+    /// 中文动词（拼日志/提示用）。
+    pub fn text(self) -> &'static str {
+        match self {
+            ServiceOp::Start => "启动",
+            ServiceOp::Stop => "停止",
+            ServiceOp::Restart => "重启",
+        }
+    }
+}
+
+/// 星尘配置里的一个子服务条目（`<ServiceInfo ... />` 的常用属性）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceEntry {
+    /// 条目名（`/RestartService` 等的 `serviceName` 参数）。
+    pub name: String,
+    /// 程序路径（可能是相对 `WorkingDirectory` 的相对路径，也可能是命令名）。
+    pub file_name: String,
+    /// 工作目录。
+    pub working_directory: String,
+    /// 是否启用。
+    pub enable: bool,
+}
+
+/// 解析配置里的 `<Services>` 段，取出所有子服务条目。
+pub fn services(config_path: &Path) -> Result<Vec<ServiceEntry>, String> {
+    let text = read_config(config_path)?;
+    let mut out = Vec::new();
+    for line in text.split_inclusive('\n') {
+        let core = line_core(line);
+        if !core.contains("<ServiceInfo") {
+            continue;
+        }
+        let name = attr(core, "Name").unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        out.push(ServiceEntry {
+            name,
+            file_name: attr(core, "FileName").unwrap_or_default(),
+            working_directory: attr(core, "WorkingDirectory").unwrap_or_default(),
+            enable: !attr(core, "Enable")
+                .map(|v| v.eq_ignore_ascii_case("false"))
+                .unwrap_or(false),
+        });
+    }
+    Ok(out)
+}
+
+/// 配置里的 `<LocalPort>`（UDP/TCP 控制端口）；缺失或非法时给 Rust 版默认 5501。
+pub fn local_port(config_path: &Path) -> u16 {
+    let Ok(text) = read_config(config_path) else {
+        return DEFAULT_AGENT_PORT;
+    };
+    tag_text(&text, "LocalPort")
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .unwrap_or(DEFAULT_AGENT_PORT)
+}
+
+/// 星尘默认控制端口（Rust 版 5501；C# 版为 5500，`local_port` 会优先取配置里的值）。
+pub const DEFAULT_AGENT_PORT: u16 = 5501;
+
+/// 定位星尘配置：环境变量 `STARAGENT_CONFIG` → 常见安装目录（Rust 版优先，C# 版目录只在最后）。
+///
+/// 只解析**运行中**那一套的配置才算数，但本函数无法探测进程，故按安装目录顺序兜底；
+/// 调用方若已知路径应直接传 `Some(path)`。
+pub fn locate_config(hint: Option<&Path>) -> Option<PathBuf> {
+    if let Some(p) = hint {
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+    }
+    if let Some(p) = std::env::var_os("STARAGENT_CONFIG") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if cfg!(windows) {
+        for d in [r"C:\StarAgent", r"C:\StarAgentRust"] {
+            dirs.push(PathBuf::from(d));
+        }
+    } else {
+        for d in ["/www/Agent", "/opt/StarAgentRust", "/opt/StarAgent", "/opt/staragent"] {
+            dirs.push(PathBuf::from(d));
+        }
+    }
+    for dir in dirs {
+        for name in ["StarAgent.config", "Agent.config"] {
+            let p = dir.join("Config").join(name);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// 按**程序路径**找条目（`FileName` 为相对路径时按 `WorkingDirectory` 解析；比较忽略大小写与斜杠方向）。
+pub fn find_by_program<'a>(entries: &'a [ServiceEntry], program: &Path) -> Option<&'a ServiceEntry> {
+    let want = normalize_path(&program.to_string_lossy());
+    let program_name = program
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    entries.iter().find(|e| {
+        let file = e.file_name.trim();
+        if file.is_empty() {
+            return false;
+        }
+        let path = Path::new(file);
+        let resolved: PathBuf = if path.is_absolute() {
+            path.to_path_buf()
+        } else if file.contains('/') || file.contains('\\') {
+            let work = e.working_directory.trim();
+            if work.is_empty() {
+                path.to_path_buf()
+            } else {
+                Path::new(work).join(path)
+            }
+        } else {
+            // 纯命令名（如 `ping`）：按文件名比较
+            return normalize_path(file) == normalize_path(&program_name);
+        };
+        normalize_path(&resolved.to_string_lossy()) == want
+    })
+}
+
+/// 对某个子服务执行动作（走星尘本地 UDP RPC；`addr` 由 `local_port` 得出）。
+pub fn operate(
+    config_path: &Path,
+    name: &str,
+    op: ServiceOp,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    let port = local_port(config_path);
+    let addr = format!("127.0.0.1:{port}");
+    let reply = match op {
+        ServiceOp::Start => crate::net::api_rpc::start_service(&addr, name, timeout),
+        ServiceOp::Stop => crate::net::api_rpc::stop_service(&addr, name, timeout),
+        ServiceOp::Restart => crate::net::api_rpc::restart_service(&addr, name, timeout),
+    }
+    .map_err(|e| format!("星尘未响应（{addr}，{name}）：{e}"))?;
+    if reply.success {
+        Ok(format!("{name}：{}成功", op.text()))
+    } else {
+        Err(format!("{name}：{}失败 — {}", op.text(), reply.message))
+    }
+}
+
+/// 让星尘**重启某个程序对应的子服务**（按程序路径找条目；找不到就明确报错，不瞎猜名字）。
+pub fn restart_program(
+    config_path: Option<&Path>,
+    program: &Path,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    let config = locate_config(config_path)
+        .ok_or_else(|| "未找到星尘配置（StarAgent.config）：本机可能没有星尘托管".to_string())?;
+    let entries = services(&config)?;
+    let entry = find_by_program(&entries, program).ok_or_else(|| {
+        format!(
+            "星尘条目里没有这个程序（{}），可能未由星尘托管",
+            program.display()
+        )
+    })?;
+    operate(&config, &entry.name, ServiceOp::Restart, timeout)
+}
+
+/// 读取 `<Tag>值</Tag>` 的文本（单行，取首个命中）。
+fn tag_text(text: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let rest = &text[start..];
+    let end = rest.find(&close)?;
+    Some(rest[..end].to_string())
+}
+
+/// 取 `<ServiceInfo ... Name="x" ... />` 的属性值（属性名大小写不敏感，值**保持原样**）。
+fn attr(line: &str, key: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let k = key.to_ascii_lowercase();
+    let mut from = 0usize;
+    while let Some(idx) = lower[from..].find(&k) {
+        let pos = from + idx;
+        // 必须是属性边界（前一个字符是空白），避免命中 FileName / UserName 这类含 Name 的属性
+        let boundary = pos == 0
+            || line[..pos]
+                .chars()
+                .next_back()
+                .map(|c| c.is_whitespace())
+                .unwrap_or(false);
+        // 注意：只用 lower 定位，**取值必须切原文 line**（否则路径/名称会被转成小写）
+        let after = line[pos + k.len()..].trim_start();
+        if boundary {
+            if let Some(rest) = after.strip_prefix('=') {
+                let value = rest.trim_start();
+                let value = value.strip_prefix('"').unwrap_or(value);
+                let end = value.find('"').unwrap_or(value.len());
+                return Some(value[..end].to_string());
+            }
+        }
+        from = pos + k.len();
+        if from >= lower.len() {
+            break;
+        }
+    }
+    None
+}
+
+/// 路径归一化（统一斜杠方向、转小写、去掉尾部分隔符），用于容错比较。
+fn normalize_path(text: &str) -> String {
+    let mut s = text.trim().replace('\\', "/");
+    while s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    s.to_ascii_lowercase()
+}
+
 // ———— 内部实现 ————
 
 fn read_config(path: &Path) -> Result<String, String> {
@@ -359,6 +600,51 @@ mod tests {
     /// 完整合法的条目（含 Name 属性），供替换/删除匹配用。
     fn sample_entry(file: &str) -> String {
         format!("<ServiceInfo Priority=\"Normal\" Name=\"DemoSvc\" FileName=\"{file}\" Enable=\"true\" />")
+    }
+
+    /// 客户端：解析服务条目 / 端口 / 按程序路径匹配（面板重启靠这三样）。
+    #[test]
+    fn client_parses_services_and_matches_program() {
+        let dir = std::env::temp_dir().join(format!("star-client-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建目录");
+        let cfg = dir.join("StarAgent.config");
+        std::fs::write(
+            &cfg,
+            concat!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<StarAgent>\n",
+                "  <LocalPort>5601</LocalPort>\n",
+                "  <Services>\n",
+                "    <ServiceInfo Priority=\"Normal\" Name=\"HlktechIotMqtt\" FileName=\"/opt/iot/bin/hlktech-iot-mqtt\" Arguments=\"-f rmqtt.toml\" WorkingDirectory=\"/opt/iot/node1\" UserName=\"\" Enable=\"true\" Mode=\"11\" />\n",
+                "    <ServiceInfo Priority=\"Normal\" Name=\"HlktechIotOta\" FileName=\"hlktech-iot-ota\" WorkingDirectory=\"/opt/iot/ota\" Enable=\"false\" />\n",
+                "  </Services>\n</StarAgent>\n"
+            ),
+        )
+        .expect("写配置");
+
+        let list = services(&cfg).expect("解析服务条目");
+        assert_eq!(list.len(), 2, "应解析出两个条目");
+        assert_eq!(list[0].name, "HlktechIotMqtt");
+        assert_eq!(list[0].working_directory, "/opt/iot/node1");
+        assert!(list[0].enable);
+        assert!(!list[1].enable, "Enable=false 应识别为未启用");
+        // 属性名不能串味：FileName 里含 "name"，不能被当成 Name 属性
+        assert_eq!(list[1].file_name, "hlktech-iot-ota");
+
+        assert_eq!(local_port(&cfg), 5601, "端口取配置里的 LocalPort");
+
+        // 绝对路径精确匹配（斜杠方向/大小写容错）
+        let hit = find_by_program(&list, Path::new(r"\opt\iot\bin\hlktech-iot-mqtt"))
+            .expect("应能按程序路径找到条目");
+        assert_eq!(hit.name, "HlktechIotMqtt");
+        // 相对 FileName 按 WorkingDirectory 解析
+        let hit = find_by_program(&list, Path::new("/opt/iot/ota/hlktech-iot-ota"))
+            .expect("相对 FileName 应能解析");
+        assert_eq!(hit.name, "HlktechIotOta");
+        // 不在清单里 → None（不瞎猜）
+        assert!(find_by_program(&list, Path::new("/opt/iot/bin/not-installed")).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
