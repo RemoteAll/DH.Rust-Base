@@ -27,7 +27,8 @@ Pek 生态的 Rust 基础库，对应 C# 的 **DH.NCore**：为 Rust 项目提�
 | `dingtalk` | 钉钉群机器人（Webhook 推送：text/markdown + **「加签」** `signed_url`/`sign` + 响应解析；feature `http-client`） | `Pek.WebHook`（钉钉机器人） |
 | `alert` | **告警中心**：企业微信 + 钉钉双通道、**异步派发**（独立线程）、按 key 冷却 + 在途去重、发送统计、`send_test`（面板在线测试）；配置由调用方给 `AlertOptions` | — |
 | `razor` | Razor 子集模板引擎（feature `razor`） | — |
-| `upgrade` | **自升级管线·应用层**：`{exe}.new`/`Update/` 双通道、静置判定、可执行魔数、自检、原子替换（Windows 改名让位+重试）、交接重启（Unix `execv` 原地接管 / 助手兜底）、外部替换指纹、资源目录同步（`index.html` 最后）、zip 包内找程序（feature `zip-extract`）、影子模式判定 | — |
+| `staragent` | **星尘（StarAgent）**：注册/注销/`handle_cli`（影子条目 upsert，逐字节保原文件）+ **本地控制客户端** `services`/`local_port`/`locate_config`/`find_by_program`/`operate`/`restart_program`（走 `net::api_rpc` UDP 规范通道，与 C# 星尘字节级互通；面板“重启服务”一律用它，不要自己拼 HTTP `/RestartService`） | `DH.NStardust`（`LocalStarClient`） |
+| `upgrade` | **自升级管线·应用层**：`{exe}.new`/`Update/` 双通道、静置判定、可执行魔数、自检、原子替换（Windows 改名让位+重试）、交接重启（Unix `execv` 原地接管 / 助手兜底）、外部替换指纹、资源目录同步（`index.html` 最后）、zip/tar.gz 包内找程序（feature `zip-extract`）、**影子模式判定 `shadow_deploy_base` 与源程序解析 `actual_program`** | — |
 
 ## HTTP 控制器与静态文件（net）
 

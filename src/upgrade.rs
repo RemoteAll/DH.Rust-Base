@@ -116,6 +116,57 @@ pub fn backup_file(path: &Path) -> Result<PathBuf, String> {
     Ok(bak)
 }
 
+/// 影子模式下 `current_exe()` 指向 `shadow/` 里的**运行副本**；本函数取它对应的**源程序**路径。
+///
+/// 升级替换、重启、日志定位都必须落在源程序上：星尘每次拉起都按源程序 md5 重建影子副本，
+/// 只改影子副本等于没改（症状：提示升级成功但版本号不变）。
+///
+/// 依次尝试（前一个不存在就看下一个）：
+/// 1. `<影子目录上三级>/bin/<程序>`（当前部署布局：程序在 `<部署根>/bin/`，影子在 `<部署根>/shadow/`）；
+/// 2. `<base>/<程序>`（老布局：程序与 `shadow/` 同级）；
+/// 3. `<影子目录上三级>/<程序>`（影子目录的上级就是程序所在目录）；
+/// 都不命中则原样返回 `exe`（调用方据此仍可完成自重启）。
+///
+/// `base`：部署基目录（如 `HLKTECH_IOT_BASE` 的值）；可为 `None`（纯按路径推断）。
+pub fn actual_program(exe: &Path, base: Option<&Path>) -> PathBuf {
+    let Some(name) = exe.file_name() else {
+        return exe.to_path_buf();
+    };
+    let normalized = exe.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+    let shadow_root = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent());
+    if normalized.contains("/shadow/") {
+        if let Some(root) = shadow_root {
+            let real = root.join("bin").join(name);
+            if real.is_file() {
+                return real;
+            }
+        }
+        if let Some(base) = base {
+            let real = base.join(name);
+            if real.is_file() {
+                return real;
+            }
+        }
+        if let Some(root) = shadow_root {
+            let real = root.join(name);
+            if real.is_file() {
+                return real;
+            }
+        }
+    } else if let Some(base) = base {
+        if let Ok(rel) = exe.strip_prefix(base) {
+            let comps: Vec<_> = rel.components().collect();
+            if comps.len() == 3 && comps[0].as_os_str() == "shadow" {
+                let real = base.join(name);
+                if real.is_file() {
+                    return real;
+                }
+            }
+        }
+    }
+    exe.to_path_buf()
+}
+
 /// 星尘影子模式判定（**纯函数**，便于测试）：程序路径里带 `shadow/` → 返回部署基目录。
 ///
 /// 影子模式（Pek.RAgent 托管）下运行的是 `shadow/` 里的副本，**源程序文件不被占用**，
@@ -1272,6 +1323,40 @@ mod tests {
         // Windows 风格路径也认
         let win = PathBuf::from(r"C:\App\shadow\app-1234\app.exe");
         assert!(shadow_deploy_base(&win, Some(r"C:\App")).is_some());
+    }
+
+    /// 影子副本 → 源程序：新布局取 `<部署根>/bin/<程序>`，老布局取 `<base>/<程序>`。
+    #[test]
+    fn actual_program_resolves_shadow_copy_to_source() {
+        let root = tmp_dir("actual");
+        // 新布局：<root>/bin/<程序> + <root>/shadow/<名称>-<hash>/<程序>
+        std::fs::create_dir_all(root.join("bin")).expect("建 bin");
+        std::fs::create_dir_all(root.join("shadow").join("app-1234")).expect("建 shadow");
+        let real = root.join("bin").join("app");
+        std::fs::write(&real, b"\x7fELF").expect("写程序");
+        let copy = root.join("shadow").join("app-1234").join("app");
+        std::fs::write(&copy, b"\x7fELF").expect("写副本");
+        assert_eq!(actual_program(&copy, None), real, "新布局：取 <root>/bin/<程序>");
+
+        // 老布局：程序与 shadow/ 同级
+        let old = tmp_dir("actual-old");
+        std::fs::create_dir_all(old.join("shadow").join("app-9")).expect("建 shadow");
+        let old_real = old.join("app");
+        std::fs::write(&old_real, b"\x7fELF").expect("写程序");
+        let old_copy = old.join("shadow").join("app-9").join("app");
+        std::fs::write(&old_copy, b"\x7fELF").expect("写副本");
+        assert_eq!(
+            actual_program(&old_copy, Some(&old)),
+            old_real,
+            "老布局：取 <base>/<程序>"
+        );
+
+        // 非影子路径：原样返回
+        assert_eq!(actual_program(&real, None), real);
+        // 影子副本但源程序不存在：退回副本本身（仍可完成自重启）
+        let gone = root.join("shadow").join("app-1234").join("missing");
+        std::fs::write(&gone, b"x").expect("写");
+        assert_eq!(actual_program(&gone, None), gone);
     }
 
     #[test]
