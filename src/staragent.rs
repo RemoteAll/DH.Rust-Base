@@ -363,6 +363,31 @@ pub fn restart_program(
     operate(&config, &entry.name, ServiceOp::Restart, timeout)
 }
 
+/// CLI 分派：`--RestartSelf`（让星尘重启**本程序**对应的子服务；命中返回退出码）。
+///
+/// 供安装/升级脚本调用——脚本只调程序，**不再自己拼 HTTP `/RestartService`**，
+/// 与面板走同一实现（`restart_program` → `net::api_rpc` UDP）。
+pub fn handle_self_action(args: &[String]) -> Option<i32> {
+    let want = args
+        .iter()
+        .any(|a| matches!(a.trim(), "--RestartSelf" | "--restart-self" | "-RestartSelf"));
+    if !want {
+        return None;
+    }
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+    let result = restart_program(None, &exe, std::time::Duration::from_secs(20));
+    match result {
+        Ok(msg) => {
+            println!("{}", msg);
+            Some(0)
+        }
+        Err(e) => {
+            eprintln!("重启失败：{e}");
+            Some(1)
+        }
+    }
+}
+
 /// 读取 `<Tag>值</Tag>` 的文本（单行，取首个命中）。
 fn tag_text(text: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
