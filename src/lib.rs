@@ -2,6 +2,8 @@ pub mod audit; // 审计日志脱敏与摘要（敏感字段 *** / 动作名 / �
 pub mod cache; // 进程内 TTL 缓存（热路径元数据缓存；HlktechIoT 心跳/鉴权实测沉底）
 pub mod cert; // 证书与域名工具（PEM 拆包 / 最小 X.509 解析 / 通配符匹配；证书下发与部署共用）
 pub mod config; // 配置项（对应 DH.NCore Setting/Configuration）
+#[cfg(feature = "excel")]
+pub mod excel; // Excel（.xlsx）读写：导出 / 导入模板 / 读回用户填写（纯 Rust，多项目共用）
 #[cfg(feature = "fileman")]
 pub mod fileman; // 文件管理（浏览/上传下载/编辑/压缩解压/搜索；Pek.RAgent 与 Pek.RPanlServer 共用）
 pub mod io; // 加了pub之后为公共模块可以为外部调用

@@ -43,6 +43,12 @@ zip = { version = "9", default-features = false, features = ["deflate"], optiona
 
 # ———— feature `patch`（zstd 字典差分补丁：以旧文件为字典压缩新文件；增量升级，Pek.RAgent ↔ DHDeploy.Agent.Rust 共用）————
 zstd = { version = "0.13", optional = true }
+
+# ———— feature `excel`（xlsx 读写：导出数据 / 导入模板 / 读回用户填写的表；HLZX.EIP 人员/供应商等模块共用）————
+# 两者都是**纯 Rust**（可 zig 交叉编 musl，不依赖 LibreOffice/系统库）；不开该特性则零依赖。
+# 写：rust_xlsxwriter；读：calamine（默认只开 `dates` —— 日期单元格需要转文本）。
+rust_xlsxwriter = { version = "0.101", default-features = false, optional = true }
+calamine = { version = "0.37", default-features = false, features = ["dates"], optional = true }
 # ———— feature `log-bridge` / `tracing-bridge`：日志门面桥接（log / tracing → dhrust::logs）————
 # 业务代码用 `log::info!`、引擎（如 rmqtt）用 `tracing::info!`，而 dhrust 自身**不安装全局 logger**，
 # 不桥接就会静默丢弃。桥接实现已收编到这里（原先各项目各写一份、逐字同构）。
@@ -122,6 +128,8 @@ zip-extract = ["dep:zip"]
 fileman = ["zip-extract"]
 # zstd 字典差分补丁（增量升级：生成/还原；Pek.RAgent 与 DHDeploy.Agent.Rust 共用）
 patch = ["dep:zstd"]
+# Excel（.xlsx）读写（导出数据 / 导入模板 / 读回用户填写的表；多项目共用）
+excel = ["dep:rust_xlsxwriter", "dep:calamine"]
 # 插件包格式 + 插件源目录签名（Ed25519；含 zip-extract）——Pek.RAgent（安装/发布）与 Pek.RPanlServer（平台）共用
 plugin = ["zip-extract", "dep:ed25519-dalek"]
 # 真 PTY 会话引擎（Windows ConPTY / Unix openpty；在线终端等服务端能力共用）
