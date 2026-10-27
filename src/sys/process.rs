@@ -145,14 +145,45 @@ pub fn is_alive(pid: u32) -> bool {
 }
 
 /// 进程是否存活。
+///
+/// Unix 的 `kill(pid, 0)` 对**僵尸进程**也返回成功；这里额外检查 `/proc/<pid>/stat`
+/// 的状态位（`Z`/`X` 视为已退出），避免停止/单实例锁把 defunct 进程当活进程。
 #[cfg(unix)]
 pub fn is_alive(pid: u32) -> bool {
     unsafe {
         if libc::kill(pid as libc::pid_t, 0) == 0 {
-            return true;
+            return !is_zombie(pid);
         }
         std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
+}
+
+/// 是否为僵尸/已退出但仍占用 PID 的进程（Linux 读 `/proc`；其它 Unix 保守返回 false）。
+#[cfg(unix)]
+fn is_zombie(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        return std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|stat| proc_stat_is_dead(&stat))
+            .unwrap_or(false);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// 解析 `/proc/<pid>/stat`：进程名在括号内，括号后的第一个字段是状态（`Z`=僵尸）。
+#[cfg(target_os = "linux")]
+fn proc_stat_is_dead(stat: &str) -> bool {
+    let Some(pos) = stat.rfind(')') else {
+        return false;
+    };
+    matches!(
+        stat[pos + 1..].trim_start().chars().next(),
+        Some('Z') | Some('X') | Some('x')
+    )
 }
 
 /// 发送温和停止信号（Unix SIGTERM / Windows taskkill），并覆盖子进程树。
@@ -979,8 +1010,23 @@ pub fn command_line(pid: u32) -> Option<String> {
     }
 }
 
-/// 读取进程命令行（非 Windows 不支持）。
-#[cfg(not(windows))]
+/// 读取进程命令行（Linux 读 `/proc/<pid>/cmdline`；其它非 Windows 平台不支持）。
+#[cfg(target_os = "linux")]
+pub fn command_line(pid: u32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).to_string())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// 读取进程命令行（其它非 Windows 平台不支持）。
+#[cfg(all(not(windows), not(target_os = "linux")))]
 pub fn command_line(_pid: u32) -> Option<String> {
     None
 }
@@ -988,6 +1034,16 @@ pub fn command_line(_pid: u32) -> Option<String> {
 #[cfg(test)]
 mod run_tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn proc_stat_detects_zombie_and_running() {
+        assert!(proc_stat_is_dead("123 (pek-ragent) Z 1 2 3"));
+        assert!(proc_stat_is_dead("123 (pek-ragent) X 1 2 3"));
+        assert!(!proc_stat_is_dead("123 (pek-ragent) S 1 2 3"));
+        assert!(!proc_stat_is_dead("123 (a) (b) R 1 2 3"));
+        assert!(!proc_stat_is_dead("garbage"));
+    }
 
     #[test]
     #[cfg(windows)]
