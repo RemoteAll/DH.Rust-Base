@@ -144,6 +144,24 @@ pub fn is_alive(pid: u32) -> bool {
     }
 }
 
+/// 尝试回收已退出的直接子进程（仅 Unix；非本进程子进程返回 false，no-op 安全）。
+///
+/// 僵尸进程不会被 SIGKILL 消灭，只能由父进程 `waitpid` 回收。RAgent 重启后丢失
+/// `Child` 句柄但仍是父进程时，用该函数清理 `Z` 状态。
+#[cfg(unix)]
+pub fn reap_child(pid: u32) -> bool {
+    unsafe {
+        libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG)
+            == pid as libc::pid_t
+    }
+}
+
+/// 尝试回收已退出的直接子进程（Windows 由系统自动回收句柄，no-op）。
+#[cfg(windows)]
+pub fn reap_child(_pid: u32) -> bool {
+    false
+}
+
 /// 进程是否存活。
 ///
 /// Unix 的 `kill(pid, 0)` 对**僵尸进程**也返回成功；这里额外检查 `/proc/<pid>/stat`
