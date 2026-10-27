@@ -300,6 +300,37 @@ pub fn operate(
     timeout: std::time::Duration,
 ) -> Result<String, String> {
     let port = local_port(config_path);
+    do_operate(port, name, op, timeout)
+}
+
+/// 不依赖配置文件：依次尝试默认端口（Rust 星尘 5501 → C# 星尘 5500）。
+///
+/// 用于**找不到 `StarAgent.config`** 但机器上确实跑着星尘的场景（如只装了 C# 版、
+/// 或配置文件放在非约定目录）。两个端口都失败才算失败，错误里带上各自原因。
+pub fn operate_by_default_ports(
+    name: &str,
+    op: ServiceOp,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    let mut errors: Vec<String> = Vec::new();
+    for port in [DEFAULT_AGENT_PORT, CSHARP_AGENT_PORT] {
+        match do_operate(port, name, op, timeout) {
+            Ok(m) => return Ok(m),
+            Err(e) => errors.push(e),
+        }
+    }
+    Err(errors.join("；"))
+}
+
+/// C# 版星尘默认控制端口。
+pub const CSHARP_AGENT_PORT: u16 = 5500;
+
+fn do_operate(
+    port: u16,
+    name: &str,
+    op: ServiceOp,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
     let addr = format!("127.0.0.1:{port}");
     let reply = match op {
         ServiceOp::Start => crate::net::api_rpc::start_service(&addr, name, timeout),
