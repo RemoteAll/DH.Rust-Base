@@ -76,11 +76,16 @@ pub fn decide(
 /// **坑（真实首验踩过）**：`WorkingDirectory=` 的值**不能加引号**——systemd 不剥离引号，
 /// 会把 `"/www/Agent"` 当作路径本体并判为“不是绝对路径”（fatal error，整个单元拒启）；
 /// 而 `ExecStart=` 支持引号且路径含空格时需要引号（按需加）。
+///
+/// `StartLimitIntervalSec=0`：禁用启动频率限制——服务崩溃后必须持续拉起，
+/// 不能因短时间多次重启被 systemd 永久放弃（旧版 systemd 忽略该键）。
+/// `OOMScoreAdjust=-500`：降低代理被 OOM 杀死的优先级（管理面优先存活）。
 pub fn systemd_unit_text(mgr: &ServiceManager) -> String {
     format!(
         "[Unit]\n\
 Description={name}\n\
 After=network.target\n\
+StartLimitIntervalSec=0\n\
 \n\
 [Service]\n\
 Type=simple\n\
@@ -89,6 +94,7 @@ ExecStart={exe} -s\n\
 Restart=always\n\
 RestartSec=5\n\
 KillMode=process\n\
+OOMScoreAdjust=-500\n\
 LimitNOFILE=65535\n\
 \n\
 [Install]\n\
@@ -349,6 +355,7 @@ mod tests {
         let expected = "[Unit]\n\
 Description=staragent\n\
 After=network.target\n\
+StartLimitIntervalSec=0\n\
 \n\
 [Service]\n\
 Type=simple\n\
@@ -357,6 +364,7 @@ ExecStart=/opt/staragent/pek-ragent -s\n\
 Restart=always\n\
 RestartSec=5\n\
 KillMode=process\n\
+OOMScoreAdjust=-500\n\
 LimitNOFILE=65535\n\
 \n\
 [Install]\n\
