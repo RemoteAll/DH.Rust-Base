@@ -133,16 +133,49 @@ pub fn shadow_deploy_base(exe: &Path, base_env: Option<&str>) -> Option<PathBuf>
     }
 }
 
-/// 从 zip 升级包里解出程序文件：解包到 `dest` → 递归按文件名找 → 大小/魔数校验。
+/// 按**魔数**把升级包解到 `dest`：支持 `.zip` 与 `.tar.gz`（不看扩展名，改名也不会解错）。
 ///
-/// 下沉自 HlktechIoT「面板在线升级」：发布包是 zip（内含 `<程序名>`，可能在子目录里），
+/// - zip：`PK\x03\x04` → `crate::zip::extract_zip`（已防目录穿越 / 占用文件安全替换）；
+/// - gzip：`1f 8b` → gunzip 后按 tar 解包（`tar` crate 会自动跳过绝对路径与带 `..` 的条目）。
+#[cfg(feature = "zip-extract")]
+pub fn extract_archive(path: &Path, dest: &Path) -> Result<(), String> {
+    let mut head = [0u8; 4];
+    let n = {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path)
+            .map_err(|e| format!("打开升级包失败（{}）：{e}", path.display()))?;
+        f.read(&mut head)
+            .map_err(|e| format!("读取升级包失败（{}）：{e}", path.display()))?
+    };
+    if n >= 4 && head[..4] == *b"PK\x03\x04" {
+        return crate::zip::extract_zip(path, dest).map(|_| ());
+    }
+    if n >= 2 && head[0] == 0x1f && head[1] == 0x8b {
+        let f = std::fs::File::open(path)
+            .map_err(|e| format!("打开升级包失败（{}）：{e}", path.display()))?;
+        let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(f));
+        ar.set_overwrite(true);
+        ar.unpack(dest)
+            .map_err(|e| format!("解包 tar.gz 失败（{}）：{e}", path.display()))?;
+        return Ok(());
+    }
+    Err(format!(
+        "不支持的升级包格式（{}）——只支持 .zip / .tar.gz",
+        path.display()
+    ))
+}
+
+/// 从升级包里解出程序文件：解包到 `dest` → 递归按文件名找 → 大小/魔数校验。
+///
+/// 下沉自 HlktechIoT「面板在线升级」：发布包可能是 `.zip` 也可能是 `.tar.gz`（集群发行包
+/// 常用后者），按**魔数字节**自动分派，不靠扩展名。内含 `<程序名>`（可能在子目录里），
 /// 找不到/不是可执行文件/体积过小都明确报错，不静默替换。
 ///
 /// - `names`：候选文件名（按顺序匹配，如 `["app.exe", "app"]`）；
 /// - `min_bytes`：最小体积（防「传了个配置/半截包」）。
 #[cfg(feature = "zip-extract")]
 pub fn extract_program(
-    zip_path: &Path,
+    archive_path: &Path,
     dest: &Path,
     names: &[&str],
     min_bytes: usize,
@@ -151,7 +184,7 @@ pub fn extract_program(
         return Err("未提供程序文件名".to_string());
     }
     std::fs::create_dir_all(dest).map_err(|e| format!("创建升级目录失败：{e}"))?;
-    crate::zip::extract_zip(zip_path, dest)?;
+    extract_archive(archive_path, dest)?;
     let mut found = None;
     for name in names {
         if let Some(p) = find_file(dest, name, 2000) {
@@ -161,7 +194,7 @@ pub fn extract_program(
     }
     let Some(path) = found else {
         return Err(format!(
-            "包里没有找到程序文件（{}）——请使用发布包 zip",
+            "包里没有找到程序文件（{}）——请使用发布包 .zip / .tar.gz",
             names.join(" / ")
         ));
     };
@@ -1233,6 +1266,44 @@ mod tests {
         assert_eq!(std::fs::read(&bak).expect("读备份"), b"MZ-old");
         assert!(backup_file(&dir.join("nope")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 升级包格式：`.tar.gz` 按魔数识别并解出程序；不认识的格式明确报错。
+    #[test]
+    #[cfg(feature = "zip-extract")]
+    fn extract_program_supports_tar_gz() {
+        use std::io::Write;
+
+        let root = tmp_dir("tgz");
+        let pkg = root.join("pkg");
+        std::fs::create_dir_all(pkg.join("bin")).expect("建目录");
+        // 假 ELF：魔数 + 填充（体积过 min_bytes 且能通过可执行文件校验）
+        let mut exe = b"\x7fELF\x02\x01\x01\x00".to_vec();
+        exe.extend(std::iter::repeat_n(0u8, 4096));
+        std::fs::write(pkg.join("bin").join("demo-app"), &exe).expect("写程序");
+        std::fs::write(pkg.join("README.md"), "hi").expect("写说明");
+
+        let tgz = root.join("pkg.tar.gz");
+        {
+            let f = std::fs::File::create(&tgz).expect("建包");
+            let enc = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+            let mut b = tar::Builder::new(enc);
+            b.append_dir_all("demo-1.0", &pkg).expect("打 tar");
+            let enc = b.into_inner().expect("收尾");
+            enc.finish().expect("压缩收尾").flush().expect("刷盘");
+        }
+
+        let found = extract_program(&tgz, &root.join("out"), &["demo-app"], 1024)
+            .expect("应能解出 tar.gz 里的程序");
+        assert!(found.ends_with("bin/demo-app"), "{}", found.display());
+
+        // 不是 zip / tar.gz 的内容要明确报错，不能静默替换
+        let bad = root.join("bad.bin");
+        std::fs::write(&bad, b"hello world").expect("写垃圾");
+        let err = extract_program(&bad, &root.join("out2"), &["demo-app"], 1).unwrap_err();
+        assert!(err.contains("不支持的升级包格式"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 存量自检用例：环境变量透传（用 cmd/echo 造一个会回显环境变量的自检程序）。

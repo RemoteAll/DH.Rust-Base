@@ -40,6 +40,8 @@ toml_edit = { version = "0.25", optional = true }
 # （`failed to select a version for the requirement zip = "^2"`）。故对齐上游唯一可用线 9.x
 # （zip 文件格式向下兼容，读写互通；2026-10-16 由 2.x 升级）。
 zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
+# tar.gz 解包（在线升级包常以 .tar.gz 发布；与 zip 同一入口按魔数自动分派）
+tar = { version = "0.4", optional = true }
 
 # ———— feature `patch`（zstd 字典差分补丁：以旧文件为字典压缩新文件；增量升级，Pek.RAgent ↔ DHDeploy.Agent.Rust 共用）————
 zstd = { version = "0.13", optional = true }
@@ -122,8 +124,8 @@ razor = []
 secret = ["dep:aes-gcm"]
 # 跨平台服务管理（Windows SCM / systemd / procd / SysV / launchd；Pek.RAgent 下沉）
 service = ["dep:windows-service"]
-# ZIP 解压（防目录穿越/占用文件安全替换；Pek.RAgent 与 DHDeploy.Agent 共用）
-zip-extract = ["dep:zip"]
+# ZIP / tar.gz 解压（防目录穿越/占用文件安全替换；Pek.RAgent 与 DHDeploy.Agent 共用）
+zip-extract = ["dep:zip", "dep:tar", "dep:flate2"]
 # 文件管理（面板浏览/上传下载/编辑/压缩解压/搜索；Pek.RAgent 与 Pek.RPanlServer 共用）
 fileman = ["zip-extract"]
 # zstd 字典差分补丁（增量升级：生成/还原；Pek.RAgent 与 DHDeploy.Agent.Rust 共用）
