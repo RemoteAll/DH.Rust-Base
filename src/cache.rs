@@ -143,6 +143,42 @@ where
     }
 }
 
+impl<V> TtlCache<String, V>
+where
+    V: Clone,
+{
+    /// 按 `&str` 读取（**零分配**）。
+    ///
+    /// 热路径上常见的写法是 `get(&key.to_string())` —— 每次查表都要先分配一个 `String`
+    /// 才能满足 `&K` 参数（设备上报场景实测每条消息一次多余分配）。
+    /// 本方法用 `String: Borrow<str>` 让 `HashMap` 直接按字符串切片查询，不产生分配。
+    ///
+    /// # 参数
+    /// - `key`：缓存键（字符串切片）。
+    ///
+    /// # 返回值
+    /// 命中且未过期时返回值副本。
+    pub fn get_str(&self, key: &str) -> Option<V> {
+        let ttl = self.ttl?;
+        let guard = match self.map.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let (at, value) = guard.get(key)?;
+        (at.elapsed() < ttl).then(|| value.clone())
+    }
+
+    /// 按 `&str` 让某个键立即失效（**零分配**）。
+    ///
+    /// # 参数
+    /// - `key`：缓存键（字符串切片）。
+    pub fn remove_str(&self, key: &str) {
+        if let Ok(mut guard) = self.map.lock() {
+            guard.remove(key);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +212,22 @@ mod tests {
         cache.insert(1, 2);
         assert_eq!(cache.get(&1), None);
         assert_eq!(cache.len(), 0);
+    }
+
+    /// `String` 键可用 `&str` 查询/删除（零分配热路径），行为与 `get(&String)` 完全一致。
+    #[test]
+    fn str_key_can_be_queried_without_allocation() {
+        let cache: TtlCache<String, i32> = TtlCache::new(60, 16);
+        cache.insert("dev-001".to_string(), 9);
+        assert_eq!(cache.get_str("dev-001"), Some(9), "按 &str 命中");
+        assert_eq!(cache.get_str("dev-002"), None, "未命中不 panic");
+        cache.remove_str("dev-001");
+        assert_eq!(cache.get_str("dev-001"), None, "按 &str 失效生效");
+
+        // 关闭缓存时同样是空操作（不 panic）
+        let off: TtlCache<String, i32> = TtlCache::new(0, 16);
+        off.insert("a".into(), 1);
+        assert_eq!(off.get_str("a"), None);
     }
 
     /// 超过容量上限时先清过期，再整体清空（不会无限增长）。

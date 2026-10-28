@@ -43,6 +43,8 @@ pub mod openai;
 pub mod panel_auth;
 #[cfg(feature = "net")]
 pub mod panel;
+#[cfg(feature = "net-tls")]
+pub mod panel_cert;
 #[cfg(feature = "net")]
 pub mod reply;
 #[cfg(feature = "net")]
