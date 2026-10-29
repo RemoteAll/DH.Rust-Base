@@ -1001,6 +1001,45 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoCertificateV
 mod tests {
     use super::*;
 
+    /// 阻塞入口的 runtime 创建代价（`cargo test --release --features net --lib -- --ignored --nocapture runtime_create`）。
+    ///
+    /// 现状：每个 `get_blocking` / `post_blocking` / `download_to_file` / `wecom` 阻塞入口都新建一个
+    /// current-thread runtime。对「每 N 秒一次」的调用无所谓；高频（逐设备推送、逐消息 webhook）时
+    /// 每次几十微秒的创建/销毁就是可观开销。本基准用来量化该开销，供是否改为共享 runtime 决策。
+    #[test]
+    #[ignore = "性能基准，按需手动运行"]
+    fn perf_blocking_runtime_creation() {
+        const N: usize = 200;
+
+        let t = std::time::Instant::now();
+        for _ in 0..N {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            drop(rt);
+        }
+        let current_thread = t.elapsed();
+
+        let t = std::time::Instant::now();
+        for _ in 0..N {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            drop(rt);
+        }
+        let multi_thread = t.elapsed();
+
+        let to_us = |d: std::time::Duration| d.as_secs_f64() * 1e6 / N as f64;
+        println!(
+            "[runtime 创建/销毁 ×{N}] current_thread {current_thread:?}（{:.1}µs/次）/ multi_thread(1) {multi_thread:?}（{:.1}µs/次）",
+            to_us(current_thread),
+            to_us(multi_thread)
+        );
+    }
+
     #[test]
     fn offthread_request_is_safe_inside_tokio_runtime() {
         use std::io::Write as _;
