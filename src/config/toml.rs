@@ -61,6 +61,11 @@ pub fn unknown_keys(json: &Value, template: &Value, free_form_sections: &[&str])
             if free_form_sections.contains(&section.as_str()) {
                 continue;
             }
+            // 模板里声明为**空表**的段（如示例 `[aliases]` 只有注释）＝ 自由段：
+            // 键名由用户自定义，模板无从校验，不能当成「未识别」删掉。
+            if known.is_empty() {
+                continue;
+            }
             for key in inner.keys() {
                 if !known.contains_key(key) {
                     out.push(format!("{section}.{key}"));
@@ -73,6 +78,82 @@ pub fn unknown_keys(json: &Value, template: &Value, free_form_sections: &[&str])
 
     out.sort();
     out
+}
+
+/// 删除无法识别的配置项（入参就是 [`unknown_keys`] 的返回值，形如 `server.heartbeat`）。
+///
+/// 与 [`merge_missing_keys`] **对称**：缺的补、多的删 —— 加载后文件里只剩
+/// 「模板定义的键 + 用户填的值」，不会留下「读了但不用」的残行。
+///
+/// 删除是**整键移除**（`Table::remove`/`Table::remove_entry` 的语义）：该键上方的注释行
+/// 随键一起消失。这是刻意的 —— 留下孤儿注释比删键更容易误导人。
+///
+/// # 参数
+/// - `doc`：目标文档。
+/// - `keys`：要删除的点分路径列表。
+///
+/// # 返回值
+/// 实际删掉的键数量（路径不存在的不计）。
+pub fn remove_keys(doc: &mut DocumentMut, keys: &[String]) -> usize {
+    let mut removed = 0;
+    for path in keys {
+        if remove_path(doc.as_table_mut(), path) {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// 删除单条点分路径（`a.b.c`）；返回是否真的删到。
+fn remove_path(table: &mut Table, path: &str) -> bool {
+    match path.split_once('.') {
+        None => table.remove(path).is_some(),
+        Some((head, rest)) => match table.get_mut(head) {
+            // 点分键（`a.b = 1`）在 toml_edit 里同样是隐式 Table，走这一支
+            Some(Item::Table(inner)) => remove_path(inner, rest),
+            _ => false,
+        },
+    }
+}
+
+/// 把配置文件**收敛到「实际字段集合」**：删掉模板里没有的键（幂等，有变化才回写）。
+///
+/// 用于**配置加载器不在我们手里**的场合（例如 broker 的插件配置由外部程序读取，
+/// 走不到 [`TomlConfig`](super::TomlConfig) 的自动剪枝）。调用方只要给出
+/// 「实际字段序列化出来的 JSON」（通常是 `serde_json::to_value(Config::default())`），
+/// 文件就会自动与代码保持一致 —— **不需要逐键特判**，也不会留下「读了但不用」的残行。
+///
+/// # 参数
+/// - `path`：配置文件路径（不存在直接返回 `Ok(0)`）。
+/// - `template`：实际字段集合（字段名基准）。
+/// - `free_form_sections`：自由映射段（键名由用户自定义，如设备别名表），不做删除。
+///
+/// # 返回值
+/// 删除的键数量。
+///
+/// # 错误
+/// 读取/解析/写回失败时返回 IO 错误；解析失败**不猜着改**，原文件保持不变。
+pub fn prune_to_schema(
+    path: &Path,
+    template: &Value,
+    free_form_sections: &[&str],
+) -> io::Result<usize> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut doc = parse_document(&text).map_err(io::Error::other)?;
+    let json = document_to_json(&doc).map_err(io::Error::other)?;
+    let unknown = unknown_keys(&json, template, free_form_sections);
+    if unknown.is_empty() {
+        return Ok(0);
+    }
+    let removed = remove_keys(&mut doc, &unknown);
+    if removed > 0 {
+        backup_and_write(path, &doc.to_string())?;
+    }
+    Ok(removed)
 }
 
 /// 以示例模板为准补齐缺失配置项（保留模板中的注释与键装饰），返回补齐的键数量。
@@ -117,8 +198,7 @@ pub fn merge_missing_keys(target: &mut Table, template: &Table) -> usize {
 /// 统计表内叶子配置项数量（含嵌套子表）。
 pub fn count_leaves(table: &Table) -> usize {
     let mut n = 0;
-    for (_, item) in table.iter() {
-        match item {
+    for (_, item) in table.iter() {        match item {
             Item::Table(t) => n += count_leaves(t),
             Item::Value(_) => n += 1,
             _ => {}

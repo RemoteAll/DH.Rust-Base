@@ -437,17 +437,26 @@ where
     if converted || fixed > 0 {
         notes.push(format!("已修正 {fixed} 个类型不符的配置项"));
     }
-    // 3) 未知键：保留并告警（不静默删除运维手写的扩展项）
+    // 3) 未知键：**删除**，让文件与模板保持一致（缺的补齐、多的删掉）
+    //
+    // 2026-10-29 定：原来是「保留并告警」。保留的代价是每次都要靠 serde 忽略，
+    // 而运维看到那行会以为它还生效 —— 判断成本远高于一次清理。
+    // 删除是**幂等**的：清理过一次之后再加载就不会再 dirty。
     let unknown = dtoml::unknown_keys(&file_json, &tpl_json, &[]);
-    if !unknown.is_empty() {
+    let removed = if unknown.is_empty() {
+        0
+    } else {
+        dtoml::remove_keys(&mut doc, &unknown)
+    };
+    if removed > 0 {
         notes.push(format!(
-            "存在未识别配置项（已保留）：{}",
+            "已删除 {removed} 个未识别配置项：{}",
             unknown.join(", ")
         ));
     }
 
     let value: T = serde_json::from_value(coerced).map_err(|e| e.to_string())?;
-    Ok((value, added > 0 || converted || fixed > 0, doc.to_string()))
+    Ok((value, added > 0 || converted || fixed > 0 || removed > 0, doc.to_string()))
 }
 
 /// 以模板为基准渲染（保留 `current` 里已有的注释与排版）。
@@ -461,6 +470,12 @@ fn render(template: &str, want: &Value, current: Option<&str>) -> Result<String,
         _ => tpl_doc.clone(),
     };
     dtoml::merge_missing_keys(doc.as_table_mut(), tpl_doc.as_table());
+    // 保存时同样把「模板里没有的键」删掉：否则 `load` 清掉了、下次 `save` 又从旧文本里带回来
+    let stale_json = dtoml::document_to_json(&doc)?;
+    let stale = dtoml::unknown_keys(&stale_json, &tpl_json, &[]);
+    if !stale.is_empty() {
+        dtoml::remove_keys(&mut doc, &stale);
+    }
     let base = dtoml::document_to_json(&doc)?;
     // `apply_type_fixes` 会写入 base→expected 之间**所有变化**的叶子值（沿用原值装饰/行内注释）
     dtoml::apply_type_fixes(&mut doc, &base, &expected);
@@ -521,9 +536,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 未识别的配置项在加载时被**删掉**（文件最终与模板一致），已知键的值与注释必须保留。
+    ///
+    /// 2026-10-29 定：原策略是「保留并告警」，导致每次都要靠 serde 忽略，
+    /// 而运维看到那行会以为它还生效。
     #[test]
-    fn save_keeps_comments_and_updates_values() {
-        let dir = temp("save");
+    fn unknown_keys_are_removed_on_load() {
+        let dir = temp("prune");
+        let file = dir.join("a.toml");
+        std::fs::write(
+            &file,
+            "# 手写注释\nvalue = 1\nname = \"x\"\ndeprecated_key = true\n\n[old_section]\nk = 1\n",
+        )
+        .expect("写");
+        let mut cfg = TomlConfig::<Demo>::load(&file, TPL);
+        assert_eq!(cfg.value().value, 1, "已知键照常读取");
+        assert_eq!(cfg.value().name, "x");
+        let text = std::fs::read_to_string(&file).expect("读");
+        assert!(!text.contains("deprecated_key"), "未知顶层键应删除：{text}");
+        assert!(!text.contains("old_section"), "未知整段应删除：{text}");
+        assert!(text.contains("# 手写注释"), "已知键的注释必须保留：{text}");
+        assert!(text.contains("name = \"x\""), "已知键的值必须保留：{text}");
+        assert!(
+            cfg.take_notes().iter().any(|n| n.contains("已删除")),
+            "应给出「已删除」提示"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 模板里声明为**空表**的段是自由段（键名由用户自定义），不能被当成未知项删掉。
+    #[test]
+    fn empty_template_section_is_free_form() {
+        const TPL2: &str = "value = 7\nname = \"\"\n\n[aliases]\n";
+        #[derive(Debug, Default, PartialEq, Serialize, serde::Deserialize)]
+        #[serde(default)]
+        struct WithAlias {
+            value: i64,
+            name: String,
+            aliases: std::collections::BTreeMap<String, String>,
+        }
+        let dir = temp("freeform");
+        let file = dir.join("a.toml");
+        std::fs::write(&file, "value = 1\nname = \"x\"\n\n[aliases]\ndev1 = \"客厅\"\n").expect("写");
+        let cfg = TomlConfig::<WithAlias>::load(&file, TPL2);
+        assert_eq!(
+            cfg.value().aliases.get("dev1").map(|s| s.as_str()),
+            Some("客厅")
+        );
+        let text = std::fs::read_to_string(&file).expect("读");
+        assert!(text.contains("dev1"), "自由段的键不能被删：{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `prune_to_schema`：给「配置加载器不在我们手里」的文件用
+    /// （模板 = 实际字段序列化出的 JSON，如 broker 插件配置由外部程序读取）。
+    #[test]
+    fn prune_to_schema_removes_unknown_keys() {
+        let dir = temp("pruneschema");
+        let file = dir.join("a.toml");
+        std::fs::write(
+            &file,
+            "# 注释\nvalue = 1\nname = \"x\"\nstale = true\n\n[sub]\nk = 1\n",
+        )
+        .unwrap();
+        // 模板只声明 value / name / sub.k
+        let tpl = serde_json::json!({ "value": 0, "name": "", "sub": { "k": 0 } });
+        assert_eq!(
+            dtoml::prune_to_schema(&file, &tpl, &[]).unwrap(),
+            1,
+            "应删掉 stale"
+        );
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(!text.contains("stale"), "未知键应删除：{text}");
+        assert!(text.contains("value = 1"), "已知键保留：{text}");
+        assert!(text.contains("# 注释"), "注释保留：{text}");
+        assert_eq!(
+            dtoml::prune_to_schema(&file, &tpl, &[]).unwrap(),
+            0,
+            "重复调用应幂等"
+        );
+        // 文件不存在：不报错、返回 0
+        assert_eq!(
+            dtoml::prune_to_schema(&dir.join("nope.toml"), &tpl, &[]).unwrap(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_keeps_comments_and_updates_values() {        let dir = temp("save");
         let file = dir.join("a.toml");
         std::fs::write(&file, "# 手写注释\nvalue = 1\nname = \"old\"\n").expect("写");
         let mut cfg = TomlConfig::<Demo>::load(&file, TPL);
