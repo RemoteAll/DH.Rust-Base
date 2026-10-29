@@ -13,6 +13,66 @@ pub fn truncate_chars(text: &str, max: usize) -> String {
     format!("{clipped}…")
 }
 
+/// 前缀匹配（ASCII 大小写不敏感，**零分配**）。
+///
+/// 替代 `s.to_ascii_lowercase().starts_with(p)`——后者每条都分配一个临时 String，
+/// 高频路径（逐消息解析协议头/主题）应改用本函数。
+pub fn starts_with_ignore_ascii_case(text: &str, prefix: &str) -> bool {
+    text.len() >= prefix.len() && text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+/// 子串包含判断（ASCII 大小写不敏感，**零分配**）。
+///
+/// 替代 `s.to_ascii_lowercase().contains(p)`。空 `needle` 返回 `true`（与 `String::contains` 一致）。
+///
+/// 实现要点（实测驱动）：先走大小写敏感 `str::contains`（memchr/SIMD 优化）快路径，
+/// 未命中才逐候选位置做整段比较。协议主题/请求头这类"大小写本就一致"的场景
+/// 稳定性与速度都优于 `to_ascii_lowercase()` + `contains`（后者每次分配一个 String）。
+pub fn contains_ignore_ascii_case(text: &str, needle: &str) -> bool {
+    let n = needle.as_bytes();
+    if n.is_empty() {
+        return true;
+    }
+    // 快路径：大小写完全一致时直接命中（`str::contains` 由编译器向量化）
+    if text.contains(needle) {
+        return true;
+    }
+    let h = text.as_bytes();
+    if h.len() < n.len() {
+        return false;
+    }
+    // 慢路径：只在实际可能是首字节的位置做整段比较，避免每个窗口都比一遍
+    let first_lo = n[0].to_ascii_lowercase();
+    let first_up = n[0].to_ascii_uppercase();
+    let mut i = 0;
+    while i + n.len() <= h.len() {
+        let b = h[i];
+        if b == first_lo || b == first_up {
+            if h[i..i + n.len()].eq_ignore_ascii_case(n) {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// 字节序列是否为空或全为空白（对齐 C# `String.IsNullOrWhiteSpace`，**通常零分配**）。
+///
+/// 纯 ASCII 走字节快路径；一旦遇到非 ASCII 字节则回退到完整 UTF-8 转换
+/// （`Trim()` 语义需按 Unicode 空白判定，如全角空格 U+3000）。
+pub fn is_blank_bytes(bytes: &[u8]) -> bool {
+    for &b in bytes {
+        if b >= 0x80 {
+            return String::from_utf8_lossy(bytes).trim().is_empty();
+        }
+        if !(b as char).is_ascii_whitespace() {
+            return false;
+        }
+    }
+    true
+}
+
 /// 邮箱格式校验（对齐 C# `ValidFormatHelper.IsEmail` 的正则语义：
 /// `\w[-\w.+]*@([A-Za-z0-9][-A-Za-z0-9]+\.)+[A-Za-z]{2,14}`）。
 ///
@@ -286,6 +346,35 @@ mod tests {
         assert_eq!(truncate_chars("abcdef", 5), "abcde…");
         // UTF-8 边界安全（emoji 为多字节）
         assert_eq!(truncate_chars("🙂🙂🙂", 2), "🙂🙂…");
+    }
+
+    #[test]
+    fn contains_and_starts_ignore_ascii_case() {
+        assert!(contains_ignore_ascii_case("sys/ABC/thing/event/ping/post", "THING/EVENT/PING/POST"));
+        assert!(!contains_ignore_ascii_case("sys/abc/x", "thing/event/ping/post"));
+        assert!(contains_ignore_ascii_case("abc", ""), "空 needle 与 String::contains 一致");
+        assert!(!contains_ignore_ascii_case("ab", "abc"), "haystack 短于 needle");
+        // 长度相等/相邻边界
+        assert!(contains_ignore_ascii_case("ABCD", "bcd"));
+        assert!(!contains_ignore_ascii_case("ABCD", "bce"));
+        // 慢路径（大小写完全反向，快路径必然 miss）与命中位置在末尾
+        assert!(contains_ignore_ascii_case("SYS/ABC/THING/EVENT/PING/POST", "thing/event/ping/post"));
+        assert!(!contains_ignore_ascii_case("SYS/ABC/THING/EVENT/PING/POSX", "thing/event/ping/post"));
+
+        assert!(starts_with_ignore_ascii_case("Content-Type", "content-type"));
+        assert!(!starts_with_ignore_ascii_case("Content", "content-type"));
+        assert!(starts_with_ignore_ascii_case("x", ""), "空前缀恒真");
+    }
+
+    #[test]
+    fn is_blank_bytes_matches_csharp_is_null_or_white_space() {
+        assert!(is_blank_bytes(b""));
+        assert!(is_blank_bytes(b" \t\r\n"));
+        assert!(!is_blank_bytes(b" a "));
+        // 非 ASCII 回退路径：全角空格（U+3000）在 C# 中算空白
+        assert!(is_blank_bytes("　".as_bytes()));
+        // 非 ASCII 且非空白
+        assert!(!is_blank_bytes("中".as_bytes()));
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! - [`Config`]：通用配置文件，对应 C# `Config<TConfig>`；缺失自动生成、
 //!   缺失属性自动补齐回存、损坏备份重建（DH.NCore `Configuration/Config.cs` 语义）。
 //! - 辅助函数：[`file_stamp`]（文件版本戳，热加载检测）、[`FileWatcher`]（轮询式变更检测）、
+//!   [`ConfigWatcher`]（**通用热重载器**：后台线程 + 快照 + 变更回调，格式无关），
 //!   [`coerce_json`]（字段级容错转换，供 TOML 等其它格式复用）、[`save_value`]（原子保存）、
 //!   [`save_if_changed`]（文本管线“渲染—比对—原子写回”；加载即补齐缺失项）。
 //! - [`toml`] 子模块（`feature = "toml"`）：TOML 配置维护管线——保注释补齐、类型修正回写、
@@ -27,6 +28,7 @@
 
 mod file_config;
 mod file_watch;
+mod hot;
 mod json;
 mod setting;
 mod xml;
@@ -47,5 +49,6 @@ pub use file_config::{
     coerce_json, file_stamp, save_if_changed, save_value, Config, ConfigOptions, FileStamp,
 };
 pub use file_watch::{FileChange, FileWatcher};
+pub use hot::{ConfigWatcher, DEFAULT_POLL_INTERVAL};
 pub use setting::{ConfigError, Setting};
 pub use xml::{read_to_json as read_xml_to_json, replace_root_section, upsert_root_values};

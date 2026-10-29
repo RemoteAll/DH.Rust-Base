@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use super::http::{HttpHandler, HttpOutcome, HttpRequest, HttpResponse};
 use super::ws::WsServerHooks;
+use crate::text::starts_with_ignore_ascii_case;
 
 /// boxed 异步结果。
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -404,11 +405,6 @@ fn normalize_static_path(pattern: &str) -> String {
     let p = pattern.trim();
     let p = p.strip_prefix('/').unwrap_or(p);
     format!("/{p}").to_ascii_lowercase()
-}
-
-/// ASCII 前缀比较（大小写不敏感；无分配）。
-fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
-    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
 
 /// 路径匹配（返回捕获的路由参数；`None` = 不匹配）。
