@@ -552,9 +552,7 @@ pub struct MemoryDetail {
 pub fn memory_detail() -> Option<MemoryDetail> {
     #[cfg(windows)]
     {
-        use windows_sys::Win32::System::SystemInformation::{
-            GlobalMemoryStatusEx, MEMORYSTATUSEX,
-        };
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
         unsafe {
             let mut status: MEMORYSTATUSEX = std::mem::zeroed();
             status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;

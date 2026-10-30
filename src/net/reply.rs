@@ -94,10 +94,7 @@ mod tests {
 
     fn text(out: HttpOutcome) -> (u16, String) {
         match out {
-            HttpOutcome::Response(r) => (
-                r.status,
-                String::from_utf8_lossy(&r.body).into_owned(),
-            ),
+            HttpOutcome::Response(r) => (r.status, String::from_utf8_lossy(&r.body).into_owned()),
             _ => panic!("应返回普通响应"),
         }
     }

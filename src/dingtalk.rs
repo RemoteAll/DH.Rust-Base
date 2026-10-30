@@ -212,7 +212,10 @@ pub fn markdown_payload(title: &str, content: &str) -> Value {
 /// <returns>`errcode == 0` 时返回结果；否则返回带 errmsg 的错误</returns>
 pub fn parse_response(body: &str) -> Result<DingTalkResult, DingTalkError> {
     let value: Value = serde_json::from_str(body).map_err(|e| {
-        DingTalkError::new(format!("响应不是合法 JSON：{e}；原文：{}", crate::text::truncate_chars(body, 200)))
+        DingTalkError::new(format!(
+            "响应不是合法 JSON：{e}；原文：{}",
+            crate::text::truncate_chars(body, 200)
+        ))
     })?;
     let errcode = value
         .get("errcode")
@@ -319,7 +322,10 @@ mod tests {
         let sign = url.split("&sign=").nth(1).unwrap();
         assert!(!sign.is_empty());
         // 签名必须 URL 编码：不能出现 base64 的 + / =
-        assert!(!sign.contains('+') && !sign.contains('/') && !sign.contains('='), "{sign}");
+        assert!(
+            !sign.contains('+') && !sign.contains('/') && !sign.contains('='),
+            "{sign}"
+        );
     }
 
     #[test]
@@ -345,10 +351,9 @@ mod tests {
         let secret = "SECxyz";
         let ts = 1_600_000_000_000_i64;
         let data = format!("{ts}\n{secret}");
-        let expected = crate::web::url_encode(&crate::sign::base64_encode(&crate::sign::hmac_sha256(
-            secret.as_bytes(),
-            data.as_bytes(),
-        )));
+        let expected = crate::web::url_encode(&crate::sign::base64_encode(
+            &crate::sign::hmac_sha256(secret.as_bytes(), data.as_bytes()),
+        ));
         assert_eq!(sign(secret, ts), expected);
     }
 
@@ -358,7 +363,8 @@ mod tests {
         assert_eq!(ok.errcode, 0);
         assert_eq!(ok.errmsg, "ok");
 
-        let err = parse_response(r#"{"errcode":300005,"errmsg":"token is not exist"}"#).unwrap_err();
+        let err =
+            parse_response(r#"{"errcode":300005,"errmsg":"token is not exist"}"#).unwrap_err();
         assert!(err.0.contains("300005"), "{}", err.0);
         assert!(err.0.contains("token is not exist"), "{}", err.0);
 
@@ -411,11 +417,18 @@ mod tests {
         let bot = DingTalkBot::new(format!("http://{addr}/robot/send?access_token=tok"))
             .with_secret("SECsecret")
             .with_timeout(Duration::from_secs(5));
-        let result = bot.send_markdown_blocking("标题", "> 内容").expect("应发送成功");
+        let result = bot
+            .send_markdown_blocking("标题", "> 内容")
+            .expect("应发送成功");
         assert_eq!(result.errcode, 0);
 
-        let (head, _full) = rx.recv_timeout(Duration::from_secs(5)).expect("桩应收到请求");
-        assert!(head.starts_with("POST /robot/send?access_token=tok"), "{head}");
+        let (head, _full) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("桩应收到请求");
+        assert!(
+            head.starts_with("POST /robot/send?access_token=tok"),
+            "{head}"
+        );
         assert!(head.contains("&timestamp="), "{head}");
         assert!(head.contains("&sign="), "{head}");
     }

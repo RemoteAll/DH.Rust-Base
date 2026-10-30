@@ -42,7 +42,7 @@
 
 use std::io::Cursor;
 
-use calamine::{Data, Reader, open_workbook_auto_from_rs};
+use calamine::{open_workbook_auto_from_rs, Data, Reader};
 use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook};
 
 /// 一张待导出的表（标题 + 表头 + 数据 + 末尾说明）。
@@ -119,13 +119,8 @@ pub fn build(sheet: &Sheet) -> Result<Vec<u8>, String> {
             if text.is_empty() {
                 continue;
             }
-            ws.write_string_with_format(
-                data_start + r as u32,
-                c as u16,
-                text,
-                &Format::new(),
-            )
-            .map_err(|e| format!("写入数据失败：{e}"))?;
+            ws.write_string_with_format(data_start + r as u32, c as u16, text, &Format::new())
+                .map_err(|e| format!("写入数据失败：{e}"))?;
         }
     }
     let mut next_row = data_start + sheet.rows.len() as u32;
@@ -160,7 +155,8 @@ pub fn build_to_file(sheet: &Sheet, path: impl AsRef<std::path::Path>) -> Result
     let path = path.as_ref();
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("创建目录失败（{}）：{e}", dir.display()))?;
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("创建目录失败（{}）：{e}", dir.display()))?;
         }
     }
     let bytes = build(sheet)?;

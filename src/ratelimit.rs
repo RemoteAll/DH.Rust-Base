@@ -185,10 +185,7 @@ impl FixedWindowStore {
 
     /// 当前保存的键数量。
     pub fn len(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|s| lock(s).len())
-            .sum()
+        self.shards.iter().map(|s| lock(s).len()).sum()
     }
 
     /// 是否为空。

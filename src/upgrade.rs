@@ -133,8 +133,14 @@ pub fn actual_program(exe: &Path, base: Option<&Path>) -> PathBuf {
     let Some(name) = exe.file_name() else {
         return exe.to_path_buf();
     };
-    let normalized = exe.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
-    let shadow_root = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent());
+    let normalized = exe
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let shadow_root = exe
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent());
     if normalized.contains("/shadow/") {
         if let Some(root) = shadow_root {
             let real = root.join("bin").join(name);
@@ -180,7 +186,10 @@ pub fn actual_program(exe: &Path, base: Option<&Path>) -> PathBuf {
 /// 星尘 CLI 注册的子服务不一定注入环境变量，只按环境变量判定会把影子部署误判成普通部署，
 /// 从而走 `execv` 自重启（PID 不变、星尘仍认为原进程在跑，等于“重启没生效”）。
 pub fn shadow_deploy_base(exe: &Path, base_env: Option<&str>) -> Option<PathBuf> {
-    let normalized = exe.to_string_lossy().to_ascii_lowercase().replace('\\', "/");
+    let normalized = exe
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .replace('\\', "/");
     if !normalized.contains("/shadow/") {
         return None;
     }
@@ -773,7 +782,8 @@ pub fn sync_tree(src: &Path, dst: &Path) -> Result<(usize, usize), String> {
     if !src.is_dir() {
         return Err(format!("资源目录不存在：{}", src.display()));
     }
-    std::fs::create_dir_all(dst).map_err(|e| format!("创建目标目录失败（{}）：{e}", dst.display()))?;
+    std::fs::create_dir_all(dst)
+        .map_err(|e| format!("创建目标目录失败（{}）：{e}", dst.display()))?;
     let mut copied = 0usize;
     let mut deferred: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut wanted: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -849,14 +859,14 @@ pub fn sync_tree(src: &Path, dst: &Path) -> Result<(usize, usize), String> {
 
 /// 逐文件同步：先写同目录临时文件，再走 [`crate::io::safe_replace_file`]（占用时改名让位）。
 fn write_atomic(from: &Path, to: &Path) -> Result<(), String> {
-    let data =
-        std::fs::read(from).map_err(|e| format!("读取失败（{}）：{e}", from.display()))?;
+    let data = std::fs::read(from).map_err(|e| format!("读取失败（{}）：{e}", from.display()))?;
     let name = to
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".to_string());
     let tmp = to.with_file_name(format!(".{name}.upgrade-tmp"));
-    std::fs::write(&tmp, &data).map_err(|e| format!("写入临时文件失败（{}）：{e}", tmp.display()))?;
+    std::fs::write(&tmp, &data)
+        .map_err(|e| format!("写入临时文件失败（{}）：{e}", tmp.display()))?;
     crate::io::safe_replace_file(&tmp, to).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("替换失败（{}）：{e}", to.display())
@@ -1166,7 +1176,9 @@ mod tests {
 
         let list = staged_candidates(&exe, &upd);
         assert_eq!(list.len(), 2, "应排除 .skipped：{list:?}");
-        assert!(list.iter().all(|p| !p.to_string_lossy().ends_with(".skipped")));
+        assert!(list
+            .iter()
+            .all(|p| !p.to_string_lossy().ends_with(".skipped")));
 
         // `{exe}.new` 优先
         let dot_new = PathBuf::from(format!("{}.new", exe.display()));
@@ -1283,15 +1295,27 @@ mod tests {
     #[test]
     fn helper_job_parses_flag_forms() {
         let flag = HELPER_FLAG;
-        let a = vec![flag.to_string(), "1234".to_string(), "-c".to_string(), "x".to_string()];
+        let a = vec![
+            flag.to_string(),
+            "1234".to_string(),
+            "-c".to_string(),
+            "x".to_string(),
+        ];
         let job = helper_job(&a).expect("识别助手参数");
         assert_eq!(job.wait_pid, 1234);
         assert_eq!(job.args, vec!["-c".to_string(), "x".to_string()]);
 
-        let b = vec![format!("{flag}=99"), "--http-addr".to_string(), ":8300".to_string()];
+        let b = vec![
+            format!("{flag}=99"),
+            "--http-addr".to_string(),
+            ":8300".to_string(),
+        ];
         let job = helper_job(&b).expect("识别 = 形态");
         assert_eq!(job.wait_pid, 99);
-        assert_eq!(job.args, vec!["--http-addr".to_string(), ":8300".to_string()]);
+        assert_eq!(
+            job.args,
+            vec!["--http-addr".to_string(), ":8300".to_string()]
+        );
 
         assert!(helper_job(&["-c".to_string()]).is_none());
     }
@@ -1337,7 +1361,11 @@ mod tests {
         std::fs::write(&real, b"\x7fELF").expect("写程序");
         let copy = root.join("shadow").join("app-1234").join("app");
         std::fs::write(&copy, b"\x7fELF").expect("写副本");
-        assert_eq!(actual_program(&copy, None), real, "新布局：取 <root>/bin/<程序>");
+        assert_eq!(
+            actual_program(&copy, None),
+            real,
+            "新布局：取 <root>/bin/<程序>"
+        );
 
         // 老布局：程序与 shadow/ 同级
         let old = tmp_dir("actual-old");
@@ -1416,16 +1444,22 @@ mod tests {
     fn selftest_passes_env_to_child() {
         let dir = tmp_dir("selftest-env");
         let bat = dir.join("check.bat");
-        std::fs::write(&bat, b"@echo off\r\nif \"%HLZX_PROBE%\"==\"ok\" exit /b 0\r\nexit /b 1\r\n")
-            .expect("写批处理");
-        let spec = SelftestSpec::new("")
-            .with_env("HLZX_PROBE", "ok");
+        std::fs::write(
+            &bat,
+            b"@echo off\r\nif \"%HLZX_PROBE%\"==\"ok\" exit /b 0\r\nexit /b 1\r\n",
+        )
+        .expect("写批处理");
+        let spec = SelftestSpec::new("").with_env("HLZX_PROBE", "ok");
         let spec = SelftestSpec {
             args: Vec::new(),
             ..spec
         };
         selftest(&bat, &spec).expect("环境变量应透传，自检通过");
-        let bad = SelftestSpec { args: Vec::new(), timeout: Duration::from_secs(5), envs: Vec::new() };
+        let bad = SelftestSpec {
+            args: Vec::new(),
+            timeout: Duration::from_secs(5),
+            envs: Vec::new(),
+        };
         assert!(selftest(&bat, &bad).is_err(), "未设置环境变量应自检失败");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1455,10 +1489,14 @@ mod tests {
     #[test]
     fn version_from_name_reads_three_segments() {
         assert_eq!(
-            version_from_name("pek-rpanlserver-v0.1.62-x86_64-unknown-linux-musl.tar.gz").as_deref(),
+            version_from_name("pek-rpanlserver-v0.1.62-x86_64-unknown-linux-musl.tar.gz")
+                .as_deref(),
             Some("0.1.62")
         );
-        assert_eq!(version_from_name("app/V1.2.3.zip").as_deref(), Some("1.2.3"));
+        assert_eq!(
+            version_from_name("app/V1.2.3.zip").as_deref(),
+            Some("1.2.3")
+        );
         // 不足三段 → 不认（避免把 v2 当版本）
         assert_eq!(version_from_name("app-v2.zip"), None);
         assert_eq!(version_from_name("no-version.zip"), None);
@@ -1484,7 +1522,10 @@ mod tests {
         let next = store.save("9.9.9", "win", b"next", "").unwrap();
         assert_eq!(store.list().len(), 4);
         assert_eq!(store.read(&a.file).unwrap(), b"one");
-        assert_eq!(store.find(&b.file).map(|p| p.version), Some("0.0.2".to_string()));
+        assert_eq!(
+            store.find(&b.file).map(|p| p.version),
+            Some("0.0.2".to_string())
+        );
 
         // 文件名白名单：路径穿越 / 非前缀一律拒绝
         assert!(store.read("../app-0.0.1-win").is_err());

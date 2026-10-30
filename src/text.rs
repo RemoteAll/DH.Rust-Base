@@ -18,7 +18,8 @@ pub fn truncate_chars(text: &str, max: usize) -> String {
 /// 替代 `s.to_ascii_lowercase().starts_with(p)`——后者每条都分配一个临时 String，
 /// 高频路径（逐消息解析协议头/主题）应改用本函数。
 pub fn starts_with_ignore_ascii_case(text: &str, prefix: &str) -> bool {
-    text.len() >= prefix.len() && text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+    text.len() >= prefix.len()
+        && text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
 
 /// 子串包含判断（ASCII 大小写不敏感，**零分配**）。
@@ -371,18 +372,39 @@ mod tests {
 
     #[test]
     fn contains_and_starts_ignore_ascii_case() {
-        assert!(contains_ignore_ascii_case("sys/ABC/thing/event/ping/post", "THING/EVENT/PING/POST"));
-        assert!(!contains_ignore_ascii_case("sys/abc/x", "thing/event/ping/post"));
-        assert!(contains_ignore_ascii_case("abc", ""), "空 needle 与 String::contains 一致");
-        assert!(!contains_ignore_ascii_case("ab", "abc"), "haystack 短于 needle");
+        assert!(contains_ignore_ascii_case(
+            "sys/ABC/thing/event/ping/post",
+            "THING/EVENT/PING/POST"
+        ));
+        assert!(!contains_ignore_ascii_case(
+            "sys/abc/x",
+            "thing/event/ping/post"
+        ));
+        assert!(
+            contains_ignore_ascii_case("abc", ""),
+            "空 needle 与 String::contains 一致"
+        );
+        assert!(
+            !contains_ignore_ascii_case("ab", "abc"),
+            "haystack 短于 needle"
+        );
         // 长度相等/相邻边界
         assert!(contains_ignore_ascii_case("ABCD", "bcd"));
         assert!(!contains_ignore_ascii_case("ABCD", "bce"));
         // 慢路径（大小写完全反向，快路径必然 miss）与命中位置在末尾
-        assert!(contains_ignore_ascii_case("SYS/ABC/THING/EVENT/PING/POST", "thing/event/ping/post"));
-        assert!(!contains_ignore_ascii_case("SYS/ABC/THING/EVENT/PING/POSX", "thing/event/ping/post"));
+        assert!(contains_ignore_ascii_case(
+            "SYS/ABC/THING/EVENT/PING/POST",
+            "thing/event/ping/post"
+        ));
+        assert!(!contains_ignore_ascii_case(
+            "SYS/ABC/THING/EVENT/PING/POSX",
+            "thing/event/ping/post"
+        ));
 
-        assert!(starts_with_ignore_ascii_case("Content-Type", "content-type"));
+        assert!(starts_with_ignore_ascii_case(
+            "Content-Type",
+            "content-type"
+        ));
         assert!(!starts_with_ignore_ascii_case("Content", "content-type"));
         assert!(starts_with_ignore_ascii_case("x", ""), "空前缀恒真");
     }

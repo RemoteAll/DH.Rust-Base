@@ -40,9 +40,9 @@ pub mod mqtt;
 #[cfg(feature = "http-client")]
 pub mod openai;
 #[cfg(feature = "net")]
-pub mod panel_auth;
-#[cfg(feature = "net")]
 pub mod panel;
+#[cfg(feature = "net")]
+pub mod panel_auth;
 #[cfg(feature = "net-tls")]
 pub mod panel_cert;
 #[cfg(feature = "net")]

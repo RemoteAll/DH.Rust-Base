@@ -70,7 +70,8 @@ pub fn ensure_self_signed_cert(
         .push(rcgen::DnType::CommonName, "dhdeploy-agent");
     // 有效期从**签发时刻**起算（此前硬编码 2036 年，到期后将无法再生成有效证书）
     let expire = chrono::Utc::now() + chrono::Duration::days(SELF_SIGNED_DAYS);
-    params.not_after = rcgen::date_time_ymd(expire.year(), expire.month() as u8, expire.day() as u8);
+    params.not_after =
+        rcgen::date_time_ymd(expire.year(), expire.month() as u8, expire.day() as u8);
 
     let cert = params
         .self_signed(&key_pair)
@@ -241,9 +242,14 @@ mod tests {
     /// Windows 一键导入脚本：内嵌 base64 证书、双存储导入、CRLF、含 Firefox 提示。
     #[test]
     fn install_script_windows_is_valid_cmd() {
-        let s = install_script_windows(b"-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n");
+        let s = install_script_windows(
+            b"-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n",
+        );
         assert!(s.contains("set \"B64="), "证书必须 base64 内嵌");
-        assert!(s.contains("certutil -user -addstore -f Root"), "先导入当前用户（免管理员）");
+        assert!(
+            s.contains("certutil -user -addstore -f Root"),
+            "先导入当前用户（免管理员）"
+        );
         assert!(s.contains("certutil -addstore -f Root"), "再尝试本机级存储");
         assert!(s.contains("Firefox"), "必须提醒 Firefox 用自己的证书库");
         assert!(s.contains("\r\n"));
@@ -256,18 +262,18 @@ mod tests {
     /// Linux/macOS 脚本：shebang、内嵌证书、双平台分支、macOS base64 -D 回退。
     #[test]
     fn install_script_unix_covers_darwin_and_linux() {
-        let s = install_script_unix(b"-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n");
+        let s =
+            install_script_unix(b"-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n");
         assert!(s.starts_with("#!/bin/sh"));
         assert!(s.contains("B64='"), "证书必须 base64 内嵌");
-        assert!(s.contains("security add-trusted-cert"), "macOS 导入系统钥匙串");
         assert!(
-            s.contains("update-ca-certificates"),
-            "Linux 导入系统 CA"
+            s.contains("security add-trusted-cert"),
+            "macOS 导入系统钥匙串"
         );
+        assert!(s.contains("update-ca-certificates"), "Linux 导入系统 CA");
         assert!(s.contains("base64 -D"), "macOS 的 base64 是大写 -D");
         assert!(s.contains("Firefox"));
     }
-
 
     #[test]
     fn ensure_and_load_roundtrip() {
@@ -307,14 +313,20 @@ mod tests {
 
         let text = std::fs::read_to_string(&cert).unwrap();
         let info = crate::cert::parse_certificate_pem(&text).expect("证书应可解析");
-        assert!(!info.is_ca, "自签必须是叶子证书（CA:FALSE），私钥泄露也无法签其他站点");
+        assert!(
+            !info.is_ca,
+            "自签必须是叶子证书（CA:FALSE），私钥泄露也无法签其他站点"
+        );
         assert!(info.covers_host("127.0.0.1"));
         assert!(info.covers_host("localhost"));
         for ip in local_ipv4() {
             assert!(info.covers_ip(&ip), "SAN 应包含本机 IP {ip}");
             assert!(cert_covers(&cert, &ip), "cert_covers 应判定覆盖 {ip}");
         }
-        assert!(!cert_covers(&cert, "10.99.99.99"), "未写入 SAN 的 IP 不应判定覆盖");
+        assert!(
+            !cert_covers(&cert, "10.99.99.99"),
+            "未写入 SAN 的 IP 不应判定覆盖"
+        );
 
         let days = (info.not_after - chrono::Utc::now().timestamp()) / 86_400;
         assert!(

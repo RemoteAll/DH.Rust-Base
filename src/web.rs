@@ -315,7 +315,10 @@ mod tests {
             "https://open.weixin.qq.com/connect/qrconnect?appid=wx123&redirect_uri=https%3A%2F%2Fexample.com%2Fcb&response_type=code&scope=snsapi_login&state=st%2F1"
         );
         assert_eq!(
-            url_with_query("https://open.weixin.qq.com/x#wechat_redirect", &[("a", "1")]),
+            url_with_query(
+                "https://open.weixin.qq.com/x#wechat_redirect",
+                &[("a", "1")]
+            ),
             "https://open.weixin.qq.com/x?a=1#wechat_redirect"
         );
         // 已有查询串：续接；末尾已是 ?/& 不重复分隔符
@@ -323,7 +326,10 @@ mod tests {
             url_with_query("https://a/b?x=1", &[("y", "2")]),
             "https://a/b?x=1&y=2"
         );
-        assert_eq!(url_with_query("https://a/b?", &[("y", "2")]), "https://a/b?y=2");
+        assert_eq!(
+            url_with_query("https://a/b?", &[("y", "2")]),
+            "https://a/b?y=2"
+        );
         assert_eq!(url_with_query("https://a/b", &[]), "https://a/b");
     }
 

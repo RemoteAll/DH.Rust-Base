@@ -151,8 +151,7 @@ pub fn is_alive(pid: u32) -> bool {
 #[cfg(unix)]
 pub fn reap_child(pid: u32) -> bool {
     unsafe {
-        libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG)
-            == pid as libc::pid_t
+        libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) == pid as libc::pid_t
     }
 }
 

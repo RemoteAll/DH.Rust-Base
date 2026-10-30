@@ -104,14 +104,20 @@ impl<T: Send + Sync + 'static> ConfigWatcher<T> {
                         Some(FileChange::Removed) => {
                             report_error(
                                 &worker_hooks,
-                                &format!("配置文件被删除（继续使用内存中的配置）：{}", worker_path.display()),
+                                &format!(
+                                    "配置文件被删除（继续使用内存中的配置）：{}",
+                                    worker_path.display()
+                                ),
                             );
                             continue;
                         }
                         Some(FileChange::Error(e)) => {
                             report_error(
                                 &worker_hooks,
-                                &format!("配置文件读取失败（{e}），保持当前配置：{}", worker_path.display()),
+                                &format!(
+                                    "配置文件读取失败（{e}），保持当前配置：{}",
+                                    worker_path.display()
+                                ),
                             );
                             continue;
                         }
@@ -121,7 +127,10 @@ impl<T: Send + Sync + 'static> ConfigWatcher<T> {
                         Err(e) => {
                             report_error(
                                 &worker_hooks,
-                                &format!("配置文件解析失败（{e}），保持当前配置：{}", worker_path.display()),
+                                &format!(
+                                    "配置文件解析失败（{e}），保持当前配置：{}",
+                                    worker_path.display()
+                                ),
                             );
                             continue;
                         }
@@ -145,7 +154,10 @@ impl<T: Send + Sync + 'static> ConfigWatcher<T> {
                         }))
                         .is_err()
                         {
-                            report_error(&worker_hooks, "配置变更回调发生 panic（已隔离，监视继续）");
+                            report_error(
+                                &worker_hooks,
+                                "配置变更回调发生 panic（已隔离，监视继续）",
+                            );
                         }
                     }
                 }

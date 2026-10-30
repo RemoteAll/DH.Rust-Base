@@ -309,11 +309,7 @@ impl KeyedLock {
         if state.notified {
             state.notified = false;
             drop(state);
-            let backend = self
-                .primary
-                .as_ref()
-                .map(|b| b.name())
-                .unwrap_or_default();
+            let backend = self.primary.as_ref().map(|b| b.name()).unwrap_or_default();
             crate::info!("锁后端已恢复（{backend}）");
             if let Some(sink) = &self.sink {
                 sink(LockEvent::Recovered { backend });
@@ -446,7 +442,10 @@ mod tests {
         let _held = lock.try_acquire("k").expect("首次应成功");
         assert!(lock.try_acquire("k").is_none());
         std::thread::sleep(Duration::from_millis(120));
-        assert!(lock.try_acquire("k").is_some(), "超过 TTL 的残留锁应被自动清理");
+        assert!(
+            lock.try_acquire("k").is_some(),
+            "超过 TTL 的残留锁应被自动清理"
+        );
     }
 
     #[test]
@@ -474,7 +473,11 @@ mod tests {
         // 窗口内不再尝试主后端（避免每个请求都白等一次超时）
         let before = fake.acquires.load(Ordering::SeqCst);
         let _ = lock.try_acquire("k2");
-        assert_eq!(fake.acquires.load(Ordering::SeqCst), before, "降级窗口内不应再打主后端");
+        assert_eq!(
+            fake.acquires.load(Ordering::SeqCst),
+            before,
+            "降级窗口内不应再打主后端"
+        );
 
         // 主后端恢复 + 窗口到期 → 重新用主后端，并发一次「恢复」事件
         fake.fail.store(false, Ordering::SeqCst);
@@ -485,7 +488,10 @@ mod tests {
         drop(guard);
         let events = lock_plain(&events);
         assert_eq!(events.len(), 2, "{events:?}");
-        assert!(matches!(events[1], LockEvent::Recovered { .. }), "{events:?}");
+        assert!(
+            matches!(events[1], LockEvent::Recovered { .. }),
+            "{events:?}"
+        );
     }
 
     #[test]
@@ -519,7 +525,10 @@ mod tests {
         lock.demote("启动时 ping 失败");
         lock.demote("再次失败");
         assert_eq!(lock_plain(&events).len(), 1, "同一轮降级只通知一次");
-        assert!(lock.degraded_reason().contains("再次失败"), "原因更新为最新");
+        assert!(
+            lock.degraded_reason().contains("再次失败"),
+            "原因更新为最新"
+        );
         let captured = lock_plain(&events);
         match &captured[0] {
             LockEvent::Degraded { reason, .. } => assert!(reason.contains("ping")),

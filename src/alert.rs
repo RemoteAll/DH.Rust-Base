@@ -216,10 +216,7 @@ impl AlertHub {
 
     /// 统计快照。
     pub fn stats(&self) -> AlertStats {
-        self.stats
-            .read()
-            .map(|s| s.clone())
-            .unwrap_or_default()
+        self.stats.read().map(|s| s.clone()).unwrap_or_default()
     }
 
     /// 异步发送一条告警。
@@ -319,9 +316,17 @@ impl AlertHub {
     /// 同步发送一条消息（面板「发送测试」用；**不受开关与冷却限制**，但要求通道已配置）。
     ///
     /// 返回成功的通道名（如 `企业微信、钉钉`）；未配置或全部失败时返回错误文本。
-    pub fn send_test(&self, opts: &AlertOptions, title: &str, lines: &[String]) -> Result<String, String> {
+    pub fn send_test(
+        &self,
+        opts: &AlertOptions,
+        title: &str,
+        lines: &[String],
+    ) -> Result<String, String> {
         if !opts.configured() {
-            return Err(format!("当前通道（{}）未配置 webhook，无法发送", opts.channel.label()));
+            return Err(format!(
+                "当前通道（{}）未配置 webhook，无法发送",
+                opts.channel.label()
+            ));
         }
         let text = format_message(AlertLevel::Info, title, lines, &[]);
         send_all(opts, title, &text)
@@ -352,7 +357,12 @@ fn lock_rw<T>(m: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 /// <param name="title">标题</param>
 /// <param name="lines">正文行</param>
 /// <param name="footer">额外附加行（可空）</param>
-pub fn format_message(level: AlertLevel, title: &str, lines: &[String], footer: &[String]) -> String {
+pub fn format_message(
+    level: AlertLevel,
+    title: &str,
+    lines: &[String],
+    footer: &[String],
+) -> String {
     let mut text = format!("{} **{}**（{}）\n", level.icon(), title, level.label());
     for line in lines {
         text.push_str("> ");
@@ -427,8 +437,16 @@ mod tests {
         assert_eq!(AlertChannel::parse("DingTalk"), AlertChannel::DingTalk);
         assert_eq!(AlertChannel::parse(" both "), AlertChannel::Both);
         assert_eq!(AlertChannel::parse("wecom"), AlertChannel::WeCom);
-        assert_eq!(AlertChannel::parse("bogus"), AlertChannel::WeCom, "未知按企业微信");
-        for ch in [AlertChannel::WeCom, AlertChannel::DingTalk, AlertChannel::Both] {
+        assert_eq!(
+            AlertChannel::parse("bogus"),
+            AlertChannel::WeCom,
+            "未知按企业微信"
+        );
+        for ch in [
+            AlertChannel::WeCom,
+            AlertChannel::DingTalk,
+            AlertChannel::Both,
+        ] {
             assert_eq!(AlertChannel::parse(ch.as_str()), ch);
         }
     }
@@ -465,7 +483,14 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        assert!(!hub.notify(&opts, "k", AlertLevel::Warn, "t", &[], Duration::from_secs(60)));
+        assert!(!hub.notify(
+            &opts,
+            "k",
+            AlertLevel::Warn,
+            "t",
+            &[],
+            Duration::from_secs(60)
+        ));
         assert_eq!(hub.stats().sent, 0);
     }
 
@@ -474,9 +499,23 @@ mod tests {
         let hub = AlertHub::new();
         let opts = AlertOptions::default().with_wecom("http://127.0.0.1:1/never");
         // 第一次入队（地址不可达，发送会失败，但冷却只记成功 → 这里只验证「第一次不被跳过」）
-        assert!(hub.notify(&opts, "dup", AlertLevel::Warn, "t", &[], Duration::from_secs(600)));
+        assert!(hub.notify(
+            &opts,
+            "dup",
+            AlertLevel::Warn,
+            "t",
+            &[],
+            Duration::from_secs(600)
+        ));
         // 在途表尚未释放（发送很慢/失败），第二次必须是跳过
-        let second = hub.notify(&opts, "dup", AlertLevel::Warn, "t", &[], Duration::from_secs(600));
+        let second = hub.notify(
+            &opts,
+            "dup",
+            AlertLevel::Warn,
+            "t",
+            &[],
+            Duration::from_secs(600),
+        );
         assert!(!second, "同一 key 并发只允许一条");
         assert!(hub.stats().skipped >= 1);
     }
@@ -500,7 +539,9 @@ mod tests {
     #[test]
     fn send_test_requires_configured_channel() {
         let hub = AlertHub::new();
-        let err = hub.send_test(&AlertOptions::default(), "标题", &[]).unwrap_err();
+        let err = hub
+            .send_test(&AlertOptions::default(), "标题", &[])
+            .unwrap_err();
         assert!(err.contains("未配置"), "{err}");
     }
 }

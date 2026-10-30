@@ -192,7 +192,10 @@ pub fn split_bundle(text: &str) -> Result<CertBundle, String> {
     for b in &blocks {
         if is_certificate_label(&b.label) {
             if b.der.is_empty() {
-                return Err(format!("证书 PEM base64 解码失败（块 {}）", certs.len() + 1));
+                return Err(format!(
+                    "证书 PEM base64 解码失败（块 {}）",
+                    certs.len() + 1
+                ));
             }
             certs_pem.push_str(&b.pem);
             match parse_certificate_der(&b.der) {
@@ -442,11 +445,9 @@ fn parse_time(t: &Tlv<'_>) -> Option<i64> {
             } else {
                 "%m%d%H%M"
             };
-            let md = NaiveDateTime::parse_from_str(
-                &format!("{year:04}{rest}"),
-                &format!("%Y{fmt}"),
-            )
-            .ok()?;
+            let md =
+                NaiveDateTime::parse_from_str(&format!("{year:04}{rest}"), &format!("%Y{fmt}"))
+                    .ok()?;
             md
         }
         0x18 => {
@@ -586,7 +587,8 @@ W0OlQmKAGuTNVSyFtDUG
             "SHA-1 指纹（IIS 绑定用）应与 openssl 一致"
         );
         assert_eq!(
-            info.sha256_hex, "db58f8aab23baad7ce07c3c220dda04b025d3439dea1a6995f523b80aadff0ec"
+            info.sha256_hex,
+            "db58f8aab23baad7ce07c3c220dda04b025d3439dea1a6995f523b80aadff0ec"
         );
         assert_eq!(unix_to_date(info.not_before).as_deref(), Some("2026-10-24"));
         assert_eq!(unix_to_date(info.not_after).as_deref(), Some("2036-10-21"));
@@ -644,9 +646,11 @@ W0OlQmKAGuTNVSyFtDUG
         assert!(parse_certificate_der(&[]).is_none());
         assert!(parse_certificate_der(&[0x30, 0x82, 0xFF, 0xFF]).is_none());
         assert!(parse_certificate_der(&[0x30, 0x03, 0x30, 0x01, 0x00]).is_none());
-        assert!(pem_blocks("-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n")[0]
-            .der
-            .is_empty());
+        assert!(
+            pem_blocks("-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n")[0]
+                .der
+                .is_empty()
+        );
     }
 
     #[test]

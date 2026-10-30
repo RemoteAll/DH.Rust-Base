@@ -198,7 +198,8 @@ pub fn merge_missing_keys(target: &mut Table, template: &Table) -> usize {
 /// 统计表内叶子配置项数量（含嵌套子表）。
 pub fn count_leaves(table: &Table) -> usize {
     let mut n = 0;
-    for (_, item) in table.iter() {        match item {
+    for (_, item) in table.iter() {
+        match item {
             Item::Table(t) => n += count_leaves(t),
             Item::Value(_) => n += 1,
             _ => {}

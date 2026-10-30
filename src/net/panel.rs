@@ -85,7 +85,11 @@ impl PanelSession {
         level: AuthLevel,
         token_ttl_secs: u64,
     ) -> Self {
-        let ttl_secs = if token_ttl_secs == 0 { DEFAULT_TOKEN_TTL_SECS } else { token_ttl_secs };
+        let ttl_secs = if token_ttl_secs == 0 {
+            DEFAULT_TOKEN_TTL_SECS
+        } else {
+            token_ttl_secs
+        };
         Self {
             account: RwLock::new(PanelAccount {
                 user: user.into(),
@@ -144,8 +148,17 @@ impl PanelSession {
     /// - `user`：新用户名。
     /// - `password`：新密码。
     /// - `level`：新鉴权级别。
-    pub fn set_account(&self, user: impl Into<String>, password: impl Into<String>, level: AuthLevel) {
-        let next = PanelAccount { user: user.into(), password: password.into(), level };
+    pub fn set_account(
+        &self,
+        user: impl Into<String>,
+        password: impl Into<String>,
+        level: AuthLevel,
+    ) {
+        let next = PanelAccount {
+            user: user.into(),
+            password: password.into(),
+            level,
+        };
         match self.account.write() {
             Ok(mut guard) => *guard = next,
             Err(poisoned) => *poisoned.into_inner() = next,
@@ -199,9 +212,11 @@ impl PanelSession {
             }
         }
         match account.level {
-            AuthLevel::None => {
-                Some(if is_loopback(&client_ip(ctx)) { account.user } else { "anon".to_string() })
-            }
+            AuthLevel::None => Some(if is_loopback(&client_ip(ctx)) {
+                account.user
+            } else {
+                "anon".to_string()
+            }),
             AuthLevel::LocalOnly => {
                 if is_loopback(&client_ip(ctx)) {
                     Some(account.user)
@@ -228,8 +243,17 @@ impl PanelSession {
         let Some(body) = json_body(ctx) else {
             return json_error(400, "Missing body");
         };
-        let user = body.get("user").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-        let password = body.get("password").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let user = body
+            .get("user")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let password = body
+            .get("password")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if user.is_empty() || password.is_empty() {
             return json_error(400, "请输入用户名与密码");
         }
@@ -314,11 +338,16 @@ impl PanelSession {
             crate::logs::warn!("面板会话文件解析失败（{}），忽略", path.display());
             return;
         };
-        let items: Vec<(String, i64, String)> =
-            list.into_iter().map(|r| (r.token, r.expire, r.user)).collect();
+        let items: Vec<(String, i64, String)> = list
+            .into_iter()
+            .map(|r| (r.token, r.expire, r.user))
+            .collect();
         let count = self.tokens.restore(items);
         if count > 0 {
-            crate::logs::info!("面板会话已恢复 {count} 个（重启/升级后仍保持登录）：{}", path.display());
+            crate::logs::info!(
+                "面板会话已恢复 {count} 个（重启/升级后仍保持登录）：{}",
+                path.display()
+            );
         }
     }
 
@@ -344,7 +373,11 @@ impl PanelSession {
             .tokens
             .snapshot()
             .into_iter()
-            .map(|(token, expire, user)| SessionRec { token, expire, user })
+            .map(|(token, expire, user)| SessionRec {
+                token,
+                expire,
+                user,
+            })
             .collect();
         let text = serde_json::to_string_pretty(&list).unwrap_or_else(|_| "[]".to_string());
         if let Err(e) = std::fs::write(&path, text) {
@@ -360,8 +393,10 @@ impl PanelSession {
                 let _ = std::fs::set_permissions(&path, perm);
             }
         }
-        self.saved_at
-            .store(crate::times::getmilltimestamp() as i64, std::sync::atomic::Ordering::Relaxed);
+        self.saved_at.store(
+            crate::times::getmilltimestamp() as i64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let _: &Path = path.as_path();
     }
 }
@@ -448,7 +483,9 @@ mod tests {
             .expect("应签发令牌");
         let auth = format!("Bearer {token}");
         assert_eq!(
-            session.principal(&request("GET", vec![("authorization", &auth)], b"")).as_deref(),
+            session
+                .principal(&request("GET", vec![("authorization", &auth)], b""))
+                .as_deref(),
             Some("admin")
         );
 

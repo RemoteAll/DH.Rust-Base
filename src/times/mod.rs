@@ -182,10 +182,7 @@ pub fn date_range_of(pattern: &str) -> Option<(NaiveDateTime, NaiveDateTime)> {
         }
         _ => return None,
     };
-    Some((
-        start.and_hms_opt(0, 0, 0)?,
-        end.and_hms_opt(23, 59, 59)?,
-    ))
+    Some((start.and_hms_opt(0, 0, 0)?, end.and_hms_opt(23, 59, 59)?))
 }
 
 /// 现在（UTC 朴素时间）。
@@ -372,7 +369,12 @@ mod tests {
         assert_eq!(parse_datetime_lax("2024/01/05 14:30:00"), Some(expected));
         assert_eq!(
             parse_datetime_lax("2024/1/5"),
-            Some(chrono::NaiveDate::from_ymd_opt(2024, 1, 5).unwrap().and_hms_opt(0, 0, 0).unwrap())
+            Some(
+                chrono::NaiveDate::from_ymd_opt(2024, 1, 5)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+            )
         );
         // 原格式仍可用
         assert_eq!(parse_datetime_lax("2024-01-05 14:30:00"), Some(expected));
@@ -392,16 +394,28 @@ mod tests {
     #[test]
     fn date_range_of_year_month_day() {
         let (start, end) = date_range_of("2024").unwrap();
-        assert_eq!(start.format("%Y-%m-%d %H:%M:%S").to_string(), "2024-01-01 00:00:00");
-        assert_eq!(end.format("%Y-%m-%d %H:%M:%S").to_string(), "2024-12-31 23:59:59");
+        assert_eq!(
+            start.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2024-01-01 00:00:00"
+        );
+        assert_eq!(
+            end.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2024-12-31 23:59:59"
+        );
 
         let (start, end) = date_range_of("2024-02").unwrap();
         assert_eq!(start.format("%Y-%m-%d").to_string(), "2024-02-01");
         assert_eq!(end.format("%Y-%m-%d").to_string(), "2024-02-29");
 
         let (start, end) = date_range_of("2024-01-31").unwrap();
-        assert_eq!(start.format("%Y-%m-%d %H:%M:%S").to_string(), "2024-01-31 00:00:00");
-        assert_eq!(end.format("%Y-%m-%d %H:%M:%S").to_string(), "2024-01-31 23:59:59");
+        assert_eq!(
+            start.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2024-01-31 00:00:00"
+        );
+        assert_eq!(
+            end.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2024-01-31 23:59:59"
+        );
 
         assert!(date_range_of("2024-1").is_none());
         assert!(date_range_of("abc").is_none());

@@ -110,22 +110,30 @@ pub fn handle_cli(
     service_name: &str,
     base_env: Option<&str>,
 ) -> Option<i32> {
-    let entry_name = name.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(service_name);
+    let entry_name = name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(service_name);
     if let Some(path) = register_path {
-        return Some(match register(Path::new(path), &Entry {
-            name: entry_name,
-            base_env,
-            health_check: "",
-        }) {
-            Ok(msg) => {
-                println!("{msg}");
-                0
-            }
-            Err(e) => {
-                eprintln!("注册失败：{e}");
-                1
-            }
-        });
+        return Some(
+            match register(
+                Path::new(path),
+                &Entry {
+                    name: entry_name,
+                    base_env,
+                    health_check: "",
+                },
+            ) {
+                Ok(msg) => {
+                    println!("{msg}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("注册失败：{e}");
+                    1
+                }
+            },
+        );
     }
     if let Some(path) = unregister_path {
         return Some(match unregister(Path::new(path), entry_name) {
@@ -247,7 +255,12 @@ pub fn locate_config(hint: Option<&Path>) -> Option<PathBuf> {
             dirs.push(PathBuf::from(d));
         }
     } else {
-        for d in ["/www/Agent", "/opt/StarAgentRust", "/opt/StarAgent", "/opt/staragent"] {
+        for d in [
+            "/www/Agent",
+            "/opt/StarAgentRust",
+            "/opt/StarAgent",
+            "/opt/staragent",
+        ] {
             dirs.push(PathBuf::from(d));
         }
     }
@@ -263,7 +276,10 @@ pub fn locate_config(hint: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// 按**程序路径**找条目（`FileName` 为相对路径时按 `WorkingDirectory` 解析；比较忽略大小写与斜杠方向）。
-pub fn find_by_program<'a>(entries: &'a [ServiceEntry], program: &Path) -> Option<&'a ServiceEntry> {
+pub fn find_by_program<'a>(
+    entries: &'a [ServiceEntry],
+    program: &Path,
+) -> Option<&'a ServiceEntry> {
     let want = normalize_path(&program.to_string_lossy());
     let program_name = program
         .file_name()
@@ -368,9 +384,12 @@ pub fn restart_program(
 /// 供安装/升级脚本调用——脚本只调程序，**不再自己拼 HTTP `/RestartService`**，
 /// 与面板走同一实现（`restart_program` → `net::api_rpc` UDP）。
 pub fn handle_self_action(args: &[String]) -> Option<i32> {
-    let want = args
-        .iter()
-        .any(|a| matches!(a.trim(), "--RestartSelf" | "--restart-self" | "-RestartSelf"));
+    let want = args.iter().any(|a| {
+        matches!(
+            a.trim(),
+            "--RestartSelf" | "--restart-self" | "-RestartSelf"
+        )
+    });
     if !want {
         return None;
     }

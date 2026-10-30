@@ -456,7 +456,11 @@ where
     }
 
     let value: T = serde_json::from_value(coerced).map_err(|e| e.to_string())?;
-    Ok((value, added > 0 || converted || fixed > 0 || removed > 0, doc.to_string()))
+    Ok((
+        value,
+        added > 0 || converted || fixed > 0 || removed > 0,
+        doc.to_string(),
+    ))
 }
 
 /// 以模板为基准渲染（保留 `current` 里已有的注释与排版）。
@@ -577,7 +581,11 @@ mod tests {
         }
         let dir = temp("freeform");
         let file = dir.join("a.toml");
-        std::fs::write(&file, "value = 1\nname = \"x\"\n\n[aliases]\ndev1 = \"客厅\"\n").expect("写");
+        std::fs::write(
+            &file,
+            "value = 1\nname = \"x\"\n\n[aliases]\ndev1 = \"客厅\"\n",
+        )
+        .expect("写");
         let cfg = TomlConfig::<WithAlias>::load(&file, TPL2);
         assert_eq!(
             cfg.value().aliases.get("dev1").map(|s| s.as_str()),
@@ -624,7 +632,8 @@ mod tests {
     }
 
     #[test]
-    fn save_keeps_comments_and_updates_values() {        let dir = temp("save");
+    fn save_keeps_comments_and_updates_values() {
+        let dir = temp("save");
         let file = dir.join("a.toml");
         std::fs::write(&file, "# 手写注释\nvalue = 1\nname = \"old\"\n").expect("写");
         let mut cfg = TomlConfig::<Demo>::load(&file, TPL);

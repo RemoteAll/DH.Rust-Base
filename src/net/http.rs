@@ -440,23 +440,22 @@ impl HttpServer {
                 if options.conn_stack_size > 0 {
                     tb = tb.stack_size(options.conn_stack_size);
                 }
-                let _ = tb
-                    .spawn(move || {
-                        let rt = match tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                        {
-                            Ok(rt) => rt,
+                let _ = tb.spawn(move || {
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(_) => return,
+                    };
+                    rt.block_on(async move {
+                        let tcp = match TcpStream::from_std(std_tcp) {
+                            Ok(t) => t,
                             Err(_) => return,
                         };
-                        rt.block_on(async move {
-                            let tcp = match TcpStream::from_std(std_tcp) {
-                                Ok(t) => t,
-                                Err(_) => return,
-                            };
-                            run_connection(tcp, tls, handler, options, guard).await;
-                        });
+                        run_connection(tcp, tls, handler, options, guard).await;
                     });
+                });
             } else if let Some(shards) = &shards {
                 // 分片池：连接按轮次分发到分片线程（socket 脱钩后重注册到分片运行时）
                 if let Ok(std_tcp) = tcp.into_std() {
@@ -500,7 +499,8 @@ impl ShardPool {
     ) -> ShardPool {
         let mut senders = Vec::with_capacity(n);
         for i in 0..n {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(std::net::TcpStream, ConnGuard)>();
+            let (tx, mut rx) =
+                tokio::sync::mpsc::unbounded_channel::<(std::net::TcpStream, ConnGuard)>();
             senders.push(tx);
             let handler = handler.clone();
             let options = options.clone();
@@ -581,7 +581,8 @@ async fn run_connection(
                         } else {
                             format!("?{}", req.query)
                         };
-                        let location = format!("https://{hostname}:{https_port}{}{query}", req.path);
+                        let location =
+                            format!("https://{hostname}:{https_port}{}{query}", req.path);
                         HttpOutcome::Response(
                             HttpResponse::text(301, "")
                                 .with_header("Location", &location)

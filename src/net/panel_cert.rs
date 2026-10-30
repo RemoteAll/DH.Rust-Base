@@ -202,12 +202,19 @@ mod tests {
 
         let cert = ensure_pem(&base).expect("首次应生成");
         assert!(cert.generated, "首次应报告 generated=true");
-        assert_eq!(ensure_pem(&base).expect("二次").generated, false, "已存在不应重生成");
+        assert_eq!(
+            ensure_pem(&base).expect("二次").generated,
+            false,
+            "已存在不应重生成"
+        );
 
         let v = status(&base, true, true, "0.0.0.0:11880");
         assert_eq!(v["exists"], true);
         assert_eq!(v["panelUrl"], "https://127.0.0.1:11880");
-        assert!(v["daysLeft"].as_i64().unwrap() > 3600, "自签有效期应约 10 年");
+        assert!(
+            v["daysLeft"].as_i64().unwrap() > 3600,
+            "自签有效期应约 10 年"
+        );
         assert!(!v["sha256"].as_str().unwrap().is_empty());
         let sans = v["sans"].as_array().unwrap();
         assert!(sans.iter().any(|s| s == "127.0.0.1"), "SAN 必须含回环地址");
@@ -220,7 +227,10 @@ mod tests {
         assert!(!cert_pem_bytes(&base).unwrap().is_empty());
         let (name, script) = install_script(&base, "win").unwrap();
         assert_eq!(name, "install-panel-cert.cmd");
-        assert!(script.contains("certutil") || script.contains("import"), "应包含导入命令");
+        assert!(
+            script.contains("certutil") || script.contains("import"),
+            "应包含导入命令"
+        );
         let (name, _) = install_script(&base, "linux").unwrap();
         assert_eq!(name, "install-panel-cert.sh");
 

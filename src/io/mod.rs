@@ -82,8 +82,7 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
     let mut mark = 0usize;
 
     while ti < text.len() {
-        if pi < pattern.len()
-            && (pattern[pi] == '?' || pattern[pi].eq_ignore_ascii_case(&text[ti]))
+        if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi].eq_ignore_ascii_case(&text[ti]))
         {
             pi += 1;
             ti += 1;
@@ -573,7 +572,9 @@ mod safe_replace_tests {
         assert!(safe_file_name(".", 200).is_err());
         assert!(safe_file_name("..", 200).is_err());
         assert!(safe_file_name("a..b", 200).is_err(), "含 .. 一律拒绝");
-        for bad in ["a/b", "a\\b", "a:b", "a*b", "a?b", "a\"b", "a<b", "a>b", "a|b"] {
+        for bad in [
+            "a/b", "a\\b", "a:b", "a*b", "a?b", "a\"b", "a<b", "a>b", "a|b",
+        ] {
             assert!(safe_file_name(bad, 200).is_err(), "应拒绝：{bad}");
         }
         // 长度按字符计（中文 1 字 = 1）

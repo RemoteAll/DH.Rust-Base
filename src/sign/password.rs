@@ -408,7 +408,10 @@ mod tests {
     #[test]
     fn unknown_algorithm_is_rejected() {
         assert!(PasswordProvider::with_algorithm("bcrypt").is_err());
-        assert!(PasswordProvider::with_algorithm("SHA512").is_ok(), "大小写不敏感");
+        assert!(
+            PasswordProvider::with_algorithm("SHA512").is_ok(),
+            "大小写不敏感"
+        );
     }
 
     #[test]
@@ -460,7 +463,10 @@ mod tests {
         let prv = PasswordProvider::with_algorithm("md5").unwrap();
         let stored = prv.hash(PASS);
         assert!(prv.verify(&md5_hex_upper(PASS), &stored), "大写十六进制");
-        assert!(prv.verify(&md5_hex_lower(PASS), &stored), "小写十六进制（JS 常见）");
+        assert!(
+            prv.verify(&md5_hex_lower(PASS), &stored),
+            "小写十六进制（JS 常见）"
+        );
     }
 
     #[test]
@@ -494,7 +500,9 @@ mod tests {
 
     #[test]
     fn salt_time_window_is_enforced() {
-        let prv = PasswordProvider::with_algorithm("md5").unwrap().with_salt_time(30);
+        let prv = PasswordProvider::with_algorithm("md5")
+            .unwrap()
+            .with_salt_time(30);
         let stored = prv.hash(PASS);
         let parts: Vec<&str> = stored.split('$').collect();
         let salt: i64 = parts[2].parse().expect("时间盐应为 Unix 秒");
@@ -510,7 +518,15 @@ mod tests {
     #[test]
     fn malformed_hash_does_not_panic() {
         let prv = PasswordProvider::new();
-        for bad in ["$", "$$", "$sha512", "$sha512$abc", "$sha512$abc$", "x$y$z", "$未知$s$h"] {
+        for bad in [
+            "$",
+            "$$",
+            "$sha512",
+            "$sha512$abc",
+            "$sha512$abc$",
+            "x$y$z",
+            "$未知$s$h",
+        ] {
             assert!(!prv.verify(PASS, bad), "异常值应判失败：{bad}");
         }
         assert!(prv.needs_upgrade("$未知$s$h"));

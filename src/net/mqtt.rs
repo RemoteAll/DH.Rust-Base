@@ -141,11 +141,17 @@ impl std::fmt::Debug for MqttOptions {
             .field("version", &self.version)
             .field("client_id", &self.client_id)
             .field("username", &self.username)
-            .field("password", &if self.password.is_empty() { "" } else { "***" })
+            .field(
+                "password",
+                &if self.password.is_empty() { "" } else { "***" },
+            )
             .field("keepalive", &self.keepalive)
             .field("reconnect", &self.reconnect)
             .field("connect_timeout", &self.connect_timeout)
-            .field("credentials", &self.credentials.as_ref().map(|_| "<factory>"))
+            .field(
+                "credentials",
+                &self.credentials.as_ref().map(|_| "<factory>"),
+            )
             .finish()
     }
 }

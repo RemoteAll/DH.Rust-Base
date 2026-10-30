@@ -226,6 +226,9 @@ mod tests {
 
     #[test]
     fn digest_matches_salted_sha256() {
-        assert_eq!(digest("salt", "pwd"), crate::sign::salted_sha256_hex("salt", "pwd"));
+        assert_eq!(
+            digest("salt", "pwd"),
+            crate::sign::salted_sha256_hex("salt", "pwd")
+        );
     }
 }
