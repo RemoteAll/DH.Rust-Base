@@ -10,6 +10,7 @@
 //! - [`process`]：进程管理（拉起/存活判定/信号与强制停止/资源查询/优先级/命令行）
 //! - [`monitor`]：实时指标采集（CPU 差分/负载/TCP 连接数/磁盘 IO/进程统计/Top）
 //! - [`machine`]：机器事实与设置（主机/系统/CPU/内存/网络接口/磁盘/机器标识/校时）
+//! - [`resources`]：运行资源快照（整机 + 本进程 + 磁盘），各项目面板「运行资源」共用口径
 //! - [`iis`]：IIS 配置解析、站点/应用池/物理路径反查、w3wp 映射与 appcmd 控制（Windows）
 //! - [`firewall`]：本机防火墙端口放行/撤销（Windows 防火墙 / firewalld / ufw / iptables）
 
@@ -21,3 +22,4 @@ pub mod machine;
 pub mod monitor;
 pub mod net;
 pub mod process;
+pub mod resources;
