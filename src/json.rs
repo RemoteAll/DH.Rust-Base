@@ -1,7 +1,7 @@
 //! JSON 工具：第三方响应取值 + **C# 兼容的宽松解析/转义**。
 //!
 //! 两部分：
-//! - [`get_str`] / [`get_i64`] / [`get_bool`]：基于 `serde_json::Value` 的取值小工具
+//! - [`get_str`] / [`get_i64`] / [`get_f64`] / [`get_bool`]：基于 `serde_json::Value` 的取值小工具
 //!   （收编各项目重复的 `json_text`/`json_i64`；全部返回 `Option`，区分“键不存在/类型不符”与“空字符串/0”）。
 //! - [`JsonValue`] / [`parse_lax`] / [`write_quoted`]：**裸键 JSON**（C# `SimpleJsonString`/`JsonParser` 风格）
 //!   的解析与转义——标准 JSON 解析器读不了裸键，本实现同时接受裸键、`//` 行注释、尾逗号与标准 JSON。
@@ -41,6 +41,20 @@ pub fn value_to_i64(value: &Value) -> Option<i64> {
 /// 读取布尔值（兼容 `"true"/"1"/"yes"/"on"` 文本）。
 pub fn get_bool(value: &Value, key: &str) -> Option<bool> {
     value.get(key).and_then(value_to_bool)
+}
+
+/// 读取浮点数（字符串也尝试解析）。
+pub fn get_f64(value: &Value, key: &str) -> Option<f64> {
+    value.get(key).and_then(value_to_f64)
+}
+
+/// 值转浮点（字符串也尝试解析）。
+pub fn value_to_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
 }
 
 /// 值转布尔（兼容 `"true"/"1"/"yes"/"on"` 与 `"false"/"0"/"no"/"off"` 文本）。

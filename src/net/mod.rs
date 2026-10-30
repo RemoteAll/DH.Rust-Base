@@ -2,6 +2,8 @@
 //!
 //! 基础：
 //! - [`my_ip`]：本机首选局域网 IPv4 地址（UDP 出口路由法；对应 DH.NCore `NetHelper.MyIP()`）。
+//! - [`parse_cidr`] / [`ip_in_cidr`] / [`ip_in_list`] / [`validate_cidr_list`]：IP 白名单与来源校验
+//!   （裸 IP + CIDR、IPv4-mapped 归一；收编 Pek.RPanlServer 与 HlktechIoT 的多份重复实现）。
 //! - [`framing`]：字节流分帧器（终结符切分/保活串剥除/超长保护/空闲结算；tcp-scanner-server 现场实践收编）。
 //!
 //! `net`（网络内核，DHDeploy.Agent Rust 迁移；选型依据迁移文档《网络层选型复核》，
@@ -183,6 +185,104 @@ pub fn split_host_port(text: &str, default_port: u16) -> (String, u16) {
     }
 }
 
+// ———— IP / CIDR（面板 IP 白名单、来源校验；Pek.RPanlServer 与 HlktechIoT 重复实现收编）————
+
+/// 解析 IP 文本（IPv4/IPv6）；**IPv4-mapped IPv6 归一为 IPv4**（`::ffff:1.2.3.4` → `1.2.3.4`）。
+pub fn normalize_ip(text: &str) -> Option<std::net::IpAddr> {
+    let ip: std::net::IpAddr = text.trim().parse().ok()?;
+    Some(match ip {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => std::net::IpAddr::V6(v6),
+        },
+        v4 => v4,
+    })
+}
+
+/// 解析 CIDR：`10.0.0.0/8`、`2001:db8::/32`；**裸 IP 视为满位**（/32、/128）。
+///
+/// 前缀越界（IPv4 > 32、IPv6 > 128）或格式非法返回 `None`。
+pub fn parse_cidr(text: &str) -> Option<(std::net::IpAddr, u8)> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let (ip_text, prefix_text) = match text.split_once('/') {
+        Some((ip, prefix)) => (ip, Some(prefix)),
+        None => (text, None),
+    };
+    let ip = normalize_ip(ip_text)?;
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    let prefix = match prefix_text {
+        Some(prefix) => prefix.trim().parse::<u8>().ok()?,
+        None => max,
+    };
+    if prefix > max {
+        return None;
+    }
+    Some((ip, prefix))
+}
+
+/// IP 是否落在 CIDR 网段内（v4/v6 各自匹配；前缀越界或族不一致返回 `false`）。
+pub fn ip_in_cidr(ip: std::net::IpAddr, net: std::net::IpAddr, bits: u8) -> bool {
+    match (ip, net) {
+        (std::net::IpAddr::V4(addr), std::net::IpAddr::V4(net)) => {
+            if bits > 32 {
+                return false;
+            }
+            let mask = if bits == 0 {
+                0
+            } else {
+                u32::MAX << (32 - bits)
+            };
+            (u32::from(addr) & mask) == (u32::from(net) & mask)
+        }
+        (std::net::IpAddr::V6(addr), std::net::IpAddr::V6(net)) => {
+            if bits > 128 {
+                return false;
+            }
+            let mask = if bits == 0 {
+                0
+            } else {
+                u128::MAX << (128 - bits)
+            };
+            (u128::from(addr) & mask) == (u128::from(net) & mask)
+        }
+        _ => false,
+    }
+}
+
+/// 命中「IP + CIDR」列表（逗号/分号/空白分隔；空项忽略）。
+///
+/// 示例：`ip_in_list("10.0.0.0/8, 192.168.1.5", "10.1.2.3") == true`；
+/// IP 非法或列表为空时返回 `false`。
+pub fn ip_in_list(list: &str, ip: &str) -> bool {
+    let Some(ip) = normalize_ip(ip) else {
+        return false;
+    };
+    list.split([',', ';', '\n', '\r', ' ', '\t'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .filter_map(parse_cidr)
+        .any(|(net, bits)| ip_in_cidr(ip, net, bits))
+}
+
+/// 校验 CIDR 列表（空 = 合法）；返回带违规条目的错误，便于面板直接展示。
+pub fn validate_cidr_list(list: &str) -> Result<(), String> {
+    for item in list
+        .split([',', ';', '\n', '\r', ' ', '\t'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        if parse_cidr(item).is_none() {
+            return Err(format!(
+                "CIDR 格式无效：{item}（例：10.0.0.0/8,192.168.0.0/16）"
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ———— N001 依赖闸门（防 feature 空转：编译期验证依赖版本 API 形态）————
 
 /// 编译期自检：hyper 服务端连接构造器 API 形态（http1 + server 特性）。
@@ -227,6 +327,31 @@ mod tests {
         assert_eq!(split_host_port("host:abc", 80), ("host".to_string(), 80));
         // IPv6 字面量：按最后一个冒号切分（`[::1]:80`）
         assert_eq!(split_host_port("[::1]:80", 0), ("[::1]".to_string(), 80));
+    }
+
+    #[test]
+    fn ip_and_cidr_matching() {
+        // 裸 IP = 满位；CIDR 命中
+        assert!(ip_in_list("10.0.0.0/8, 192.168.1.5", "10.1.2.3"));
+        assert!(ip_in_list("10.0.0.0/8, 192.168.1.5", "192.168.1.5"));
+        assert!(!ip_in_list("10.0.0.0/8", "11.0.0.1"));
+        // IPv6
+        assert!(ip_in_list("2001:db8::/32", "2001:db8::1"));
+        assert!(!ip_in_list("2001:db8::/32", "2001:db9::1"));
+        // IPv4-mapped 归一
+        assert_eq!(
+            normalize_ip("::ffff:1.2.3.4"),
+            Some("1.2.3.4".parse().unwrap())
+        );
+        assert!(ip_in_list("1.2.3.4", "::ffff:1.2.3.4"));
+        // 越界/非法项不命中
+        assert!(!ip_in_list("10.0.0.0/33", "10.0.0.1"));
+        assert!(!ip_in_list("", "10.0.0.1"));
+        assert!(!ip_in_list("10.0.0.0/8", "not-an-ip"));
+        // 列表校验
+        assert!(validate_cidr_list("10.0.0.0/8, 192.168.0.0/16").is_ok());
+        assert!(validate_cidr_list("10.0.0.0/33").is_err());
+        assert!(validate_cidr_list("10.0.0.0/8; 2001:db8::/32").is_ok());
     }
 
     #[test]

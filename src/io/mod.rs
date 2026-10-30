@@ -70,6 +70,54 @@ pub fn write_all_text_atomic<P: AsRef<Path>>(path: P, text: &str) -> io::Result<
     }
 }
 
+/// 原子写二进制文件（升级暂存程序等）；`executable = true` 时 Unix 置 `0755`。
+///
+/// 为什么需要可执行位：[`crate::upgrade::replace_file`] 在 Unix 只做 `rename`，
+/// **不会**补权限——暂存阶段不置位，替换后程序会因无执行权限而起不来。
+pub fn write_all_bytes_atomic<P: AsRef<Path>>(
+    path: P,
+    bytes: &[u8],
+    executable: bool,
+) -> io::Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+    fs::write(&tmp, bytes)?;
+    if executable {
+        set_executable(&tmp)?;
+    }
+
+    match safe_replace_file(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // 目标被占用时降级为直接写入（尽力而为），并清理临时文件
+            let rs = fs::write(path, bytes);
+            if rs.is_ok() && executable {
+                let _ = set_executable(path);
+            }
+            let _ = fs::remove_file(&tmp);
+            rs
+        }
+    }
+}
+
+/// 置可执行位（Unix `0755`；Windows 无此概念，直接成功）。
+fn set_executable(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 /// 简单通配匹配：`*`（任意串）与 `?`（单字符），ASCII 大小写不敏感。
 ///
 /// 迭代 + 回溯实现（非线性递归）：多个 `*` 的长文本也不会指数级回溯。
@@ -294,6 +342,22 @@ mod tests {
         assert_eq!(sanitize_file_name(""), "_");
         assert_eq!(sanitize_file_name("a\nb"), "a_b");
         assert!(!exe_dir().as_os_str().is_empty());
+    }
+
+    #[test]
+    fn write_all_bytes_atomic_sets_executable() {
+        let dir = std::env::temp_dir().join(format!("dhrust-io-bytes-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("prog.bin");
+        write_all_bytes_atomic(&file, &[0x7f, b'E', b'L', b'F'], true).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), vec![0x7f, b'E', b'L', b'F']);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755);
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
