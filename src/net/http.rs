@@ -11,7 +11,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use http_body_util::{BodyExt, Full};
@@ -326,6 +326,73 @@ pub struct HttpServer {
     tls: Option<ServerTlsAcceptor>,
 }
 
+/// 连接统计（**跨平台精确计数**；与 [`HttpServerOptions`] 解耦，不改其字段）。
+///
+/// 用法（监听层）：
+/// ```ignore
+/// let stats = dhrust::net::http::ConnStats::new();
+/// let listener = dhrust::net::listener::Listener::bind_with_stats(
+///     "0.0.0.0:8300", "app", handler, options, stats.clone())?;
+/// println!("当前 {} / 峰值 {} / 累计 {}", stats.current(), stats.peak(), stats.total());
+/// ```
+///
+/// 口径：`current` = 已接受且尚未结束的连接；`total` = 启动以来累计接受；
+/// `peak` = 并发峰值（可用 [`Self::reset_peak`] 重置观测窗口）。
+/// 开销：每连接 3 次原子操作（accept 时 total+current+peak，关闭时 current-1），纳秒级。
+#[derive(Clone, Debug, Default)]
+pub struct ConnStats {
+    current: Arc<AtomicUsize>,
+    total: Arc<AtomicU64>,
+    peak: Arc<AtomicUsize>,
+}
+
+impl ConnStats {
+    /// 新建一组计数器（克隆共享同一份数据）。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 当前活动连接数。
+    pub fn current(&self) -> usize {
+        self.current.load(Ordering::Relaxed)
+    }
+
+    /// 启动以来累计接受的连接数。
+    pub fn total(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    /// 并发连接峰值。
+    pub fn peak(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
+    }
+
+    /// 把峰值重置为当前值（用于分窗口观测）。
+    pub fn reset_peak(&self) {
+        self.peak.store(self.current(), Ordering::Relaxed);
+    }
+
+    fn on_accept(&self) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+        let cur = self.current.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak.fetch_max(cur, Ordering::Relaxed);
+    }
+
+    fn on_close(&self) {
+        // CAS 循环：兼容老稳定版（不依赖 fetch_update/try_update 的新旧差异），且防下溢
+        let mut cur = self.current.load(Ordering::Relaxed);
+        while cur > 0 {
+            match self
+                .current
+                .compare_exchange_weak(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(v) => cur = v,
+            }
+        }
+    }
+}
+
 impl HttpServer {
     /// 绑定监听地址（`127.0.0.1:0` 随机端口便于测试）。
     pub async fn bind(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<HttpServer> {
@@ -389,6 +456,36 @@ impl HttpServer {
     where
         F: std::future::Future<Output = ()> + Send,
     {
+        self.serve_with_shutdown_inner(handler, options, shutdown, None)
+            .await
+    }
+
+    /// 同 [`Self::serve_with_shutdown`]，额外把连接数写入 [`ConnStats`]
+    /// （跨平台精确计数；不传统计时走 [`Self::serve_with_shutdown`]，零额外开销）。
+    pub async fn serve_with_shutdown_stats<F>(
+        self,
+        handler: HttpHandler,
+        options: HttpServerOptions,
+        shutdown: F,
+        stats: ConnStats,
+    ) -> std::io::Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send,
+    {
+        self.serve_with_shutdown_inner(handler, options, shutdown, Some(stats))
+            .await
+    }
+
+    async fn serve_with_shutdown_inner<F>(
+        self,
+        handler: HttpHandler,
+        options: HttpServerOptions,
+        shutdown: F,
+        stats: Option<ConnStats>,
+    ) -> std::io::Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send,
+    {
         // 分片线程池（可选）：每片一个 current_thread 运行时承载多连接
         let shards = if options.conn_shards > 0 && !options.thread_per_connection {
             Some(ShardPool::start(
@@ -418,7 +515,13 @@ impl HttpServer {
                 continue;
             }
             conn_count.fetch_add(1, Ordering::Relaxed);
-            let guard = ConnGuard(conn_count.clone());
+            if let Some(s) = &stats {
+                s.on_accept();
+            }
+            let guard = ConnGuard {
+                limit: conn_count.clone(),
+                stats: stats.clone(),
+            };
             let handler = handler.clone();
             let options = options.clone();
             let tls = clone_tls(&self.tls);
@@ -480,12 +583,19 @@ struct ShardPool {
     senders: Vec<tokio::sync::mpsc::UnboundedSender<(std::net::TcpStream, ConnGuard)>>,
 }
 
-/// 连接计数守卫：`Drop` 时归还一个并发名额（超限即丢连接的实现基础）。
-struct ConnGuard(Arc<AtomicUsize>);
+/// 连接计数守卫：`Drop` 时归还一个并发名额（超限即丢连接的实现基础），
+/// 并把连接数从 [`ConnStats`] 里减掉（未启用统计时只减限额，零额外开销）。
+struct ConnGuard {
+    limit: Arc<AtomicUsize>,
+    stats: Option<ConnStats>,
+}
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.limit.fetch_sub(1, Ordering::Relaxed);
+        if let Some(s) = &self.stats {
+            s.on_close();
+        }
     }
 }
 

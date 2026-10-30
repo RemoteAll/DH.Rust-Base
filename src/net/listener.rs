@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
-use crate::net::http::{HttpHandler, HttpServer, HttpServerOptions};
+use crate::net::http::{ConnStats, HttpHandler, HttpServer, HttpServerOptions};
 
 /// 已启动的监听器。
 pub struct Listener {
@@ -44,7 +44,21 @@ impl Listener {
         handler: HttpHandler,
         options: HttpServerOptions,
     ) -> Result<Self, String> {
-        Self::bind_inner(addr, thread_name, None, handler, options)
+        Self::bind_inner(addr, thread_name, None, handler, options, None)
+    }
+
+    /// 绑定并启动（仅 HTTP），并把**连接数统计**写入 `stats`（跨平台精确计数）。
+    ///
+    /// 与 [`Self::bind`] 完全同行为，仅多 3 个原子操作/连接；`stats` 可在任意线程读取
+    /// （`ConnStats` 是共享计数器的克隆）。
+    pub fn bind_with_stats(
+        addr: &str,
+        thread_name: &str,
+        handler: HttpHandler,
+        options: HttpServerOptions,
+        stats: ConnStats,
+    ) -> Result<Self, String> {
+        Self::bind_inner(addr, thread_name, None, handler, options, Some(stats))
     }
 
     /// 绑定并启动（HTTPS；`cert_pem`/`key_pem` 为 PEM 字节）。
@@ -63,6 +77,28 @@ impl Listener {
             Some((cert_pem.to_vec(), key_pem.to_vec())),
             handler,
             options,
+            None,
+        )
+    }
+
+    /// 绑定并启动（HTTPS），并把连接数统计写入 `stats`。
+    #[cfg(feature = "net-tls")]
+    pub fn bind_tls_with_stats(
+        addr: &str,
+        thread_name: &str,
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        handler: HttpHandler,
+        options: HttpServerOptions,
+        stats: ConnStats,
+    ) -> Result<Self, String> {
+        Self::bind_inner(
+            addr,
+            thread_name,
+            Some((cert_pem.to_vec(), key_pem.to_vec())),
+            handler,
+            options,
+            Some(stats),
         )
     }
 
@@ -112,6 +148,7 @@ impl Listener {
         tls: Option<(Vec<u8>, Vec<u8>)>,
         handler: HttpHandler,
         options: HttpServerOptions,
+        stats: Option<ConnStats>,
     ) -> Result<Self, String> {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<SocketAddr, String>>();
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
@@ -159,7 +196,16 @@ impl Listener {
                     let shutdown = async move {
                         let _ = stop_rx.await;
                     };
-                    if let Err(e) = server.serve_with_shutdown(handler, options, shutdown).await {
+                    // 有统计器 → 走带统计的 serve（仅多 3 个原子操作/连接）
+                    let result = match stats {
+                        Some(stats) => {
+                            server
+                                .serve_with_shutdown_stats(handler, options, shutdown, stats)
+                                .await
+                        }
+                        None => server.serve_with_shutdown(handler, options, shutdown).await,
+                    };
+                    if let Err(e) = result {
                         crate::logs::write_line(&format!("监听服务循环退出（{addr_text}）：{e}"));
                     }
                 });
