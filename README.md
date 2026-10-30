@@ -15,9 +15,10 @@ Pek 生态的 Rust 基础库，对应 C# 的 **DH.NCore**：为 Rust 项目提�
 | `ratelimit` | 固定窗口限流：`CounterStore` 抽象 + `WindowLimiter` + 分片进程内 `FixedWindowStore`（首次创建过期、可注入 Redis 共享计数） | `DH.RateLimter`（计数器部分） |
 | `lock` | **键控锁** `KeyedLock`：主后端（`LockBackend` trait，谁有能力谁实现）+ 进程内 `MemoryLock` 兜底 + **故障自动降级/恢复事件**（`LockEvent`，可接告警）；非阻塞 `try_acquire`、`Drop` 即释放 | — |
 | `threading` | 不可重入定时器、调度器、Cron 表达式 | `NewLife.Threading`（`TimerX`/`TimerScheduler`/`Cron`） |
-| `config` | 核心设置 `Setting`，读写 `Config/Core.config`（XML）/ `Core.json`；TOML 配置 `TomlConfig<T>`（feature `toml`，含 `save_with_arrays` 数组表同步） | `NewLife.Setting` / `Configuration` |
+| `config` | 核心设置 `Setting`，读写 `Config/Core.config`（XML）/ `Core.json`；TOML 配置 `TomlConfig<T>`（feature `toml`，含 `save_with_arrays` 数组表同步）；TOML 回写件：`toml::{merge_missing_keys, apply_type_fixes, sync_array_of_tables, backup_and_write}` + **`escape_basic`（基本字符串转义，含换行/控制字符）/ `quote_key`（不安全键加引号）** | `NewLife.Setting` / `Configuration` |
 | `logs` | 分级日志：控制台/文本文件/复合输出、全局门面与 `info!` 等宏 | `NewLife.Log`（`XTrace`/`ILog`/`TextFileLog`/`ConsoleLog`/`CompositeLog`） |
 | `text` | 通用文本：`truncate_chars`、`is_email`、`email_suffix`、`split_mail_addresses`、`mask_*` 系列（含**`mask_secret`**：首尾保留 + 中段 `****`，短值全遮）、**`csv_cell`/`csv_row`（CSV 转义 + 公式注入防护）**、**`conn_same`（数据库连接串归一化判等：忽略大小写/段顺序/`ShowSql`）** | `ValidFormatHelper.IsEmail` / `MailHelper.GetEmailSuffix` |
+| `web` | URL / 格式化工具：`url_encode`、**`url_decode` / `form_decode`（百分号解码，后者 `+`→空格）**、`form_encode`、`url_with_query`、**`query_params` / `query_param`（查询串解析与取值，保持顺序/保留重复键）**、`url_authority` / `url_host`、`json_escape`、`format_bytes*`、`uptime_text*`、`Paged<T>` | `NewLife.Web` 系列 |
 | `zip` | 极简 ZIP 打包器（store 法；内存 + 流式落盘） | — |
 | `excel` | **Excel（.xlsx）读写**（feature `excel`）：`Sheet`（标题/表头/数据/末尾说明）+ `build`/`build_to_file` 导出、`read` 读回（浮点整型归整、空整行剔除）、`column_index` 按表头名称匹配列、`cell` 安全取值；纯 Rust（`rust_xlsxwriter` + `calamine`），可 zig 交叉编 musl | — |
 | `sys` | 系统信息与进程管理：磁盘过滤/网卡流量（第一批）；进程管理/指标采集/机器事实（第二批，[`process`/`monitor`/`machine`]） | — |
