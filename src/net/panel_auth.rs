@@ -88,6 +88,75 @@ pub fn is_loopback(ip: &str) -> bool {
     ip.starts_with("127.") || ip == "::1" || ip.starts_with("::ffff:127.")
 }
 
+/// **反代后的真实客户端 IP**：只有在「对端是回环 / 受信代理」时才采纳转发头。
+///
+/// 为什么必须做：nginx 之类的反代之后，TCP 对端恒为 `127.0.0.1`——若直接拿它当客户端 IP，
+/// IP 限流、失败封禁、WAF 的 Top IP 全部退化成「全站共享一份配额」，而且一旦开了回环放行就等于整体放行。
+///
+/// 规则（从严）：
+/// 1. `trust = false` → 一律用对端（不看转发头）；
+/// 2. 对端既非回环、也不在 `trusted_proxies`（逗号分隔）里 → 同样用对端（防伪造 `X-Forwarded-For` 绕过限流）；
+/// 3. 否则先取 `X-Forwarded-For` 的**第一段**，其次 `X-Real-IP`；
+/// 4. 取到的值必须是合法 IP（`parse::<IpAddr>()` 通过），否则继续回落到对端。
+///
+/// # 参数
+/// - `peer`：TCP 对端 IP 文本（不带端口）
+/// - `forwarded_for`：`X-Forwarded-For` 原值
+/// - `real_ip`：`X-Real-IP` 原值
+/// - `trusted_proxies`：受信代理 IP 列表（逗号分隔；空 = 只信任回环）
+/// - `trust`：上层开关（配置里的 `TrustForwardedFor`）
+///
+/// # 返回值
+/// 客户端 IP 文本；`peer` 为空时返回 `"unknown"`。
+///
+/// 收编自 Pek.DeepSeekProxy 的 `client_ip_of`（与 C# `AbuseGuard.GetClientIp` 同口径）。
+pub fn client_ip_behind_proxy(
+    peer: &str,
+    forwarded_for: Option<&str>,
+    real_ip: Option<&str>,
+    trusted_proxies: &str,
+    trust: bool,
+) -> String {
+    let peer = peer.trim();
+    if peer.is_empty() {
+        return "unknown".to_string();
+    }
+    if !trust {
+        return peer.to_string();
+    }
+
+    let from_trusted = is_loopback(peer)
+        || trusted_proxies
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .any(|item| item.eq_ignore_ascii_case(peer));
+    if !from_trusted {
+        return peer.to_string();
+    }
+
+    if let Some(value) = forwarded_for {
+        if let Some(first) = value
+            .split(',')
+            .map(str::trim)
+            .find(|item| !item.is_empty())
+        {
+            if first.parse::<std::net::IpAddr>().is_ok() {
+                return first.to_string();
+            }
+        }
+    }
+
+    if let Some(value) = real_ip {
+        let trimmed = value.trim();
+        if trimmed.parse::<std::net::IpAddr>().is_ok() {
+            return trimmed.to_string();
+        }
+    }
+
+    peer.to_string()
+}
+
 /// 请求鉴权：按鉴权级别判定。
 ///
 /// - `None`：全部放行；
@@ -489,5 +558,54 @@ mod tests {
         assert!(!store.validate(&b));
         assert_eq!(store.revoke_all_except(""), 1, "空 keep = 全部清除");
         assert!(!store.validate(&a));
+    }
+
+    #[test]
+    fn client_ip_prefers_forwarded_only_behind_trusted_proxy() {
+        // 1) trust=false：一律对端
+        assert_eq!(
+            client_ip_behind_proxy("127.0.0.1", Some("1.2.3.4"), None, "", false),
+            "127.0.0.1"
+        );
+
+        // 2) 回环对端 + XFF 首段 → 取首段
+        assert_eq!(
+            client_ip_behind_proxy("127.0.0.1", Some("1.2.3.4, 10.0.0.1"), None, "", true),
+            "1.2.3.4"
+        );
+
+        // 3) 非受信对端：忽略转发头（防伪造绕过限流）
+        assert_eq!(
+            client_ip_behind_proxy("8.8.8.8", Some("1.2.3.4"), None, "", true),
+            "8.8.8.8"
+        );
+
+        // 4) 受信代理列表命中时也采纳
+        assert_eq!(
+            client_ip_behind_proxy("10.0.0.9", Some("1.2.3.4"), None, "10.0.0.9,10.0.0.10", true),
+            "1.2.3.4"
+        );
+
+        // 5) XFF 非法 → 回落 X-Real-IP
+        assert_eq!(
+            client_ip_behind_proxy("127.0.0.1", Some("not-an-ip"), Some("5.6.7.8"), "", true),
+            "5.6.7.8"
+        );
+
+        // 6) 两个头都非法/缺失 → 对端
+        assert_eq!(
+            client_ip_behind_proxy("127.0.0.1", Some("garbage"), Some(""), "", true),
+            "127.0.0.1"
+        );
+
+        // 7) IPv6 对端
+        assert_eq!(
+            client_ip_behind_proxy("::1", Some("2001:db8::1"), None, "", true),
+            "2001:db8::1"
+        );
+        assert!(is_loopback("::ffff:127.0.0.1"));
+
+        // 8) 空对端
+        assert_eq!(client_ip_behind_proxy("", Some("1.2.3.4"), None, "", true), "unknown");
     }
 }
