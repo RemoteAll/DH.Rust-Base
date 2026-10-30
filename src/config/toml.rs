@@ -418,6 +418,48 @@ pub fn backup_and_write(path: &Path, content: &str) -> io::Result<PathBuf> {
     Ok(bak)
 }
 
+/// TOML **基本字符串**转义（不含两端引号；写 `Key = "…"` 时用）。
+///
+/// 转义：`\` → `\\`、`"` → `\"`、`\n` → `\n`（字面两字符）、`\r`、`\t`，
+/// 其余控制字符（`< 0x20` 与 `0x7F`）写成 `\u00XX`。
+///
+/// 注意：只处理转义，**不加引号**——要连引号一起要，请用 [`quote_key`] 或自行 `format!("\"{}\"", …)`。
+/// 收编自 Pek.DeepSeekProxy 的 `Database.toml` 回写（原实现只转 `\` 与 `"`，
+/// 连接串/备注里带换行时会写出非法 TOML）。
+pub fn escape_basic(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if (ch as u32) < 0x20 || ch == '\u{7F}' => {
+                out.push_str(&format!("\\u{:04X}", ch as u32));
+            }
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+/// TOML 键写法：裸键安全（`A-Za-z0-9_-` 且非空）原样返回，否则加双引号并转义。
+///
+/// 用于 `[Connections.<名>]` 这类拼接：名字里带点、空格、中文时必须走引号形式，
+/// 否则 TOML 会把它当成多层表。
+pub fn quote_key(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
+    if safe {
+        value.to_string()
+    } else {
+        format!("\"{}\"", escape_basic(value))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,5 +566,35 @@ mod tests {
         let text = doc.to_string();
         assert!(changed >= 1, "应有变更：\n{text}");
         assert!(!text.contains("Name = \"b\""), "多余段应删除：\n{text}");
+    }
+
+    #[test]
+    fn escape_basic_covers_quotes_newlines_and_controls() {
+        assert_eq!(escape_basic(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(escape_basic(r"a\b"), r"a\\b");
+        assert_eq!(escape_basic("a\nb"), r"a\nb");
+        assert_eq!(escape_basic("a\rb\tc"), r"a\rb\tc");
+        assert_eq!(escape_basic("a\u{1}b"), r"a\u0001b");
+        assert_eq!(escape_basic("中文正常"), "中文正常");
+
+        // 转义结果能被 TOML 解析回原值（含换行与引号的连接串）
+        let raw = "Server=a;Pwd=\"x\\\\y\"\nNote=第二行";
+        let text = format!("Conn = \"{}\"\n", escape_basic(raw));
+        let doc = parse_document(&text).expect("转义后必须是合法 TOML");
+        assert_eq!(doc["Conn"].as_str().unwrap(), raw);
+    }
+
+    #[test]
+    fn quote_key_only_quotes_unsafe_names() {
+        assert_eq!(quote_key("main"), "main");
+        assert_eq!(quote_key("my-db_2"), "my-db_2");
+        assert_eq!(quote_key(""), "\"\"");
+        assert_eq!(quote_key("a.b"), "\"a.b\""); // 点必须引号，否则被当多层表
+        assert_eq!(quote_key("数 据库"), "\"数 据库\"");
+
+        // 引号化后的键仍能被解析（[Connections."a.b"]）
+        let text = format!("[Connections.{}]\nX = 1\n", quote_key("a.b"));
+        let doc = parse_document(&text).expect("引号键必须是合法 TOML");
+        assert!(doc["Connections"]["a.b"]["X"].as_integer().is_some());
     }
 }

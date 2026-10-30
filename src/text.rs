@@ -272,12 +272,43 @@ pub fn mask_connection_string(conn: &str) -> String {
         .join(";")
 }
 
+/// 敏感值掩码：保留首 `head` 个与尾 `tail` 个字符，中间固定为 `****`。
+///
+/// - 空串返回空串（调用方据此判断「没有值」）；
+/// - 长度不足以同时保留首尾（`len <= head + tail`）时**整体遮成 `********`**，
+///   避免「很短的令牌反而露出大半」；
+/// - 按**字符**计数（多字节安全），不按字节。
+///
+/// 收编自 Pek.DeepSeekProxy 面板的 API Key 掩码（原先名为 `mask_key`）。
+///
+/// ```
+/// use dhrust::text::mask_secret;
+///
+/// assert_eq!(mask_secret("sk-abcdef123456", 7, 4), "sk-abcd****3456");
+/// assert_eq!(mask_secret("short", 7, 4), "********");
+/// assert_eq!(mask_secret("", 7, 4), "");
+/// ```
+pub fn mask_secret(value: &str, head: usize, tail: usize) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return String::new();
+    }
+
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= head + tail {
+        return "********".to_string();
+    }
+
+    let front: String = chars.iter().take(head).collect();
+    let back: String = chars.iter().skip(chars.len() - tail).collect();
+    format!("{front}****{back}")
+}
+
 /// 解析智能布尔文本（大小写不敏感）：
 /// `true/1/yes/on/是` → `true`，`false/0/no/off/否` → `false`，其余 `None`。
 ///
 /// 供 JSON 宽松取值（`JsonValue::to_bool` / `value_to_bool`）与内存数据库字段值共用。
-pub fn parse_bool(text: &str) -> Option<bool> {
-    let text = text.trim();
+pub fn parse_bool(text: &str) -> Option<bool> {    let text = text.trim();
     if text == "是" {
         return Some(true);
     }
@@ -570,6 +601,21 @@ mod tests {
     fn csv_row_joins_escaped_fields() {
         assert_eq!(csv_row(["a", "b,c", "=x"]), "a,\"b,c\",'=x");
         assert_eq!(csv_row(Vec::<String>::new()), "");
+    }
+
+    #[test]
+    fn mask_secret_keeps_short_values_fully_hidden() {
+        assert_eq!(mask_secret("sk-abcdef123456", 7, 4), "sk-abcd****3456");
+        // 长度不足以同时留首尾 → 全遮
+        assert_eq!(mask_secret("sk-abc", 7, 4), "********");
+        assert_eq!(mask_secret("12345678901", 7, 4), "********");
+        // 刚好够（12 > 11）才露出首尾
+        assert_eq!(mask_secret("123456789012", 7, 4), "1234567****9012");
+        // 空串/空白
+        assert_eq!(mask_secret("", 7, 4), "");
+        assert_eq!(mask_secret("   ", 7, 4), "");
+        // 多字节按字符计
+        assert_eq!(mask_secret("口令口令口令口令", 2, 2), "口令****口令");
     }
 
     #[test]

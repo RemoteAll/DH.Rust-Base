@@ -17,11 +17,11 @@ Pek 生态的 Rust 基础库，对应 C# 的 **DH.NCore**：为 Rust 项目提�
 | `threading` | 不可重入定时器、调度器、Cron 表达式 | `NewLife.Threading`（`TimerX`/`TimerScheduler`/`Cron`） |
 | `config` | 核心设置 `Setting`，读写 `Config/Core.config`（XML）/ `Core.json`；TOML 配置 `TomlConfig<T>`（feature `toml`，含 `save_with_arrays` 数组表同步） | `NewLife.Setting` / `Configuration` |
 | `logs` | 分级日志：控制台/文本文件/复合输出、全局门面与 `info!` 等宏 | `NewLife.Log`（`XTrace`/`ILog`/`TextFileLog`/`ConsoleLog`/`CompositeLog`） |
-| `text` | 通用文本：`truncate_chars`、`is_email`、`email_suffix`、`split_mail_addresses`、`mask_*` 系列、**`csv_cell`/`csv_row`（CSV 转义 + 公式注入防护）**、**`conn_same`（数据库连接串归一化判等：忽略大小写/段顺序/`ShowSql`）** | `ValidFormatHelper.IsEmail` / `MailHelper.GetEmailSuffix` |
+| `text` | 通用文本：`truncate_chars`、`is_email`、`email_suffix`、`split_mail_addresses`、`mask_*` 系列（含**`mask_secret`**：首尾保留 + 中段 `****`，短值全遮）、**`csv_cell`/`csv_row`（CSV 转义 + 公式注入防护）**、**`conn_same`（数据库连接串归一化判等：忽略大小写/段顺序/`ShowSql`）** | `ValidFormatHelper.IsEmail` / `MailHelper.GetEmailSuffix` |
 | `zip` | 极简 ZIP 打包器（store 法；内存 + 流式落盘） | — |
 | `excel` | **Excel（.xlsx）读写**（feature `excel`）：`Sheet`（标题/表头/数据/末尾说明）+ `build`/`build_to_file` 导出、`read` 读回（浮点整型归整、空整行剔除）、`column_index` 按表头名称匹配列、`cell` 安全取值；纯 Rust（`rust_xlsxwriter` + `calamine`），可 zig 交叉编 musl | — |
 | `sys` | 系统信息与进程管理：磁盘过滤/网卡流量（第一批）；进程管理/指标采集/机器事实（第二批，[`process`/`monitor`/`machine`]） | — |
-| `net` | 网络内核：HTTP 服务端/客户端、WebSocket（文本/二进制、可选服务端 Ping 保活与慢消费者断开）、RPC、**HTTP 控制器（MVC 风格动作分发 + 视图约定）与静态文件服务（目录/嵌入/SPA 回退）**、TCP 探活（`tcp_check`/`split_host_port`，零依赖）（feature `net`） | `Http` / `Net` / `Remoting`（部分）/ `MapController` / `MapEmbedded` |
+| `net` | 网络内核：HTTP 服务端/客户端、WebSocket（文本/二进制、可选服务端 Ping 保活与慢消费者断开）、RPC、**HTTP 控制器（MVC 风格动作分发 + 视图约定）与静态文件服务（目录/嵌入/SPA 回退）**、TCP 探活（`tcp_check`/`split_host_port`，零依赖）（feature `net`）；**`net::sse`（SSE 读写基础件，零依赖无条件可用）：`SseBuffer` 按行切分半包 + `data_of`/`json_of` 解析 + `frame`/`event_frame`/`json_frame`/`event_json_frame`/`done_frame` 帧构造 + `push_*` 复用缓冲** | `Http` / `Net` / `Remoting`（部分）/ `MapController` / `MapEmbedded` |
 | `stun` | STUN 服务（RFC 5389 Binding；feature `stun`，`net` 自动包含） | — |
 | `wecom` | 企业微信机器人（Webhook 推送：文本/Markdown/Markdown V2 + 响应解析；feature `http-client`，https 需 `http-tls`） | `Pek.WebHook`（`WeChatWorkRobot`） |
 | `dingtalk` | 钉钉群机器人（Webhook 推送：text/markdown + **「加签」** `signed_url`/`sign` + 响应解析；feature `http-client`） | `Pek.WebHook`（钉钉机器人） |

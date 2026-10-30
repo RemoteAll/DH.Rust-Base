@@ -65,6 +65,10 @@ pub mod ws;
 /// 字节流分帧（终结符切分 + 保活串剥除 + 超长保护 + 空闲结算；tcp-scanner-server 实践沉淀收编）。
 pub mod framing;
 
+/// Server-Sent Events 读写基础件（按行切分上游分片 + 构造下游帧；
+/// Pek.DeepSeekProxy 三套协议流式共用实现收编）。
+pub mod sse;
+
 /// 登录限流（按来源的失败计数/封禁；默认 15 分钟 5 次 → 封禁 5 分钟——
 /// Pek.RAgent 与 HlkProductTool 面板同款实现的收编）。
 pub mod login_guard;

@@ -1,6 +1,8 @@
 //! Web 辅助（对应 DH.NCore `NewLife.Web` 系列工具；收编自 DHDeploy.Agent / tcp-scanner-server 等工程的重复实现）。
 //!
 //! - [`url_encode`]：RFC 3986 百分号编码（URL 查询串与 `application/x-www-form-urlencoded` 值）；
+//! - [`url_decode`] / [`form_decode`]：百分号解码（后者额外把 `+` 当空格）；
+//! - [`query_params`] / [`query_param`]：查询串解析与取值（保持顺序、保留重复键）；
 //! - [`form_encode`] / [`url_with_query`]：表单键值对编码与 URL 查询串拼接（片段保持在末尾）；
 //! - [`json_escape`]：JSON 字符串转义（不含两端引号，供请求体模板内嵌 JSON 值）；
 //! - [`format_bytes`] / [`format_bytes_iec`] / [`format_speed`]：流量/速率可读格式化
@@ -75,6 +77,111 @@ pub fn url_with_query(base: &str, query: &[(&str, &str)]) -> String {
         out.push_str(fragment);
     }
     out
+}
+
+/// 百分号解码（`%XX` → 字节，其余原样；`+` **不**转空格）。
+///
+/// 非法序列（`%` 后不足两位 / 非十六进制）原样保留而不报错——查询串里常见裸 `%`；
+/// 解码结果按 UTF-8 宽松转换（坏字节替换为 `\u{FFFD}`，不 panic）。
+///
+/// 收编自 Pek.DeepSeekProxy 面板查询串解析（原先各项目各写一份手写解码）。
+pub fn url_decode(value: &str) -> String {
+    decode_percent(value, false)
+}
+
+/// 表单解码（`application/x-www-form-urlencoded`：`%XX` 解码 **且** `+` → 空格）。
+pub fn form_decode(value: &str) -> String {
+    decode_percent(value, true)
+}
+
+/// 百分号解码实现（`plus_as_space` 决定 `+` 的语义）。
+fn decode_percent(value: &str, plus_as_space: bool) -> String {
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' if plus_as_space => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
+                match u8::from_str_radix(hex, 16) {
+                    Ok(byte) => {
+                        out.push(byte);
+                        index += 3;
+                    }
+                    Err(_) => {
+                        out.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// 解析查询串为键值对（`a=1&b=2`；键与值都做 [`form_decode`]）。
+///
+/// - **保持出现顺序**，重复键全部保留（调用方需要「取第一个」请用 [`query_param`]）；
+/// - 没有 `=` 的段视为「键存在、值为空」（`?debug` → `("debug", "")`）；
+/// - 空段（如末尾 `&`、开头的 `?`）跳过。
+pub fn query_params(query: &str) -> Vec<(String, String)> {
+    let query = query.trim_start_matches('?');
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = match pair.split_once('=') {
+            Some((key, value)) => (key, value),
+            None => (pair, ""),
+        };
+        if key.is_empty() {
+            continue;
+        }
+        out.push((form_decode(key), form_decode(value)));
+    }
+    out
+}
+
+/// 取查询串里某个键的**第一个**值（键名比较区分大小写；不存在返回 `None`）。
+///
+/// 直接遍历，不先构造整个键值对表——面板/接口取值大多只要一两个键。
+pub fn query_param(query: &str, name: &str) -> Option<String> {
+    let query = query.trim_start_matches('?');
+    if query.is_empty() {
+        return None;
+    }
+
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = match pair.split_once('=') {
+            Some((key, value)) => (key, value),
+            None => (pair, ""),
+        };
+        if key.is_empty() {
+            continue;
+        }
+        if form_decode(key) == name {
+            return Some(form_decode(value));
+        }
+    }
+    None
 }
 
 /// 追加 RFC 3986 编码（避免每个字段/字节单独创建 String）。
@@ -412,5 +519,51 @@ mod tests {
         assert_eq!(uptime_text_compact(90), "1分");
         assert_eq!(uptime_text_compact(3_600 + 300), "1小时5分");
         assert_eq!(uptime_text_compact(21 * 86_400 + 13 * 3_600), "21天13小时");
+    }
+
+    #[test]
+    fn decodes_percent_and_form_semantics() {
+        // 中文与保留字符
+        assert_eq!(url_decode("%E4%BD%A0%E5%A5%BD"), "你好");
+        assert_eq!(url_decode("a%2Fb"), "a/b");
+        // url_decode 不把 + 当空格；form_decode 当空格
+        assert_eq!(url_decode("a+b"), "a+b");
+        assert_eq!(form_decode("a+b"), "a b");
+        // 非法序列原样保留
+        assert_eq!(url_decode("%zz"), "%zz");
+        assert_eq!(url_decode("100%"), "100%");
+        assert_eq!(url_decode("%2"), "%2");
+        // 非 UTF-8 字节不 panic
+        assert_eq!(url_decode("%FF"), "\u{FFFD}");
+    }
+
+    #[test]
+    fn query_params_keep_order_and_duplicates() {
+        let pairs = query_params("?a=1&b=%E5%BC%A0&a=3&debug&");
+        assert_eq!(
+            pairs,
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "张".to_string()),
+                ("a".to_string(), "3".to_string()),
+                ("debug".to_string(), String::new()),
+            ]
+        );
+        assert!(query_params("").is_empty());
+        assert!(query_params("?").is_empty());
+    }
+
+    #[test]
+    fn query_param_returns_first_value() {
+        assert_eq!(
+            query_param("keyword=%E5%BC%A0&days=7", "keyword").as_deref(),
+            Some("张")
+        );
+        assert_eq!(query_param("a=1&a=2", "a").as_deref(), Some("1"));
+        assert_eq!(query_param("?debug", "debug").as_deref(), Some(""));
+        assert_eq!(query_param("a=1", "b"), None);
+        assert_eq!(query_param("", "a"), None);
+        // 大小写敏感，与 C# HttpRequest.Query 默认行为一致
+        assert_eq!(query_param("A=1", "a"), None);
     }
 }
