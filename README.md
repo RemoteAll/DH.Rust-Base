@@ -17,7 +17,7 @@ Pek 生态的 Rust 基础库，对应 C# 的 **DH.NCore**：为 Rust 项目提�
 | `threading` | 不可重入定时器、调度器、Cron 表达式 | `NewLife.Threading`（`TimerX`/`TimerScheduler`/`Cron`） |
 | `config` | 核心设置 `Setting`，读写 `Config/Core.config`（XML）/ `Core.json`；TOML 配置 `TomlConfig<T>`（feature `toml`，含 `save_with_arrays` 数组表同步） | `NewLife.Setting` / `Configuration` |
 | `logs` | 分级日志：控制台/文本文件/复合输出、全局门面与 `info!` 等宏 | `NewLife.Log`（`XTrace`/`ILog`/`TextFileLog`/`ConsoleLog`/`CompositeLog`） |
-| `text` | 通用文本：`truncate_chars`、`is_email`、`email_suffix`、`split_mail_addresses`、`mask_*` 系列、**`csv_cell`/`csv_row`（CSV 转义 + 公式注入防护）** | `ValidFormatHelper.IsEmail` / `MailHelper.GetEmailSuffix` |
+| `text` | 通用文本：`truncate_chars`、`is_email`、`email_suffix`、`split_mail_addresses`、`mask_*` 系列、**`csv_cell`/`csv_row`（CSV 转义 + 公式注入防护）**、**`conn_same`（数据库连接串归一化判等：忽略大小写/段顺序/`ShowSql`）** | `ValidFormatHelper.IsEmail` / `MailHelper.GetEmailSuffix` |
 | `zip` | 极简 ZIP 打包器（store 法；内存 + 流式落盘） | — |
 | `excel` | **Excel（.xlsx）读写**（feature `excel`）：`Sheet`（标题/表头/数据/末尾说明）+ `build`/`build_to_file` 导出、`read` 读回（浮点整型归整、空整行剔除）、`column_index` 按表头名称匹配列、`cell` 安全取值；纯 Rust（`rust_xlsxwriter` + `calamine`），可 zig 交叉编 musl | — |
 | `sys` | 系统信息与进程管理：磁盘过滤/网卡流量（第一批）；进程管理/指标采集/机器事实（第二批，[`process`/`monitor`/`machine`]） | — |

@@ -334,6 +334,27 @@ where
         .join(",")
 }
 
+/// 连接串归一化比较（判等）：忽略大小写、首尾空白、段顺序与 `ShowSql` 段。
+///
+/// 用于「数据源是否真的换了」这类判定（面板保存新连接串要不要标迁移、启动时要不要搬数据）：
+/// 同一个库换个字段顺序、加个 `ShowSql` 不算换库，否则会白搬一次数据。
+///
+/// 只做字符串归一，不解析 Provider；空串与全空白等价。
+/// 调用频次低（配置切换/启动一次），用朴素实现换取可读性与零依赖。
+pub fn conn_same(a: &str, b: &str) -> bool {
+    fn norm(conn: &str) -> String {
+        let mut parts: Vec<String> = conn
+            .split(';')
+            .map(|part| part.trim().to_ascii_lowercase())
+            .filter(|part| !part.is_empty() && !part.starts_with("showsql"))
+            .collect();
+        parts.sort();
+        parts.join(";")
+    }
+
+    norm(a) == norm(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,5 +548,20 @@ mod tests {
     fn csv_row_joins_escaped_fields() {
         assert_eq!(csv_row(["a", "b,c", "=x"]), "a,\"b,c\",'=x");
         assert_eq!(csv_row(Vec::<String>::new()), "");
+    }
+
+    #[test]
+    fn conn_same_ignores_case_order_and_showsql() {
+        // 大小写 / 段顺序 / 空白 / ShowSql 都不算换库
+        assert!(conn_same(
+            "Server=a;Port=3306;Database=DH",
+            "database=dh; server=A ;port=3306;ShowSql=true"
+        ));
+        // 空串与全空白等价
+        assert!(conn_same("", " ShowSql=1 "));
+        // 值变了就不算同一个库
+        assert!(!conn_same("Server=a;Database=DH", "Server=b;Database=DH"));
+        // 少一个真实段也不算同一个库（ShowSql 是唯一被忽略的段）
+        assert!(!conn_same("Server=a", "Server=a;Pooling=false"));
     }
 }
