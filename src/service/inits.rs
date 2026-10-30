@@ -95,15 +95,16 @@ Restart=always\n\
 RestartSec=5\n\
 KillMode=process\n\
 OOMScoreAdjust=-500\n\
-LimitNOFILE=65535\n\
+LimitNOFILE={nofile}\n\
 \n\
 [Install]\n\
 WantedBy=multi-user.target\n",
         name = mgr.name,
         workdir = mgr.base.display(), // 裸写（WorkingDirectory 不能引号）
         exe = quote_path(&mgr.exe.display().to_string()),
-    )
-}
+        // 统一口径：与本库 `sys::limits` 的默认值同一常量（以前这里硬编码 65535，
+        // 各项目面板写 drop-in 时又是另一个数，属于“同一含义两处口径”）
+        nofile = crate::sys::limits::NOFILE_SERVICE_DEFAULT,
 
 /// 路径引号（仅含空白时加引号）。
 ///

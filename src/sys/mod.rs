@@ -16,6 +16,7 @@
 pub mod disk;
 pub mod firewall;
 pub mod iis;
+pub mod limits;
 pub mod machine;
 pub mod monitor;
 pub mod net;
