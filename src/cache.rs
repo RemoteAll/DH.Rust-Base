@@ -86,6 +86,10 @@ where
 
     /// 写入缓存（关闭缓存时为空操作）。
     ///
+    /// 容量策略：满了先清过期；仍满则**按写入时间淘汰最旧的 ~10%**（而不是整体清空）——
+    /// 整体清空会让下一次请求全部打回数据库，形成周期性延迟尖刺
+    /// （来源：HlktechIoT 设备缓存实测教训，2026-10-30 下沉时保留该行为）。
+    ///
     /// # 参数
     /// - `key`：缓存键。
     /// - `value`：值。
@@ -98,12 +102,21 @@ where
             Err(poisoned) => poisoned.into_inner(),
         };
         if guard.len() >= self.max_entries {
-            // 先清过期，仍超限则整体清空（元数据可重建，代价可接受）
             if let Some(ttl) = self.ttl {
                 guard.retain(|_, (at, _)| at.elapsed() < ttl);
             }
             if guard.len() >= self.max_entries {
-                guard.clear();
+                // 按最旧淘汰到上限的 90%：一次只让 10% 的键回源，避免全量失效尖刺
+                let target = (self.max_entries * 9 / 10).max(1);
+                let excess = guard.len().saturating_sub(target);
+                let mut ages: Vec<(Instant, K)> = guard
+                    .iter()
+                    .map(|(k, (at, _))| (*at, k.clone()))
+                    .collect();
+                ages.sort_by_key(|(at, _)| *at);
+                for (_, k) in ages.into_iter().take(excess) {
+                    guard.remove(&k);
+                }
             }
         }
         guard.insert(key, (Instant::now(), value));
@@ -182,6 +195,26 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **容量满时只淘汰最旧的 ~10%，不做整体清空**。
+    ///
+    /// 为什么守这条：整体清空会让下一次请求全部回源（数据库瞬间打满）；
+    /// HlktechIoT 设备缓存在 10 万设备规模下就是靠"渐进淘汰"避免周期性尖刺的。
+    #[test]
+    fn cache_evicts_oldest_tenth_instead_of_clearing() {
+        let cache: TtlCache<u32, u32> = TtlCache::new(600, 20);
+        for i in 0..20u32 {
+            cache.insert(i, i);
+            // 让写入时间有先后（Instant 精度在部分平台较粗，这里只保证单调）
+            std::thread::yield_now();
+        }
+        // 第 21 条触发淘汰：应保留大部分旧键（10% = 2 条被淘汰），而不是清空
+        cache.insert(100, 100);
+        let len = cache.len();
+        assert!(len >= 17, "淘汰后应保留大部分条目，实际 {len}");
+        assert!(len < 20, "应确实淘汰了最旧的几条，实际 {len}");
+        assert_eq!(cache.get(&100), Some(100), "新写入的键必须在");
+    }
 
     /// 命中后返回同一份值；过期后视为未命中。
     #[test]
