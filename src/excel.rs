@@ -52,9 +52,58 @@ pub struct Sheet {
     /// 第 2 行表头。
     pub head: Vec<String>,
     /// 数据行（每行长度不足时按空串补齐）。
+    ///
+    /// **全部按文本写入**（Excel 里是左对齐的字符串，不能直接求和）。
+    /// 需要数值参与公式/汇总时改用 [`Sheet::typed_rows`] / [`Sheet::push_cells`]。
     pub rows: Vec<Vec<String>>,
+    /// 带类型的数据行：`Cell::Number` 写成**数值单元格**（Excel 里可直接 `SUM`）。
+    ///
+    /// **与 [`Sheet::rows`] 互斥**：`typed_rows` 非空时以它为准（`rows` 被忽略），
+    /// 避免两套数据在同一个表里交错出现、列位置错乱。
+    pub typed_rows: Vec<Vec<Cell>>,
     /// 末尾说明行（如「总数：12」），为空则不写。
     pub notes: Vec<String>,
+}
+
+/// 单元格值（导出用）。
+///
+/// 只有 [`Cell::Number`] 会写成数值单元格；其余一律按文本（保持既有行为）。
+#[derive(Clone, Debug, PartialEq)]
+pub enum Cell {
+    /// 文本（空串等同空白单元格，不写格式）。
+    Text(String),
+    /// 数值（金额/数量/百分比用小数即可；整数也走这里）。
+    Number(f64),
+    /// 空白（占位，保持列位置）。
+    Blank,
+}
+
+impl Cell {
+    /// 文本单元格的便捷构造。
+    pub fn text(v: impl Into<String>) -> Self {
+        Cell::Text(v.into())
+    }
+
+    /// 「能解析成数字就给数值单元格，否则文本」——报表导出的通用口径。
+    ///
+    /// 接受前导/尾随空白、`1,234.56`（千分位）、`12%`（按 0.12 写入并保留百分号格式不做）。
+    /// 空串返回 [`Cell::Blank`]（避免把「—」这类占位写进数值列）。
+    pub fn auto(v: impl AsRef<str>) -> Self {
+        let raw = v.as_ref();
+        let text = raw.trim();
+        if text.is_empty() {
+            return Cell::Blank;
+        }
+        let cleaned: String = text.chars().filter(|c| *c != ',' && *c != ' ').collect();
+        let (body, percent) = match cleaned.strip_suffix('%') {
+            Some(rest) => (rest, true),
+            None => (cleaned.as_str(), false),
+        };
+        match body.parse::<f64>() {
+            Ok(n) if n.is_finite() => Cell::Number(if percent { n / 100.0 } else { n }),
+            _ => Cell::Text(raw.to_string()),
+        }
+    }
 }
 
 impl Sheet {
@@ -64,6 +113,7 @@ impl Sheet {
             title: title.into(),
             head,
             rows: Vec::new(),
+            typed_rows: Vec::new(),
             notes: Vec::new(),
         }
     }
@@ -75,6 +125,47 @@ impl Sheet {
         S: Into<String>,
     {
         self.rows.push(cells.into_iter().map(Into::into).collect());
+    }
+
+    /// 追加一行**带类型**的单元格（数值列用 `Cell::Number` / `Cell::auto`）。
+    ///
+    /// 一旦用过本方法，[`Sheet::build`] 会以 `typed_rows` 为准、忽略 `rows`。
+    pub fn push_cells<I>(&mut self, cells: I)
+    where
+        I: IntoIterator<Item = Cell>,
+    {
+        self.typed_rows.push(cells.into_iter().collect());
+    }
+
+    /// 是否走「带类型」通道。
+    pub fn uses_typed(&self) -> bool {
+        !self.typed_rows.is_empty()
+    }
+
+    /// 某行某列的显示文本（列宽估算用）。
+    fn cell_display(&self, row: usize, col: usize) -> String {
+        if self.uses_typed() {
+            match self.typed_rows.get(row).and_then(|r| r.get(col)) {
+                Some(Cell::Text(t)) => t.clone(),
+                Some(Cell::Number(n)) => format!("{n}"),
+                _ => String::new(),
+            }
+        } else {
+            self.rows
+                .get(row)
+                .and_then(|r| r.get(col))
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    /// 数据行数（两种通道取其一）。
+    fn data_len(&self) -> usize {
+        if self.uses_typed() {
+            self.typed_rows.len()
+        } else {
+            self.rows.len()
+        }
     }
 }
 
@@ -113,17 +204,37 @@ pub fn build(sheet: &Sheet) -> Result<Vec<u8>, String> {
     }
 
     let data_start = head_row + 1;
-    for (r, row) in sheet.rows.iter().enumerate() {
-        for c in 0..cols {
-            let text = row.get(c).map(String::as_str).unwrap_or("");
-            if text.is_empty() {
-                continue;
+    if sheet.uses_typed() {
+        // 带类型通道：Number 写成数值单元格（Excel 里可直接 SUM），Text 仍按文本
+        for (r, row) in sheet.typed_rows.iter().enumerate() {
+            for c in 0..cols {
+                let row_no = data_start + r as u32;
+                match row.get(c) {
+                    Some(Cell::Number(n)) => {
+                        ws.write_number_with_format(row_no, c as u16, *n, &Format::new())
+                            .map_err(|e| format!("写入数值单元格失败：{e}"))?;
+                    }
+                    Some(Cell::Text(t)) if !t.is_empty() => {
+                        ws.write_string_with_format(row_no, c as u16, t, &Format::new())
+                            .map_err(|e| format!("写入数据失败：{e}"))?;
+                    }
+                    _ => {}
+                }
             }
-            ws.write_string_with_format(data_start + r as u32, c as u16, text, &Format::new())
-                .map_err(|e| format!("写入数据失败：{e}"))?;
+        }
+    } else {
+        for (r, row) in sheet.rows.iter().enumerate() {
+            for c in 0..cols {
+                let text = row.get(c).map(String::as_str).unwrap_or("");
+                if text.is_empty() {
+                    continue;
+                }
+                ws.write_string_with_format(data_start + r as u32, c as u16, text, &Format::new())
+                    .map_err(|e| format!("写入数据失败：{e}"))?;
+            }
         }
     }
-    let mut next_row = data_start + sheet.rows.len() as u32;
+    let mut next_row = data_start + sheet.data_len() as u32;
     for note in sheet.notes.iter().filter(|n| !n.trim().is_empty()) {
         ws.write_string_with_format(next_row, 0, note, &note_fmt)
             .map_err(|e| format!("写入统计行失败：{e}"))?;
@@ -133,8 +244,8 @@ pub fn build(sheet: &Sheet) -> Result<Vec<u8>, String> {
     // 列宽：按「表头 + 数据」的最大显示宽度估算（中文按 2 个字符宽）
     for c in 0..cols {
         let mut width = display_width(sheet.head.get(c).map(String::as_str).unwrap_or(""));
-        for row in &sheet.rows {
-            let w = display_width(row.get(c).map(String::as_str).unwrap_or(""));
+        for r in 0..sheet.data_len() {
+            let w = display_width(&sheet.cell_display(r, c));
             if w > width {
                 width = w;
             }
@@ -308,5 +419,63 @@ mod tests {
         assert_eq!(cell_text(&Data::Float(1.5)), "1.5");
         assert_eq!(cell_text(&Data::Int(7)), "7");
         assert_eq!(cell_text(&Data::Bool(true)), "TRUE");
+    }
+
+    #[test]
+    fn typed_rows_write_numbers_as_numbers() {
+        let mut sheet = Sheet::new("金额", vec!["名称".into(), "金额".into()]);
+        // 文本列 + 数值列：数值必须是**数值单元格**（Excel 里能直接 SUM）
+        sheet.push_cells([Cell::text("甲"), Cell::Number(123.45)]);
+        sheet.push_cells([Cell::text("乙"), Cell::Number(66.55)]);
+        sheet.notes.push("合计：190".into());
+        assert!(sheet.uses_typed());
+
+        let bytes = build(&sheet).expect("build");
+        // 文本读回：小数位不丢
+        let rows = read(&bytes).expect("read");
+        assert_eq!(rows[1], vec!["名称".to_string(), "金额".to_string()]);
+        assert_eq!(rows[2], vec!["甲".to_string(), "123.45".to_string()]);
+        assert_eq!(rows[3], vec!["乙".to_string(), "66.55".to_string()]);
+
+        // 关键断言：读回来的**原始类型**是数值（不是字符串）——Excel 里才能直接 SUM
+        let raw = raw_types(&bytes);
+        assert!(
+            matches!(raw[2][1], Data::Float(_)),
+            "金额列应为数值单元格：{:?}",
+            raw[2]
+        );
+        assert!(
+            matches!(raw[2][0], Data::String(_)),
+            "名称列应为文本单元格：{:?}",
+            raw[2]
+        );
+    }
+
+    #[test]
+    fn typed_rows_override_plain_rows() {
+        let mut sheet = Sheet::new("", vec!["A".into()]);
+        sheet.push_row(["忽略我"]);
+        sheet.push_cells([Cell::Number(7.0)]);
+        let rows = read(&build(&sheet).expect("build")).expect("read");
+        assert_eq!(rows.len(), 2, "只应写出 typed_rows 一行数据：{rows:?}");
+        assert_eq!(rows[1][0], "7");
+    }
+
+    #[test]
+    fn cell_auto_parses_numbers_and_keeps_text() {
+        assert_eq!(Cell::auto("1234.5"), Cell::Number(1234.5));
+        assert_eq!(Cell::auto(" 1,234.50 "), Cell::Number(1234.5));
+        assert_eq!(Cell::auto("12%"), Cell::Number(0.12));
+        assert_eq!(Cell::auto(""), Cell::Blank);
+        assert_eq!(Cell::auto("—"), Cell::Text("—".to_string()));
+        assert_eq!(Cell::auto("KH0001"), Cell::Text("KH0001".to_string()));
+    }
+
+    /// 第一个工作表的原始 `Data` 网格（判断单元格是文本还是数值；`read` 会统一转字符串）。
+    fn raw_types(bytes: &[u8]) -> Vec<Vec<Data>> {
+        let mut wb = open_workbook_auto_from_rs(Cursor::new(bytes.to_vec())).expect("open");
+        let names = wb.sheet_names().to_vec();
+        let range = wb.worksheet_range(&names[0]).expect("range");
+        range.rows().map(|r| r.to_vec()).collect()
     }
 }
