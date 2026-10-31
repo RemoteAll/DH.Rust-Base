@@ -105,6 +105,8 @@ WantedBy=multi-user.target\n",
         // 统一口径：与本库 `sys::limits` 的默认值同一常量（以前这里硬编码 65535，
         // 各项目面板写 drop-in 时又是另一个数，属于“同一含义两处口径”）
         nofile = crate::sys::limits::NOFILE_SERVICE_DEFAULT,
+    )
+}
 
 /// 路径引号（仅含空白时加引号）。
 ///
