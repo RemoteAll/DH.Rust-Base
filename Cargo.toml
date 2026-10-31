@@ -39,9 +39,21 @@ toml_edit = { version = "0.25", optional = true }
 # 停在 `^2` 时既有项目靠 Cargo.lock 里已锁的 2.4.2 仍可续编，但**新建项目**解析依赖会失败
 # （`failed to select a version for the requirement zip = "^2"`）。故对齐上游唯一可用线 9.x
 # （zip 文件格式向下兼容，读写互通；2026-10-16 由 2.x 升级）。
-zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
+# aes-crypto：AES-256 加密条目解密（wzAES）；lzma / xz：LZMA、XZ 压缩方法的条目。
+# 三者均为纯 Rust（aes/pbkdf2/hmac/sha1、lzma-rust2），可 zig 交叉编 musl。
+zip = { version = "9", default-features = false, features = ["deflate", "aes-crypto", "lzma", "xz"], optional = true }
 # tar.gz 解包（在线升级包常以 .tar.gz 发布；与 zip 同一入口按魔数自动分派）
 tar = { version = "0.4", optional = true }
+
+# ———— feature `archive-extract`（多格式解压：7z / tar.bz2 / tar.xz / tar.zst；全纯 Rust，可 zig 交叉编 musl）————
+# 7z（含 AES-256 密码；compress/util 只按需开，不引入写支持以省体积）
+sevenz-rust2 = { version = "0.23", default-features = false, features = ["aes256", "util"], optional = true }
+# tar.xz 流式解码（显式声明：zip 的 lzma 特性已带入同一 crate，这里固定版本语义）
+lzma-rust2 = { version = "0.21", optional = true }
+# tar.bz2 解码（0.6 起默认后端是 libbz2-rs-sys —— 纯 Rust，无 C 依赖）
+bzip2 = { version = "0.6", optional = true }
+# tar.zst / 单文件 zst（复用 `patch` 特性同一个 zstd；C 后端已随现有打包链交叉编译验证）
+# （zstd 依赖声明见上方 feature `patch` 处）
 
 # ———— feature `patch`（zstd 字典差分补丁：以旧文件为字典压缩新文件；增量升级，Pek.RAgent ↔ DHDeploy.Agent.Rust 共用）————
 zstd = { version = "0.13", optional = true }
@@ -117,8 +129,7 @@ windows-service = { version = "0.7", optional = true }
 
 [features]
 # TOML 配置维护管线（tcp-scanner-server 实践沉淀；启用后提供 config::toml 模块）
-toml = ["dep:toml", "dep:toml_edit"]
-# Razor 子集模板引擎（方案 C，零新依赖；规约见 Doc/Razor子集模板引擎架构.md）
+toml = ["dep:toml", "dep:toml_edit"]# Razor 子集模板引擎（方案 C，零新依赖；规约见 Doc/Razor子集模板引擎架构.md）
 razor = []
 # 可逆加密（AES-256-GCM；配置中敏感值“防直读”存储，如登录密码——HlkProductTool 实践沉淀）
 secret = ["dep:aes-gcm"]
@@ -126,8 +137,16 @@ secret = ["dep:aes-gcm"]
 service = ["dep:windows-service"]
 # ZIP / tar.gz 解压（防目录穿越/占用文件安全替换；Pek.RAgent 与 DHDeploy.Agent 共用）
 zip-extract = ["dep:zip", "dep:tar", "dep:flate2"]
+# 多格式解压（zip / 7z / tar[.gz|.bz2|.xz|.zst] / 单文件 gz|bz2|xz|zst，zip 与 7z 支持密码）
+archive-extract = [
+    "zip-extract",
+    "dep:sevenz-rust2",
+    "dep:lzma-rust2",
+    "dep:bzip2",
+    "dep:zstd",
+]
 # 文件管理（面板浏览/上传下载/编辑/压缩解压/搜索；Pek.RAgent 与 Pek.RPanlServer 共用）
-fileman = ["zip-extract"]
+fileman = ["archive-extract"]
 # zstd 字典差分补丁（增量升级：生成/还原；Pek.RAgent 与 DHDeploy.Agent.Rust 共用）
 patch = ["dep:zstd"]
 # Excel（.xlsx）读写（导出数据 / 导入模板 / 读回用户填写的表；多项目共用）
@@ -177,3 +196,5 @@ codegen-units = 1
 [dev-dependencies]
 # 集成测试（tests/razor_cases.rs）读取用例数据；与主依赖同 crate 同版本（零新增供应链）
 serde_json = { version = "1", features = ["preserve_order"] }
+# 多格式解压测试要「造」加密 7z（正式依赖只开解压，不引入压缩编码器）
+sevenz-rust2 = { version = "0.23", default-features = false, features = ["aes256", "util", "compress"] }

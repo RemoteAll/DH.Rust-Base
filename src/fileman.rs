@@ -14,7 +14,7 @@
 //! - 下载上限 256MB、在线编辑上限 10MB（二进制拒读），大文件请用 SFTP。
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
@@ -27,6 +27,10 @@ pub const MAX_EDIT_SIZE: u64 = 10 * 1024 * 1024;
 pub const MAX_DOWNLOAD_SIZE: u64 = 256 * 1024 * 1024;
 /// 批量操作（删除/复制/移动/压缩）单次条目上限。
 pub const MAX_BATCH: usize = 100;
+/// 单文件上传上限（2GB；分片上传——服务端只按片接收，内存不随文件大小增长）。
+pub const MAX_UPLOAD_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+/// 分片上传的临时文件前缀（目录列表隐藏；`upload_abort` / 空闲清理按此前缀识别）。
+pub const UPLOAD_TMP_PREFIX: &str = ".pek-upload-";
 /// 搜索返回条数上限。
 const SEARCH_MAX_RESULTS: usize = 200;
 /// 搜索扫描条数上限。
@@ -296,6 +300,10 @@ pub fn list_dir(dir: &Path) -> Result<Vec<Json>, String> {
     let mut items: Vec<(bool, String, Json)> = Vec::new();
     for entry in rd.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
+        // 分片上传的临时分片不对外展示（否则用户会在面板看到 .pek-upload-xxx.part）
+        if is_upload_temp(&name) {
+            continue;
+        }
         // DirEntry::metadata 不跟随符号链接（链接本身元数据）
         let Ok(md) = entry.metadata() else { continue };
         let is_link = md.file_type().is_symlink();
@@ -690,7 +698,629 @@ pub fn compress_entry(
     Ok((dst, files, size))
 }
 
+// ————— 分片上传（大文件走分片：单片 ≤ 调用方切片大小，服务端内存恒定）—————
+
+/// 是否为上传临时文件（目录列表过滤用）。
+pub fn is_upload_temp(name: &str) -> bool {
+    name.starts_with(UPLOAD_TMP_PREFIX)
+}
+
+/// 分片上传进度。
+#[derive(Debug, Clone)]
+pub struct UploadProgress {
+    /// 服务端已接收字节数
+    pub received: u64,
+    /// 文件总大小
+    pub total: u64,
+    /// 是否已收齐并落盘
+    pub done: bool,
+    /// 落盘后的最终路径（`done=true` 时有效）
+    pub path: Option<PathBuf>,
+}
+
+fn upload_part_path(dir: &Path, upload_id: &str) -> Result<PathBuf, String> {
+    let id = upload_id.trim();
+    let valid = (8..=64).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !valid {
+        return Err("上传会话标识无效（应为 8~64 位字母/数字/连字符）".to_string());
+    }
+    Ok(dir.join(format!("{UPLOAD_TMP_PREFIX}{id}.part")))
+}
+
+/// 查询某会话已接收字节数（0 = 未开始或已清理；供断点续传）。
+pub fn upload_received(dir: &Path, upload_id: &str) -> Result<u64, String> {
+    let part = upload_part_path(dir, upload_id)?;
+    Ok(match fs::metadata(&part) {
+        Ok(md) if md.is_file() => md.len(),
+        _ => 0,
+    })
+}
+
+/// 写入一个分片；返回进度（`done=true` 表示已落盘到目标文件名）。
+///
+/// - `offset` 必须等于服务端已接收字节数（防乱序/重复；断点续传时先查 `upload_received`）；
+/// - `overwrite=false` 时：首片即检查目标是否存在（不白传 2GB 再失败），末片再检查一次；
+/// - 收齐前只写 `{dir}/.pek-upload-{id}.part`，收齐后原子替换到目标（占用时安全让位）。
+pub fn upload_chunk(
+    dir: &Path,
+    name: &str,
+    upload_id: &str,
+    offset: u64,
+    total: u64,
+    data: &[u8],
+    overwrite: bool,
+) -> Result<UploadProgress, String> {
+    validate_name(name)?;
+    if !dir.is_dir() {
+        return Err(format!("目录不存在：{}", dir.display()));
+    }
+    let dst = dir.join(name.trim());
+    if dst.is_dir() {
+        return Err("目标是目录，无法覆盖".to_string());
+    }
+    if total == 0 {
+        return Err("文件为空（0 字节），无需分片上传".to_string());
+    }
+    if total > MAX_UPLOAD_SIZE {
+        return Err(format!("文件过大（上限 2GB）：{} 字节", total));
+    }
+    let part = upload_part_path(dir, upload_id)?;
+    let received = upload_received(dir, upload_id)?;
+    if received != offset {
+        return Err(format!(
+            "分片位置不匹配（服务端已收 {received} 字节，本次 offset={offset}）：请查询已收字节后续传"
+        ));
+    }
+    if !overwrite && received == 0 && dst.exists() {
+        return Err(format!(
+            "目标已存在：{}（确认覆盖后可继续上传）",
+            dst.display()
+        ));
+    }
+    if data.is_empty() {
+        return Err("分片内容为空".to_string());
+    }
+    let next = received
+        .checked_add(data.len() as u64)
+        .ok_or_else(|| "分片长度溢出".to_string())?;
+    if next > total {
+        return Err(format!("分片超出文件大小（{next} > {total}）"));
+    }
+    {
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&part)
+            .map_err(|e| format!("写入临时分片失败（{}）：{e}", part.display()))?;
+        f.write_all(data)
+            .map_err(|e| format!("写入临时分片失败（{}）：{e}", part.display()))?;
+        if let Err(e) = f.flush() {
+            return Err(format!("刷新临时分片失败（{}）：{e}", part.display()));
+        }
+    }
+    if next < total {
+        return Ok(UploadProgress {
+            received: next,
+            total,
+            done: false,
+            path: None,
+        });
+    }
+    if !overwrite && dst.exists() {
+        return Err(format!(
+            "目标已存在：{}（确认覆盖后重发最后一片即可）",
+            dst.display()
+        ));
+    }
+    crate::io::safe_replace_file(&part, &dst).map_err(|e| format!("保存失败：{e}"))?;
+    Ok(UploadProgress {
+        received: next,
+        total,
+        done: true,
+        path: Some(dst),
+    })
+}
+
+/// 放弃上传会话（删除临时分片）。
+pub fn upload_abort(dir: &Path, upload_id: &str) -> Result<(), String> {
+    let part = upload_part_path(dir, upload_id)?;
+    let _ = fs::remove_file(&part);
+    Ok(())
+}
+
+// ————— 多格式解压（zip / 7z / tar[.gz|.bz2|.xz|.zst] / 单文件 gz|bz2|xz|zst）—————
+
+/// 支持的压缩包格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveFormat {
+    Zip,
+    SevenZip,
+    Tar,
+    TarGz,
+    TarBz2,
+    TarXz,
+    TarZst,
+    Gzip,
+    Bzip2,
+    Xz,
+    Zstd,
+}
+
+impl ArchiveFormat {
+    /// 机器可读代码（前端展示 / 日志用）。
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Zip => "zip",
+            Self::SevenZip => "7z",
+            Self::Tar => "tar",
+            Self::TarGz => "tar.gz",
+            Self::TarBz2 => "tar.bz2",
+            Self::TarXz => "tar.xz",
+            Self::TarZst => "tar.zst",
+            Self::Gzip => "gz",
+            Self::Bzip2 => "bz2",
+            Self::Xz => "xz",
+            Self::Zstd => "zst",
+        }
+    }
+
+    /// 展示名。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Zip => "ZIP",
+            Self::SevenZip => "7Z",
+            Self::Tar => "TAR",
+            Self::TarGz => "TAR.GZ",
+            Self::TarBz2 => "TAR.BZ2",
+            Self::TarXz => "TAR.XZ",
+            Self::TarZst => "TAR.ZST",
+            Self::Gzip => "GZ",
+            Self::Bzip2 => "BZ2",
+            Self::Xz => "XZ",
+            Self::Zstd => "ZST",
+        }
+    }
+
+    /// 是否支持密码（仅 zip / 7z）。
+    pub fn supports_password(self) -> bool {
+        matches!(self, Self::Zip | Self::SevenZip)
+    }
+}
+
+/// 解压统计。
+#[derive(Debug, Clone, Default)]
+pub struct ExtractReport {
+    /// 识别出的格式（识别失败时为 `None`）
+    pub format: Option<ArchiveFormat>,
+    /// 写出的文件数
+    pub files: u64,
+    /// 写出的字节数
+    pub bytes: u64,
+    /// 被跳过的条目数（目录穿越 / 符号链接 / 循环链接 / 损坏条目）
+    pub skipped: u64,
+    /// 覆盖的同名文件数
+    pub overridden: u64,
+}
+
+/// 压缩包同名主干名（`a.tar.gz` → `a`；`a.zip` → `a`）。
+pub fn archive_stem(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    for suffix in [
+        ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tar.zstd", ".tgz", ".tbz2", ".tbz", ".txz",
+        ".tzst", ".tar", ".zip", ".7z", ".gz", ".bz2", ".xz", ".zst", ".zstd",
+    ] {
+        if lower.ends_with(suffix) {
+            let base = &name[..name.len() - suffix.len()];
+            if !base.is_empty() {
+                return base.to_string();
+            }
+        }
+    }
+    name.to_string()
+}
+
+/// 解压默认目标目录：压缩包同级同名子目录（`a.zip` → 同目录 `a/`）。
+pub fn default_extract_target(src: &Path) -> PathBuf {
+    let name = file_label(src);
+    let stem = archive_stem(&name);
+    let dir = if stem.is_empty() || stem == "." || stem == ".." {
+        format!("{name}.out")
+    } else {
+        stem
+    };
+    src.parent()
+        .map(|p| p.join(&dir))
+        .unwrap_or_else(|| PathBuf::from(dir))
+}
+
+fn read_head(path: &Path, n: usize) -> Result<Vec<u8>, String> {
+    let mut f = fs::File::open(path).map_err(|e| format!("无法打开 {}：{}", path.display(), e))?;
+    let mut buf = vec![0u8; n];
+    let got = f
+        .read(&mut buf)
+        .map_err(|e| format!("读取失败（{}）：{e}", path.display()))?;
+    buf.truncate(got);
+    Ok(buf)
+}
+
+fn open_decoder(path: &Path, fmt: ArchiveFormat) -> Result<Box<dyn Read>, String> {
+    let f = fs::File::open(path).map_err(|e| format!("无法打开 {}：{}", path.display(), e))?;
+    Ok(match fmt {
+        ArchiveFormat::Gzip | ArchiveFormat::TarGz => {
+            Box::new(flate2::read::MultiGzDecoder::new(f))
+        }
+        ArchiveFormat::Bzip2 | ArchiveFormat::TarBz2 => Box::new(bzip2::read::BzDecoder::new(f)),
+        ArchiveFormat::Xz | ArchiveFormat::TarXz => Box::new(lzma_rust2::XzReader::new(f, false)),
+        ArchiveFormat::Zstd | ArchiveFormat::TarZst => Box::new(
+            zstd::stream::read::Decoder::new(f)
+                .map_err(|e| format!("zstd 解码初始化失败（{}）：{e}", path.display()))?,
+        ),
+        _ => return Err("该格式不是单流压缩".to_string()),
+    })
+}
+
+/// 单流压缩包内部是否为 tar（读解压后的前 512 字节看 `ustar` 魔数）。
+fn inner_is_tar(path: &Path, fmt: ArchiveFormat) -> Result<bool, String> {
+    let mut dec = open_decoder(path, fmt)?;
+    let mut buf = [0u8; 512];
+    let mut got = 0usize;
+    while got < buf.len() {
+        match dec.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            // 解不开就别在这里下结论，交给正式解压时报具体错误
+            Err(_) => return Ok(false),
+        }
+    }
+    Ok(got >= 262 && &buf[257..262] == b"ustar")
+}
+
+/// 识别压缩包格式（魔数优先、扩展名兜底；rar 明确报不支持）。
+pub fn detect_archive(path: &Path) -> Result<ArchiveFormat, String> {
+    let md = fs::metadata(path).map_err(|e| format!("文件不存在：{}（{e}）", path.display()))?;
+    if md.is_dir() {
+        return Err("目标是目录，无法解压".to_string());
+    }
+    let name = file_label(path).to_ascii_lowercase();
+    if name.ends_with(".rar") {
+        return Err(
+            "RAR 格式暂不支持（无纯 Rust 解压实现）：请先转换为 ZIP 或 7Z 再解压".to_string(),
+        );
+    }
+    let head = read_head(path, 512)?;
+    if head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") || head.starts_with(b"PK\x07\x08")
+    {
+        return Ok(ArchiveFormat::Zip);
+    }
+    if head.starts_with(b"7z\xBC\xAF\x27\x1C") {
+        return Ok(ArchiveFormat::SevenZip);
+    }
+    if head.len() >= 262 && &head[257..262] == b"ustar" {
+        return Ok(ArchiveFormat::Tar);
+    }
+    let stream = if head.starts_with(b"\x1f\x8b") {
+        Some((ArchiveFormat::Gzip, ArchiveFormat::TarGz))
+    } else if head.starts_with(b"BZh") {
+        Some((ArchiveFormat::Bzip2, ArchiveFormat::TarBz2))
+    } else if head.starts_with(b"\xfd7zXZ\x00") {
+        Some((ArchiveFormat::Xz, ArchiveFormat::TarXz))
+    } else if head.starts_with(b"\x28\xb5\x2f\xfd") {
+        Some((ArchiveFormat::Zstd, ArchiveFormat::TarZst))
+    } else {
+        None
+    };
+    if let Some((plain, tarball)) = stream {
+        return Ok(if inner_is_tar(path, plain)? {
+            tarball
+        } else {
+            plain
+        });
+    }
+    // 魔数不认识：按扩展名兜底（让解压器给出更具体的错误）
+    if name.ends_with(".zip") {
+        return Ok(ArchiveFormat::Zip);
+    }
+    if name.ends_with(".7z") {
+        return Ok(ArchiveFormat::SevenZip);
+    }
+    if name.ends_with(".tar") {
+        return Ok(ArchiveFormat::Tar);
+    }
+    Err(format!(
+        "无法识别的压缩包格式：{}（支持 zip / 7z / tar / tar.gz / tar.bz2 / tar.xz / tar.zst / gz / bz2 / xz / zst）",
+        file_label(path)
+    ))
+}
+
+/// 把条目相对路径拼到目标目录（拒绝绝对路径、盘符、`..`、空名）。
+fn safe_join(target: &Path, rel: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = target.to_path_buf();
+    let mut pushed = false;
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(seg) => {
+                let text = seg.to_string_lossy();
+                if text.is_empty() || text == "." {
+                    continue;
+                }
+                out.push(seg);
+                pushed = true;
+            }
+            Component::CurDir => {}
+            // RootDir / Prefix（C:）/ ParentDir 一律拒绝
+            _ => return None,
+        }
+    }
+    if pushed { Some(out) } else { None }
+}
+
+fn extract_zip_entries(
+    src: &Path,
+    target: &Path,
+    password: Option<&str>,
+    report: &mut ExtractReport,
+) -> Result<(), String> {
+    let file = fs::File::open(src).map_err(|e| format!("无法打开 {}：{}", src.display(), e))?;
+    let mut zip = zip::ZipArchive::new(file)
+        .map_err(|e| format!("不是有效的 ZIP 文件（{}）：{e}", src.display()))?;
+    // 没给密码时先探测加密条目：直接给出「请输入密码」，而不是逐条静默跳过
+    if password.is_none() {
+        for i in 0..zip.len() {
+            if let Ok(entry) = zip.by_index_raw(i) {
+                if entry.encrypted() {
+                    return Err("压缩包已加密：请输入密码后重试".to_string());
+                }
+            }
+        }
+    }
+    let mut bad_password = false;
+    for i in 0..zip.len() {
+        let opened = match password {
+            Some(pw) => zip.by_index_decrypt(i, pw.as_bytes()),
+            None => zip.by_index(i),
+        };
+        let mut entry = match opened {
+            Ok(e) => e,
+            Err(zip::result::ZipError::InvalidPassword) => {
+                bad_password = true;
+                continue;
+            }
+            Err(_) => {
+                report.skipped += 1;
+                continue;
+            }
+        };
+        let name = match entry.name() {
+            Ok(n) => n.to_string(),
+            Err(_) => {
+                report.skipped += 1;
+                continue;
+            }
+        };
+        let Some(out) = safe_join(target, Path::new(&name)) else {
+            report.skipped += 1;
+            continue;
+        };
+        if entry.is_dir() {
+            fs::create_dir_all(&out)
+                .map_err(|e| format!("创建目录失败（{}）：{e}", out.display()))?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("创建目录失败（{}）：{e}", parent.display()))?;
+        }
+        if out.exists() {
+            report.overridden += 1;
+        }
+        let mut f =
+            fs::File::create(&out).map_err(|e| format!("写入失败（{}）：{e}", out.display()))?;
+        match std::io::copy(&mut entry, &mut f) {
+            Ok(n) => {
+                report.files += 1;
+                report.bytes += n;
+            }
+            Err(e) => {
+                // ZipCrypto 只有 1/256 概率在打开时校验出错误密码，读取阶段才暴露
+                return Err(if password.is_some() {
+                    format!("解密失败（密码错误或压缩包损坏）：{e}")
+                } else {
+                    format!("读取条目失败（{}）：{e}", out.display())
+                });
+            }
+        }
+    }
+    if bad_password {
+        return Err("密码错误：无法解密压缩包".to_string());
+    }
+    Ok(())
+}
+
+fn extract_7z_entries(
+    src: &Path,
+    target: &Path,
+    password: Option<&str>,
+    report: &mut ExtractReport,
+) -> Result<(), String> {
+    let file = fs::File::open(src).map_err(|e| format!("无法打开 {}：{}", src.display(), e))?;
+    let pw = sevenz_rust2::Password::from(password.unwrap_or(""));
+    let mut reader = sevenz_rust2::ArchiveReader::new(file, pw)
+        .map_err(|e| format!("不是有效的 7Z 文件（{}）：{e}", src.display()))?;
+    let mut fail: Option<String> = None;
+    let walk = reader.for_each_entries(|entry, rd| {
+        if fail.is_some() {
+            return Ok(false);
+        }
+        let raw = entry.name().replace('\\', "/");
+        let Some(out) = safe_join(target, Path::new(&raw)) else {
+            report.skipped += 1;
+            return Ok(true);
+        };
+        if entry.is_directory() {
+            if let Err(e) = fs::create_dir_all(&out) {
+                fail = Some(format!("创建目录失败（{}）：{e}", out.display()));
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+        if let Some(parent) = out.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                fail = Some(format!("创建目录失败（{}）：{e}", parent.display()));
+                return Ok(false);
+            }
+        }
+        if out.exists() {
+            report.overridden += 1;
+        }
+        let mut f = match fs::File::create(&out) {
+            Ok(f) => f,
+            Err(e) => {
+                fail = Some(format!("写入失败（{}）：{e}", out.display()));
+                return Ok(false);
+            }
+        };
+        match std::io::copy(rd, &mut f) {
+            Ok(n) => {
+                report.files += 1;
+                report.bytes += n;
+            }
+            Err(e) => {
+                fail = Some(if password.is_some() {
+                    format!("解密失败（密码错误或压缩包损坏）：{e}")
+                } else {
+                    format!("读取条目失败（{}）：{e}", out.display())
+                });
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    });
+    if let Some(msg) = fail {
+        return Err(msg);
+    }
+    walk.map_err(|e| format!("解压 7Z 失败（密码错误或压缩包损坏？）：{e}"))?;
+    Ok(())
+}
+
+fn extract_tar_stream(
+    reader: Box<dyn Read>,
+    target: &Path,
+    report: &mut ExtractReport,
+) -> Result<(), String> {
+    let mut ar = tar::Archive::new(reader);
+    let entries = ar
+        .entries()
+        .map_err(|e| format!("读取 tar 失败（{}）：{e}", target.display()))?;
+    for entry in entries {
+        let mut entry = match entry {
+            Ok(e) => e,
+            Err(_) => {
+                report.skipped += 1;
+                continue;
+            }
+        };
+        let path = match entry.path() {
+            Ok(p) => p.to_path_buf(),
+            Err(_) => {
+                report.skipped += 1;
+                continue;
+            }
+        };
+        let Some(out) = safe_join(target, &path) else {
+            report.skipped += 1;
+            continue;
+        };
+        let kind = entry.header().entry_type();
+        if kind.is_dir() {
+            fs::create_dir_all(&out)
+                .map_err(|e| format!("创建目录失败（{}）：{e}", out.display()))?;
+            continue;
+        }
+        if !kind.is_file() {
+            // 符号链接 / 硬链接 / 设备节点：跳过（防借链接写到目标目录之外）
+            report.skipped += 1;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("创建目录失败（{}）：{e}", parent.display()))?;
+        }
+        if out.exists() {
+            report.overridden += 1;
+        }
+        let mut f =
+            fs::File::create(&out).map_err(|e| format!("写入失败（{}）：{e}", out.display()))?;
+        let n = std::io::copy(&mut entry, &mut f)
+            .map_err(|e| format!("写入失败（{}）：{e}", out.display()))?;
+        report.files += 1;
+        report.bytes += n;
+    }
+    Ok(())
+}
+
+/// 多格式解压到 `target`（不存在则创建）；`password` 仅 zip / 7z 生效。
+pub fn extract_archive(
+    src: &Path,
+    target: &Path,
+    password: Option<&str>,
+) -> Result<ExtractReport, String> {
+    let format = detect_archive(src)?;
+    if !target.is_dir() {
+        fs::create_dir_all(target).map_err(|e| format!("创建目标目录失败：{e}"))?;
+    }
+    let pw = password.map(|p| p.trim()).filter(|p| !p.is_empty());
+    let mut report = ExtractReport {
+        format: Some(format),
+        ..Default::default()
+    };
+    match format {
+        ArchiveFormat::Zip => extract_zip_entries(src, target, pw, &mut report)?,
+        ArchiveFormat::SevenZip => extract_7z_entries(src, target, pw, &mut report)?,
+        ArchiveFormat::Tar => {
+            let f =
+                fs::File::open(src).map_err(|e| format!("无法打开 {}：{}", src.display(), e))?;
+            extract_tar_stream(Box::new(f), target, &mut report)?;
+        }
+        ArchiveFormat::TarGz
+        | ArchiveFormat::TarBz2
+        | ArchiveFormat::TarXz
+        | ArchiveFormat::TarZst => {
+            let dec = open_decoder(src, format)?;
+            extract_tar_stream(dec, target, &mut report)?;
+        }
+        ArchiveFormat::Gzip | ArchiveFormat::Bzip2 | ArchiveFormat::Xz | ArchiveFormat::Zstd => {
+            if let Some(p) = pw {
+                let _ = p; // 单流压缩格式不支持密码，忽略
+            }
+            let mut dec = open_decoder(src, format)?;
+            let stem = archive_stem(&file_label(src));
+            let out = target.join(if stem.is_empty() {
+                format!("{}.out", file_label(src))
+            } else {
+                stem
+            });
+            if out.exists() {
+                report.overridden += 1;
+            }
+            let mut f =
+                fs::File::create(&out).map_err(|e| format!("写入失败（{}）：{e}", out.display()))?;
+            let n = std::io::copy(&mut dec, &mut f)
+                .map_err(|e| format!("解压失败（{}）：{e}", file_label(src)))?;
+            report.files = 1;
+            report.bytes = n;
+        }
+    }
+    Ok(report)
+}
+
 /// 解压入口（目标为空 = 压缩包所在目录；不存在则创建）。
+///
+/// 兼容旧调用方：只返回（目标目录, 文件数, 字节数）；需要格式/跳过/覆盖统计时用
+/// [`extract_archive`]。
 pub fn extract_entry(src: &Path, target: Option<&Path>) -> Result<(PathBuf, u64, u64), String> {
     let md = fs::metadata(src).map_err(|e| format!("文件不存在：{}（{e}）", src.display()))?;
     if md.is_dir() {
@@ -703,11 +1333,8 @@ pub fn extract_entry(src: &Path, target: Option<&Path>) -> Result<(PathBuf, u64,
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from(".")),
     };
-    if !target.is_dir() {
-        fs::create_dir_all(&target).map_err(|e| format!("创建目标目录失败：{e}"))?;
-    }
-    let (files, bytes) = extract_zip_file(src, &target)?;
-    Ok((target, files, bytes))
+    let report = extract_archive(src, &target, None)?;
+    Ok((target, report.files, report.bytes))
 }
 
 /// 解析八进制权限文本（`755` / `0o755`）。
@@ -877,5 +1504,234 @@ mod tests {
         assert_eq!(fs::read(target.join("a.txt")).unwrap(), b"AAAA");
         assert_eq!(fs::read(target.join("sub/b.txt")).unwrap(), b"BBBBBB");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ————— 分片上传（2026-10-31）—————
+
+    #[test]
+    fn upload_chunks_assemble_and_reject_bad_offset() {
+        let dir = temp_dir("upload");
+        let id = "abcdefgh1234";
+        let p = upload_chunk(&dir, "a.bin", id, 0, 5, b"ab", false).unwrap();
+        assert!(!p.done);
+        assert_eq!(p.received, 2);
+        assert_eq!(upload_received(&dir, id).unwrap(), 2);
+        // offset 与服务端已收字节不一致 → 拒绝（防乱序/重复）
+        assert!(upload_chunk(&dir, "a.bin", id, 0, 5, b"x", false).is_err());
+        // 超出总大小 → 拒绝
+        assert!(upload_chunk(&dir, "a.bin", id, 2, 5, b"cdef", false).is_err());
+        let p = upload_chunk(&dir, "a.bin", id, 2, 5, b"cde", false).unwrap();
+        assert!(p.done);
+        assert_eq!(fs::read(dir.join("a.bin")).unwrap(), b"abcde");
+        // 临时分片已合入目标并被移除
+        assert_eq!(upload_received(&dir, id).unwrap(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upload_respects_overwrite_flag() {
+        let dir = temp_dir("upload-overwrite");
+        fs::write(dir.join("a.bin"), b"old").unwrap();
+        let id = "abcdefgh5678";
+        let err = upload_chunk(&dir, "a.bin", id, 0, 3, b"new", false).unwrap_err();
+        assert!(err.contains("已存在"), "{err}");
+        assert_eq!(fs::read(dir.join("a.bin")).unwrap(), b"old");
+        let p = upload_chunk(&dir, "a.bin", id, 0, 3, b"new", true).unwrap();
+        assert!(p.done);
+        assert_eq!(fs::read(dir.join("a.bin")).unwrap(), b"new");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upload_rejects_bad_id_and_oversize() {
+        let dir = temp_dir("upload-bad");
+        // 会话 id 非法（含路径分隔符 / 过短）→ 拒绝，防写到目录外
+        assert!(upload_chunk(&dir, "a.bin", "../escape", 0, 1, b"x", true).is_err());
+        assert!(upload_chunk(&dir, "a.bin", "short", 0, 1, b"x", true).is_err());
+        // 超过 2GB 上限 → 首片即拒，不白传
+        assert!(upload_chunk(&dir, "a.bin", "abcdefgh1", 0, MAX_UPLOAD_SIZE + 1, b"x", true).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_dir_hides_upload_temp_files() {
+        let dir = temp_dir("upload-hidden");
+        fs::write(dir.join("a.txt"), b"x").unwrap();
+        fs::write(dir.join(format!("{UPLOAD_TMP_PREFIX}abcdefgh.part")), b"x").unwrap();
+        let items = list_dir(&dir).unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ————— 多格式解压（2026-10-31）—————
+
+    fn tar_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (name, data) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_cksum();
+            builder.append_data(&mut header, name, *data).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn detects_and_extracts_tar_gz() {
+        let dir = temp_dir("targz");
+        let tar = tar_bytes(&[("sub/a.txt", b"hello")]);
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&tar).unwrap();
+        let src = dir.join("pkg.tar.gz");
+        fs::write(&src, enc.finish().unwrap()).unwrap();
+        assert_eq!(detect_archive(&src).unwrap(), ArchiveFormat::TarGz);
+        assert_eq!(default_extract_target(&src), dir.join("pkg"));
+        let target = dir.join("out");
+        let report = extract_archive(&src, &target, None).unwrap();
+        assert_eq!(report.files, 1);
+        assert_eq!(report.format, Some(ArchiveFormat::TarGz));
+        assert_eq!(fs::read(target.join("sub/a.txt")).unwrap(), b"hello");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extracts_bare_tar_and_bz2_zst_streams() {
+        let dir = temp_dir("tar-forms");
+        let tar = tar_bytes(&[("x/y.txt", b"0123456789")]);
+        // 裸 tar
+        let bare = dir.join("pkg.tar");
+        fs::write(&bare, &tar).unwrap();
+        assert_eq!(detect_archive(&bare).unwrap(), ArchiveFormat::Tar);
+        let r = extract_archive(&bare, &dir.join("o1"), None).unwrap();
+        assert_eq!(r.files, 1);
+        // tar.bz2
+        let mut bz = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+        bz.write_all(&tar).unwrap();
+        let bz2 = dir.join("pkg.tar.bz2");
+        fs::write(&bz2, bz.finish().unwrap()).unwrap();
+        assert_eq!(detect_archive(&bz2).unwrap(), ArchiveFormat::TarBz2);
+        let r = extract_archive(&bz2, &dir.join("o2"), None).unwrap();
+        assert_eq!(r.files, 1);
+        assert_eq!(fs::read(dir.join("o2/x/y.txt")).unwrap(), b"0123456789");
+        // tar.zst
+        let mut z = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        z.write_all(&tar).unwrap();
+        let zst = dir.join("pkg.tar.zst");
+        fs::write(&zst, z.finish().unwrap()).unwrap();
+        assert_eq!(detect_archive(&zst).unwrap(), ArchiveFormat::TarZst);
+        let r = extract_archive(&zst, &dir.join("o3"), None).unwrap();
+        assert_eq!(r.files, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extracts_single_stream_files() {
+        let dir = temp_dir("single-stream");
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(b"single payload").unwrap();
+        let src = dir.join("note.txt.gz");
+        fs::write(&src, enc.finish().unwrap()).unwrap();
+        // 不是 tar → 识别为单文件 GZ
+        assert_eq!(detect_archive(&src).unwrap(), ArchiveFormat::Gzip);
+        let r = extract_archive(&src, &dir.join("out"), None).unwrap();
+        assert_eq!(r.files, 1);
+        assert_eq!(fs::read(dir.join("out/note.txt")).unwrap(), b"single payload");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extracts_encrypted_zip_with_password() {
+        let dir = temp_dir("zip-aes");
+        let src = dir.join("sec.zip");
+        {
+            let f = fs::File::create(&src).unwrap();
+            let mut w = zip::ZipWriter::new(f);
+            let opt = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .with_aes_encryption(zip::AesMode::Aes256, "s3cret");
+            w.start_file("a.txt", opt).unwrap();
+            w.write_all(b"secret payload").unwrap();
+            w.finish().unwrap();
+        }
+        // 未给密码 → 明确提示需要密码
+        let err = extract_archive(&src, &dir.join("o1"), None).unwrap_err();
+        assert!(err.contains("加密"), "{err}");
+        // 错密码
+        let err = extract_archive(&src, &dir.join("o2"), Some("bad")).unwrap_err();
+        assert!(err.contains("密码"), "{err}");
+        // 正确密码
+        let r = extract_archive(&src, &dir.join("o3"), Some("s3cret")).unwrap();
+        assert_eq!(r.files, 1);
+        assert_eq!(fs::read(dir.join("o3/a.txt")).unwrap(), b"secret payload");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extracts_7z_with_and_without_password() {
+        let dir = temp_dir("sevenz");
+        let inner = dir.join("in");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("a.txt"), b"seven zip payload").unwrap();
+        // 无密码包
+        let plain = dir.join("pkg.7z");
+        sevenz_rust2::compress_to_path(&inner, &plain).unwrap();
+        assert_eq!(detect_archive(&plain).unwrap(), ArchiveFormat::SevenZip);
+        let r = extract_archive(&plain, &dir.join("o1"), None).unwrap();
+        assert_eq!(r.files, 1);
+        // 加密包
+        let locked = dir.join("locked.7z");
+        sevenz_rust2::compress_to_path_encrypted(&inner, &locked, "pw123456".into()).unwrap();
+        let r = extract_archive(&locked, &dir.join("o2"), Some("pw123456")).unwrap();
+        assert_eq!(r.files, 1);
+        let found = dir.join("o2/a.txt");
+        assert_eq!(fs::read(&found).unwrap(), b"seven zip payload");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_traversal_entries_and_rar() {
+        let dir = temp_dir("traversal");
+        // tar crate 自身就拒绝写入含 `..` 的条目（append_data 报错），
+        // 所以这里直接测解压侧的路径闸门：任何 `..` / 绝对路径 / 盘符一律不出目标目录。
+        let base = PathBuf::from("/tmp/target");
+        assert!(safe_join(&base, Path::new("../evil.txt")).is_none());
+        assert!(safe_join(&base, Path::new("a/../../evil")).is_none());
+        assert!(safe_join(&base, Path::new("/etc/passwd")).is_none());
+        assert!(safe_join(&base, Path::new("")).is_none());
+        assert!(safe_join(&base, Path::new("./")).is_none());
+        assert_eq!(
+            safe_join(&base, Path::new("./a/b.txt")).unwrap(),
+            base.join("a").join("b.txt")
+        );
+        #[cfg(windows)]
+        assert!(safe_join(&base, Path::new("C:\\Windows\\x.txt")).is_none());
+        // 正常 tar 仍可解（回归：闸门不能误杀普通条目）
+        let src = dir.join("ok.tar");
+        fs::write(&src, tar_bytes(&[("a/b.txt", b"ok")])).unwrap();
+        let report = extract_archive(&src, &dir.join("out"), None).unwrap();
+        assert_eq!(report.files, 1);
+        assert_eq!(report.skipped, 0);
+        // rar 明确不支持
+        let rar = dir.join("x.rar");
+        fs::write(&rar, b"Rar!\x1a\x07\x00").unwrap();
+        let err = detect_archive(&rar).unwrap_err();
+        assert!(err.contains("RAR"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_extract_target_strips_known_suffixes() {
+        assert_eq!(archive_stem("a.tar.gz"), "a");
+        assert_eq!(archive_stem("a.tgz"), "a");
+        assert_eq!(archive_stem("a.zip"), "a");
+        assert_eq!(archive_stem("a.7z"), "a");
+        assert_eq!(archive_stem("a.txt.gz"), "a.txt");
+        assert_eq!(archive_stem("noext"), "noext");
+        assert_eq!(
+            default_extract_target(Path::new("/tmp/pkg/b.tar.xz")),
+            PathBuf::from("/tmp/pkg/b")
+        );
     }
 }
