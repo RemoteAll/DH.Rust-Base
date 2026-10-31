@@ -29,11 +29,16 @@ pub fn get_i64(value: &Value, key: &str) -> Option<i64> {
     value.get(key).and_then(value_to_i64)
 }
 
-/// 值转整数（字符串也尝试解析）。
+/// 值转整数（字符串也尝试解析；**布尔当 0/1**）。
+///
+/// 布尔分支是为「前端开关直接传 `true/false`」准备的：早前只认数字与字符串，
+/// 调用方拿到的 `None` 会被 `unwrap_or(0)` 静默吞成 0——多单位/多规格这类开关
+/// 于是「界面勾了、库里还是 0」，排查成本很高。
 pub fn value_to_i64(value: &Value) -> Option<i64> {
     match value {
         Value::Number(number) => number.as_i64(),
         Value::String(text) => text.trim().parse().ok(),
+        Value::Bool(flag) => Some(i64::from(*flag)),
         _ => None,
     }
 }
@@ -567,6 +572,10 @@ mod tests {
 
         assert_eq!(value_to_string(&json!(42)).as_deref(), Some("42"));
         assert_eq!(value_to_i64(&json!("7")), Some(7));
+        // 布尔当 0/1：前端开关直传 `true/false` 时不能被静默吞成 0
+        assert_eq!(value_to_i64(&json!(true)), Some(1));
+        assert_eq!(value_to_i64(&json!(false)), Some(0));
+        assert_eq!(get_i64(&value, "flag"), Some(1));
         assert_eq!(value_to_bool(&json!("off")), Some(false));
         assert_eq!(value_to_string(&json!(null)), None);
     }
