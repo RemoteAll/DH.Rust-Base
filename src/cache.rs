@@ -41,14 +41,16 @@ where
     ///
     /// # 参数
     /// - `ttl_secs`：有效期秒数（`0` = 关闭缓存，读写都是空操作）。
-    /// - `max_entries`：容量上限（建议不小于「热数据条数」；内部最小 16）。
+    /// - `max_entries`：容量上限（**`0` = 不限**，按实际负载自然增长，靠 [`TtlCache::purge_expired`]
+    ///   主动回收；非 0 时内部最小 16）。
     ///
     /// # 返回值
     /// 缓存实例。
     pub fn new(ttl_secs: u64, max_entries: usize) -> Self {
         Self {
             ttl: (ttl_secs > 0).then(|| Duration::from_secs(ttl_secs)),
-            max_entries: max_entries.max(16),
+            // `0` 保留为「不限」，不能被 `.max(16)` 吃掉（否则「设 0 = 不限」的调用方会静默变成 16 条）
+            max_entries: if max_entries == 0 { 0 } else { max_entries.max(16) },
             map: Mutex::new(HashMap::new()),
         }
     }
@@ -103,41 +105,7 @@ where
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if guard.len() >= self.max_entries {
-            if let Some(ttl) = self.ttl {
-                guard.retain(|_, (at, _)| at.elapsed() < ttl);
-            }
-            if guard.len() >= self.max_entries {
-                // 按最旧淘汰到上限的 90%：一次只让 10% 的键回源，避免全量失效尖刺。
-                //
-                // **这里在持锁状态下执行**，所以必须廉价：旧实现把「全部 key 克隆进 Vec + 全量排序」
-                // （`guard.iter().map(|(k,(at,_))| (*at, k.clone()))` + `sort_by_key`），
-                // 5 万容量时单次约 5~6 ms；百万设备场景下每 0.3 秒触发一次，
-                // 会周期性制造毫秒级尾延迟尖刺（见审计报告 R6）。
-                //
-                // 现在：① 只收集时间戳（`Instant` 是 Copy，不克隆 key），
-                //       ② `select_nth_unstable` 求第 excess 旧的时间戳（O(n)，不排序），
-                //       ③ `retain` 删除旧于该阈值的最多 `excess` 条。
-                // 全程零 key 克隆，单次从 O(n log n) 降到 O(n)。
-                let target = (self.max_entries * 9 / 10).max(1);
-                let excess = guard.len().saturating_sub(target);
-                if excess > 0 {
-                    let mut ages: Vec<Instant> = guard.values().map(|(at, _)| *at).collect();
-                    let (_, cutoff, _) = ages.select_nth_unstable(excess - 1);
-                    let cutoff = *cutoff;
-                    // 时间戳可能相同：用 `excess` 封顶，避免一次误删过多
-                    let mut removed = 0usize;
-                    guard.retain(|_, (at, _)| {
-                        if removed < excess && *at <= cutoff {
-                            removed += 1;
-                            false
-                        } else {
-                            true
-                        }
-                    });
-                }
-            }
-        }
+        self.make_room(&mut guard);
         guard.insert(key, (Instant::now(), value));
     }
 
@@ -172,6 +140,118 @@ where
     /// 空为 `true`。
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// **已占用条数是否已达上限**（只对固定容量有意义；`max_entries = 0` 时恒为 `false`）。
+    ///
+    /// # 返回值
+    /// 已达上限为 `true`。
+    pub fn is_saturated(&self) -> bool {
+        self.max_entries > 0 && self.len() >= self.max_entries
+    }
+
+    /// 主动清掉已过期的条目（后台定时任务调用）。
+    ///
+    /// `max_entries = 0`（不限容量）时必须靠它回收：否则过期条目永远留在表里，
+    /// 内存会随「写入速率 × 时间」无限增长。
+    ///
+    /// # 返回值
+    /// 实际清掉的条数（关闭缓存时恒为 0）。
+    pub fn purge_expired(&self) -> usize {
+        let Some(ttl) = self.ttl else {
+            return 0;
+        };
+        let mut guard = match self.map.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let before = guard.len();
+        guard.retain(|_, (at, _)| at.elapsed() < ttl);
+        let kept = guard.len();
+        let removed = before - kept;
+        if removed > 0 {
+            // 收缩容量：过期批次删完后表可能只剩零星几条，不收缩会长期占着大块内存
+            guard.shrink_to((kept * 2).max(16));
+        }
+        removed
+    }
+
+    /// 键不存在（或已过期）时插入并返回 `true`；已存在且**未过期**时返回 `false`、不写入。
+    ///
+    /// 专为「去重 / 幂等」场景设计：`get` + `insert` 要**两次加锁 + 两次哈希**，
+    /// 而热路径上常见的写法就是这两个（实测 HlktechIoT 属性上报每点 152.6 ns，
+    /// 合并后 132.9 ns）。本方法只加一次锁、只探测一次。
+    ///
+    /// # 参数
+    /// - `key`：缓存键。
+    ///
+    /// # 返回值
+    /// 本次插入返回 `true`；键已存在且未过期返回 `false`。
+    pub fn insert_if_absent(&self, key: K) -> bool
+    where
+        V: Default,
+    {
+        let Some(ttl) = self.ttl else {
+            return false;
+        };
+        let mut guard = match self.map.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // 单次探测：命中且未过期 → 视为已存在；命中但已过期 → 覆盖写入并视为新插入
+        if let Some((at, _)) = guard.get(&key) {
+            if at.elapsed() < ttl {
+                return false;
+            }
+        }
+        self.make_room(&mut guard);
+        guard.insert(key, (Instant::now(), V::default()));
+        true
+    }
+
+    /// 容量保护（`insert` / `insert_if_absent` 共用，调用方**必须已持锁**）。
+    ///
+    /// # 参数
+    /// - `guard`：已加锁的映射表。
+    fn make_room(&self, guard: &mut HashMap<K, (Instant, V)>) {
+        if self.max_entries == 0 || guard.len() < self.max_entries {
+            return;
+        }
+        if let Some(ttl) = self.ttl {
+            guard.retain(|_, (at, _)| at.elapsed() < ttl);
+        }
+        if guard.len() < self.max_entries {
+            return;
+        }
+        // 按最旧淘汰到上限的 90%：一次只让 10% 的键回源，避免全量失效尖刺。
+        //
+        // **这里在持锁状态下执行**，所以必须廉价：旧实现把「全部 key 克隆进 Vec + 全量排序」
+        // （`guard.iter().map(|(k,(at,_))| (*at, k.clone()))` + `sort_by_key`），
+        // 5 万容量时单次约 5~6 ms；百万设备场景下每 0.3 秒触发一次，
+        // 会周期性制造毫秒级尾延迟尖刺（见审计报告 R6）。
+        //
+        // 现在：① 只收集时间戳（`Instant` 是 Copy，不克隆 key），
+        //       ② `select_nth_unstable` 求第 excess 旧的时间戳（O(n)，不排序），
+        //       ③ `retain` 删除旧于该阈值的最多 `excess` 条。
+        // 全程零 key 克隆，单次从 O(n log n) 降到 O(n)。
+        let target = (self.max_entries * 9 / 10).max(1);
+        let excess = guard.len().saturating_sub(target);
+        if excess == 0 {
+            return;
+        }
+        let mut ages: Vec<Instant> = guard.values().map(|(at, _)| *at).collect();
+        let (_, cutoff, _) = ages.select_nth_unstable(excess - 1);
+        let cutoff = *cutoff;
+        // 时间戳可能相同：用 `excess` 封顶，避免一次误删过多
+        let mut removed = 0usize;
+        guard.retain(|_, (at, _)| {
+            if removed < excess && *at <= cutoff {
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
@@ -278,11 +358,79 @@ mod tests {
 
         // 关闭缓存时同样是空操作（不 panic）
         let off: TtlCache<String, i32> = TtlCache::new(0, 16);
-        off.insert("a".into(), 1);
-        assert_eq!(off.get_str("a"), None);
+        assert_eq!(off.get_str("dev-001"), None);
+        off.remove_str("dev-001");
+        off.insert("x".to_string(), 1);
+        assert_eq!(off.get_str("x"), None);
     }
 
-    /// 超过容量上限时先清过期，再整体清空（不会无限增长）。
+    /// **`max_entries = 0` 表示不限**：按实际负载自然增长，不能被 `.max(16)` 吃掉。
+    ///
+    /// 为什么守这条：口径是「内存管够，按实际量自然占用，只是不要浪费」。
+    /// 若 `0` 被静默当成 16，调用方写 `max = 0`（意为不限）会得到一个 16 条的缓存，
+    /// 表现为「缓存随机失效、查库量暴涨」，且很难看出来。
+    #[test]
+    fn zero_max_entries_means_unlimited() {
+        let cache: TtlCache<u32, u32> = TtlCache::new(600, 0);
+        for i in 0..5_000u32 {
+            cache.insert(i, i);
+        }
+        assert_eq!(cache.len(), 5_000, "0 必须表示不限，不能淘汰到 16 或 90%");
+        assert!(!cache.is_saturated(), "不限容量时永远不算饱和");
+    }
+
+    /// **`insert_if_absent`：一次加锁完成「判重 + 写入」**，语义等同 `get` + `insert`。
+    #[test]
+    fn insert_if_absent_dedups_in_one_pass() {
+        let cache: TtlCache<u64, ()> = TtlCache::new(600, 0);
+        assert!(cache.insert_if_absent(7), "首次应插入");
+        assert!(!cache.insert_if_absent(7), "重复应返回 false 且不覆盖");
+        assert!(cache.insert_if_absent(8), "不同键应插入");
+        assert_eq!(cache.len(), 2);
+
+        // 过期后应重新视为「不存在」
+        let short: TtlCache<u64, ()> = TtlCache::new(1, 0);
+        assert!(short.insert_if_absent(1));
+        {
+            let mut guard = short.map.lock().expect("锁");
+            if let Some(entry) = guard.get_mut(&1) {
+                entry.0 = Instant::now() - Duration::from_secs(5);
+            }
+        }
+        assert!(short.insert_if_absent(1), "过期条目必须视为不存在");
+
+        // 关闭缓存时恒返回 false（不缓存 = 不去重），与 `get`/`insert` 的空操作口径一致
+        let off: TtlCache<u64, ()> = TtlCache::new(0, 0);
+        assert!(!off.insert_if_absent(1));
+    }
+
+    /// **`purge_expired` 主动回收**：`max_entries = 0` 时靠它把内存还回去。
+    #[test]
+    fn purge_expired_reclaims_and_shrinks() {
+        let cache: TtlCache<u32, u32> = TtlCache::new(1, 0);
+        for i in 0..1_000u32 {
+            cache.insert(i, i);
+        }
+        assert_eq!(cache.len(), 1_000);
+        // 尚未过期 → 一条都不该删
+        assert_eq!(cache.purge_expired(), 0);
+        // 全部改成 5 秒前写入 → 应全部回收
+        {
+            let mut guard = cache.map.lock().expect("锁");
+            let old = Instant::now() - Duration::from_secs(5);
+            for entry in guard.values_mut() {
+                entry.0 = old;
+            }
+        }
+        assert_eq!(cache.purge_expired(), 1_000);
+        assert_eq!(cache.len(), 0);
+
+        // 关闭缓存时为 0 且不 panic
+        let off: TtlCache<u32, u32> = TtlCache::new(0, 0);
+        assert_eq!(off.purge_expired(), 0);
+    }
+
+    /// 超过容量上限时先清过期，再渐进淘汰（不会无限增长）。
     #[test]
     fn capacity_is_bounded() {
         let cache: TtlCache<u32, u32> = TtlCache::new(60, 16);
