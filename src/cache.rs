@@ -5,7 +5,9 @@
 //! **一次往返就是整条链路的主要成本**，缓存命中即 0 次往返。
 //!
 //! 设计取舍：
-//! - 只做 TTL + 容量上限，**不做 LRU**（IoT/设备场景 key 数量有界，超限时整体清理更简单可靠）；
+//! - 只做 TTL + 容量上限，**不做 LRU**——但满容时**不是整体清空**，而是「按写入时刻淘汰最旧的到上限的 90%」，
+//!   一次只让 10% 的键回源（详见 [`TtlCache::insert`]）；
+//! - 淘汰时**不克隆 key、不全量排序**：只收集时间戳（`Copy`）求阈值，再限量删除；
 //! - 值按 `Clone` 返回（元数据结构小），避免与锁生命周期纠缠；
 //! - `ttl_secs = 0` 时退化为「不缓存」，调用方无需分支。
 //!
@@ -24,7 +26,7 @@ use std::time::{Duration, Instant};
 pub struct TtlCache<K, V> {
     /// 有效期（`None` = 不缓存）。
     ttl: Option<Duration>,
-    /// 容量上限（超过后先清过期、再整体清空）。
+    /// 容量上限（超过时先清过期，仍超限则**按写入时刻淘汰最旧的到 90%**）。
     max_entries: usize,
     /// 缓存内容：key → (写入时刻, 值)。
     map: Mutex<HashMap<K, (Instant, V)>>,
@@ -106,16 +108,33 @@ where
                 guard.retain(|_, (at, _)| at.elapsed() < ttl);
             }
             if guard.len() >= self.max_entries {
-                // 按最旧淘汰到上限的 90%：一次只让 10% 的键回源，避免全量失效尖刺
+                // 按最旧淘汰到上限的 90%：一次只让 10% 的键回源，避免全量失效尖刺。
+                //
+                // **这里在持锁状态下执行**，所以必须廉价：旧实现把「全部 key 克隆进 Vec + 全量排序」
+                // （`guard.iter().map(|(k,(at,_))| (*at, k.clone()))` + `sort_by_key`），
+                // 5 万容量时单次约 5~6 ms；百万设备场景下每 0.3 秒触发一次，
+                // 会周期性制造毫秒级尾延迟尖刺（见审计报告 R6）。
+                //
+                // 现在：① 只收集时间戳（`Instant` 是 Copy，不克隆 key），
+                //       ② `select_nth_unstable` 求第 excess 旧的时间戳（O(n)，不排序），
+                //       ③ `retain` 删除旧于该阈值的最多 `excess` 条。
+                // 全程零 key 克隆，单次从 O(n log n) 降到 O(n)。
                 let target = (self.max_entries * 9 / 10).max(1);
                 let excess = guard.len().saturating_sub(target);
-                let mut ages: Vec<(Instant, K)> = guard
-                    .iter()
-                    .map(|(k, (at, _))| (*at, k.clone()))
-                    .collect();
-                ages.sort_by_key(|(at, _)| *at);
-                for (_, k) in ages.into_iter().take(excess) {
-                    guard.remove(&k);
+                if excess > 0 {
+                    let mut ages: Vec<Instant> = guard.values().map(|(at, _)| *at).collect();
+                    let (_, cutoff, _) = ages.select_nth_unstable(excess - 1);
+                    let cutoff = *cutoff;
+                    // 时间戳可能相同：用 `excess` 封顶，避免一次误删过多
+                    let mut removed = 0usize;
+                    guard.retain(|_, (at, _)| {
+                        if removed < excess && *at <= cutoff {
+                            removed += 1;
+                            false
+                        } else {
+                            true
+                        }
+                    });
                 }
             }
         }
