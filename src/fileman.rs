@@ -27,6 +27,13 @@ pub const MAX_EDIT_SIZE: u64 = 10 * 1024 * 1024;
 pub const MAX_DOWNLOAD_SIZE: u64 = 256 * 1024 * 1024;
 /// 批量操作（删除/复制/移动/压缩）单次条目上限。
 pub const MAX_BATCH: usize = 100;
+/// 面板批量操作的单次条目上限（面板勾选动辄上百项，故比 [`MAX_BATCH`] 宽松；
+/// 前端还会按 500 一批分批提交，超大选择也不会被拒）。
+pub const MAX_PANEL_BATCH: usize = 5_000;
+/// 批量建目录的单次上限（拖拽整棵文件夹树时一次补齐）。
+pub const MAX_FOLDER_DIRS: usize = 2_000;
+/// 断点续传下载的单次分片示意上限（前端 8MB/片；仅用于文档与冒烟核对）。
+pub const RESUME_CHUNK_HINT: u64 = 8 * 1024 * 1024;
 /// 单文件上传上限（2GB；分片上传——服务端只按片接收，内存不随文件大小增长）。
 pub const MAX_UPLOAD_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 /// 分片上传的临时文件前缀（目录列表隐藏；`upload_abort` / 空闲清理按此前缀识别）。
@@ -440,16 +447,18 @@ pub fn transfer_many(paths: &[PathBuf], target: &Path, copy: bool) -> Result<(u6
         if !p.exists() && fs::symlink_metadata(p).is_err() {
             return Err(format!("不存在：{}", p.display()));
         }
-        if p.starts_with(target) {
+        let dst = target.join(file_label(p));
+        // 先判「粘贴到源目录本身」：`p.starts_with(target)` 会把「粘贴到同目录/上级」
+        // 统统误报成「目标在选中项内部」，所以顺序不能颠倒。
+        if dst == *p {
+            return Err("目标目录与源目录相同，无需粘贴".to_string());
+        }
+        if target.starts_with(p) {
             return Err(if copy {
                 "目标目录在选中项内部，无法复制".to_string()
             } else {
                 "目标目录在选中项内部，无法移动".to_string()
             });
-        }
-        let dst = target.join(file_label(p));
-        if dst == *p {
-            return Err("目标与源相同".to_string());
         }
         if dst.exists() {
             return Err(format!("目标已存在：{}", dst.display()));
@@ -477,6 +486,67 @@ pub fn transfer_many(paths: &[PathBuf], target: &Path, copy: bool) -> Result<(u6
         }
     }
     Ok((files, bytes))
+}
+
+/// 批量建目录（`rels` 相对 `parent`，可多段，`/` 与 `\` 均作分隔符；已存在视为成功）。
+///
+/// 面向「拖拽整棵文件夹树」：前端把每个目录的相对路径一次送来，服务端逐段校验后落盘。
+/// 返回实际处理（含已存在）的目录数。
+pub fn create_dirs(parent: &Path, rels: &[String]) -> Result<u64, String> {
+    if !parent.is_dir() {
+        return Err(format!("目录不存在：{}", parent.display()));
+    }
+    if rels.len() > MAX_FOLDER_DIRS {
+        return Err(format!("单次最多创建 {MAX_FOLDER_DIRS} 个目录"));
+    }
+    let mut created = 0u64;
+    for rel in rels {
+        let mut dst = parent.to_path_buf();
+        let mut has_segment = false;
+        for seg in rel.split(['/', '\\']) {
+            let seg = seg.trim();
+            if seg.is_empty() {
+                continue;
+            }
+            // 盘符 / NTFS 备用数据流（`C:`、`a:stream`）会让 push 跳出根目录，必须先拦
+            if seg.contains(':') {
+                return Err("目录名不能包含冒号".to_string());
+            }
+            validate_name(seg)?;
+            dst.push(seg);
+            has_segment = true;
+        }
+        if !has_segment {
+            continue;
+        }
+        fs::create_dir_all(&dst)
+            .map_err(|e| format!("创建目录失败（{}）：{e}", dst.display()))?;
+        created += 1;
+    }
+    Ok(created)
+}
+
+/// 目录内同名预检：返回 `names` 中已存在的名字（非法名字直接略过）。
+pub fn existing_in(dir: &Path, names: &[String]) -> Vec<String> {
+    let mut existing = Vec::new();
+    for name in names {
+        let name = name.trim();
+        if validate_name(name).is_ok() && dir.join(name).exists() {
+            existing.push(name.to_string());
+        }
+    }
+    existing
+}
+
+/// 批量路径存在性预检：返回 `paths` 中仍然存在的原始输入（文件夹上传覆盖确认用）。
+pub fn existing_paths(base: &Path, paths: &[String]) -> Vec<String> {
+    let mut existing = Vec::new();
+    for text in paths {
+        if resolve_path(base, text).map(|p| p.exists()).unwrap_or(false) {
+            existing.push(text.clone());
+        }
+    }
+    existing
 }
 
 /// 保存上传内容（先写临时文件再原子替换，覆盖同名文件）。
@@ -564,6 +634,114 @@ pub fn content_disposition(name: &str) -> String {
         ascii,
         percent_encode(name)
     )
+}
+
+// ————— 下载：Range 断点续传 —————
+
+/// `Range` 头解析结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteRange {
+    /// 没有 `Range`（或不支持的多区间/未知单位，按整文件处理）
+    None,
+    /// 有效区间（含首尾字节）
+    Valid(u64, u64),
+    /// 区间越界 → 416
+    Unsatisfiable,
+}
+
+impl ByteRange {
+    /// 需要读取的字节数（`None` 由调用方按整文件处理）。
+    pub fn len(&self, total: u64) -> u64 {
+        match self {
+            ByteRange::Valid(start, end) => end - start + 1,
+            _ => total,
+        }
+    }
+}
+
+/// 解析单区间 `Range: bytes=start-end | start- | -suffix`。
+///
+/// 多区间（含 `,`）、未知单位一律按「无 Range」处理（返回整文件），
+/// 这样下载器/浏览器都能正常工作，只是不享受分段收益。
+pub fn parse_byte_range(header: Option<&str>, total: u64) -> ByteRange {
+    let Some(raw) = header else {
+        return ByteRange::None;
+    };
+    let raw = raw.trim();
+    let Some((unit, spec)) = raw.split_once('=') else {
+        return ByteRange::None;
+    };
+    if !unit.trim().eq_ignore_ascii_case("bytes") {
+        return ByteRange::None;
+    }
+    let spec = spec.trim();
+    if spec.contains(',') {
+        return ByteRange::None;
+    }
+    let Some((head, tail)) = spec.split_once('-') else {
+        return ByteRange::None;
+    };
+    let (head, tail) = (head.trim(), tail.trim());
+    if head.is_empty() {
+        // `-N`：最后 N 字节
+        let Ok(n) = tail.parse::<u64>() else {
+            return ByteRange::None;
+        };
+        if n == 0 || total == 0 {
+            return ByteRange::Unsatisfiable;
+        }
+        return ByteRange::Valid(total.saturating_sub(n), total - 1);
+    }
+    let Ok(start) = head.parse::<u64>() else {
+        return ByteRange::None;
+    };
+    if start >= total {
+        return ByteRange::Unsatisfiable;
+    }
+    let end = if tail.is_empty() {
+        total - 1
+    } else {
+        match tail.parse::<u64>() {
+            Ok(v) => v.min(total - 1),
+            Err(_) => return ByteRange::None,
+        }
+    };
+    if end < start {
+        return ByteRange::Unsatisfiable;
+    }
+    ByteRange::Valid(start, end)
+}
+
+/// 只读取指定区间（不整文件进内存；`len` 由调用方限制在 [`MAX_DOWNLOAD_SIZE`] 内）。
+pub fn read_range(path: &Path, start: u64, len: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Seek, SeekFrom};
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut file = fs::File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut buf = vec![0u8; len as usize];
+    file.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// 下载用的强校验标识（长度 + 修改时间纳秒），配合 `If-Range` 判断源文件是否已变。
+pub fn file_etag(md: &fs::Metadata) -> String {
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("\"{:x}-{:x}\"", md.len(), mtime)
+}
+
+/// 解析 `If-Range` 并判断续传前提是否成立（`None`/非 ETag → 视为成立）。
+pub fn if_range_matches(header: Option<&str>, etag: &str) -> bool {
+    match header.map(str::trim) {
+        Some(sent) if sent.starts_with('"') => sent == etag,
+        _ => true,
+    }
 }
 
 // ————— ZIP 压缩 / 解压 —————
@@ -1733,5 +1911,105 @@ mod tests {
             default_extract_target(Path::new("/tmp/pkg/b.tar.xz")),
             PathBuf::from("/tmp/pkg/b")
         );
+    }
+
+    #[test]
+    fn parses_single_byte_ranges() {
+        assert_eq!(parse_byte_range(None, 100), ByteRange::None);
+        assert_eq!(parse_byte_range(Some("bytes=0-9"), 100), ByteRange::Valid(0, 9));
+        assert_eq!(parse_byte_range(Some("bytes=90-"), 100), ByteRange::Valid(90, 99));
+        assert_eq!(parse_byte_range(Some("bytes=-10"), 100), ByteRange::Valid(90, 99));
+        // 尾部超界自动收敛到文件末尾
+        assert_eq!(parse_byte_range(Some("bytes=90-999"), 100), ByteRange::Valid(90, 99));
+        // 越界/空区间 → 416
+        assert_eq!(parse_byte_range(Some("bytes=100-"), 100), ByteRange::Unsatisfiable);
+        assert_eq!(parse_byte_range(Some("bytes=-0"), 100), ByteRange::Unsatisfiable);
+        // 多区间/未知单位/语法错误 → 按整文件
+        assert_eq!(parse_byte_range(Some("bytes=0-1,3-4"), 100), ByteRange::None);
+        assert_eq!(parse_byte_range(Some("items=0-1"), 100), ByteRange::None);
+        assert_eq!(parse_byte_range(Some("bytes=abc"), 100), ByteRange::None);
+        assert_eq!(ByteRange::Valid(90, 99).len(100), 10);
+        assert_eq!(ByteRange::None.len(100), 100);
+    }
+
+    #[test]
+    fn reads_only_requested_range() {
+        let dir = temp_dir("range");
+        let file = dir.join("big.bin");
+        let data: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        fs::write(&file, &data).unwrap();
+        let md = fs::metadata(&file).unwrap();
+        assert!(file_etag(&md).starts_with('"'), "ETag 必须带引号");
+        assert!(if_range_matches(Some(&file_etag(&md)), &file_etag(&md)));
+        assert!(!if_range_matches(Some("\"stale\""), &file_etag(&md)));
+        assert!(if_range_matches(None, &file_etag(&md)));
+        let slice = read_range(&file, 1000, 512).unwrap();
+        assert_eq!(slice.len(), 512);
+        assert_eq!(slice, &data[1000..1512]);
+        assert!(read_range(&file, 0, 0).unwrap().is_empty());
+        assert!(read_range(&file, 4000, 512).is_err(), "越界读取必须报错");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn creates_nested_directories_and_rejects_traversal() {
+        let dir = temp_dir("mkdirs");
+        let rels = vec![
+            "a/b/c".to_string(),
+            "a\\b\\d".to_string(),
+            "".to_string(),
+            "docs".to_string(),
+        ];
+        assert_eq!(create_dirs(&dir, &rels).unwrap(), 3);
+        assert!(dir.join("a/b/c").is_dir());
+        assert!(dir.join("a/b/d").is_dir());
+        assert!(dir.join("docs").is_dir());
+        // 重复创建视为成功
+        assert_eq!(create_dirs(&dir, &rels).unwrap(), 3);
+        // 盘符 / 数据流名必须拦住（否则 push 会跑出根目录）
+        assert!(create_dirs(&dir, &["C:/Windows".to_string()]).is_err());
+        assert!(create_dirs(&dir, &["a:stream".to_string()]).is_err());
+        assert!(create_dirs(&dir, &["ok/../../x".to_string()]).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transfer_to_same_or_parent_directory_is_not_a_loop() {
+        let dir = temp_dir("transfer-cases");
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(dir.join("a.txt"), b"1").unwrap();
+        fs::write(sub.join("b.txt"), b"2").unwrap();
+        // 粘贴到源目录本身
+        let err = transfer_many(&[dir.join("a.txt")], &dir, true).unwrap_err();
+        assert!(err.contains("相同"), "{err}");
+        // 粘贴到上级（目标不在选中项内部）
+        fs::create_dir_all(dir.join("up")).unwrap();
+        let (files, bytes) = transfer_many(&[sub.clone()], &dir.join("up"), true).unwrap();
+        assert_eq!((files, bytes), (1, 1));
+        assert!(dir.join("up/sub/b.txt").is_file());
+        // 真正的自嵌套仍要拦
+        let err = transfer_many(&[dir.join("up")], &dir.join("up"), true).unwrap_err();
+        assert!(err.contains("相同") || err.contains("内部"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checks_existing_names_and_paths() {
+        let dir = temp_dir("check");
+        fs::write(dir.join("hit.txt"), b"1").unwrap();
+        let names = vec![
+            "hit.txt".to_string(),
+            "miss.txt".to_string(),
+            "../evil".to_string(),
+        ];
+        assert_eq!(existing_in(&dir, &names), vec!["hit.txt".to_string()]);
+        let base = dir.clone();
+        let paths = vec![
+            dir.join("hit.txt").display().to_string(),
+            dir.join("nope").display().to_string(),
+        ];
+        assert_eq!(existing_paths(&base, &paths).len(), 1);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

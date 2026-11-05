@@ -48,3 +48,4 @@ pub mod dingtalk; // 钉钉群机器人（Webhook 推送：text/markdown；支�
 
 #[cfg(feature = "http-client")]
 pub mod wecom; // 企业微信机器人（Webhook 推送：文本/Markdown/Markdown V2；对应 C# Pek.WebHook 的 WeChatWorkRobot）
+pub mod assets; // Web 面板共享前端资产（fileman 传输内核 JS；Pek.RAgent 与 Pek.RPanlServer 共用）
