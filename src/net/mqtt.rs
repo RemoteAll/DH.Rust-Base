@@ -449,9 +449,17 @@ async fn session(
         Some(t)
     };
 
+    // 等待 PUBACK 的发布（packet id → 结果回调）
+    let mut pending: HashMap<u16, oneshot::Sender<Result<(), String>>> = HashMap::new();
+    // 等待 SUBACK 的订阅（packet id → 主题过滤器）：订阅被拒时日志要能说出是哪个主题
+    let mut pending_subacks: HashMap<u16, String> = HashMap::new();
+    // 本次连接内已告警过的失败主题（重连后重新告警：重连往往伴随 broker 配置变更）
+    let mut rejected_subs: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     // 连接（或重连）成功：全量恢复订阅（服务端 Clean Session 不保留订阅关系）
     for (topic, qos) in subs.iter() {
         let id = next_packet_id();
+        pending_subacks.insert(id, topic.clone());
         if wr
             .write_all(&codec::encode_subscribe(id, topic, *qos, opts.version))
             .await
@@ -460,9 +468,6 @@ async fn session(
             return;
         }
     }
-
-    // 等待 PUBACK 的发布（packet id → 结果回调）
-    let mut pending: HashMap<u16, oneshot::Sender<Result<(), String>>> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -488,6 +493,7 @@ async fn session(
                     if !subs.iter().any(|(t, _)| t == &topic) {
                         subs.push((topic.clone(), qos));
                         let id = next_packet_id();
+                        pending_subacks.insert(id, topic.clone());
                         if wr.write_all(&codec::encode_subscribe(id, &topic, qos, opts.version)).await.is_err() {
                             break;
                         }
@@ -503,7 +509,29 @@ async fn session(
                             }
                         }
                     }
-                    codec::SUBACK => {} // 订阅确认（无需处理）
+                    codec::SUBACK => {
+                        // 订阅确认**必须看返回码**：被 broker 的订阅 ACL / 插件拒绝时，服务端照样回
+                        // SUBACK（3.1.1 为 0x80，5.0 为 0x80 以上的原因码）。旧实现直接忽略，
+                        // 调用方只看到"已订阅"，之后一条消息都收不到且没有任何提示（2026-11-06 现场）。
+                        if let Some((id, codes)) = codec::parse_suback(&data, opts.version) {
+                            if let Some(topic) = pending_subacks.remove(&id) {
+                                if let Some(code) = codes.iter().copied().find(|c| *c >= 0x80) {
+                                    if rejected_subs.insert(topic.clone()) {
+                                        log::warn!(
+                                            "MQTT 订阅被拒绝（{}:{}）：{topic} ← SUBACK 返回码 {code:#04x}；\
+                                             该主题将收不到任何消息。常见原因：broker 订阅 ACL 拒绝\
+                                             （设备/APP 禁通配符、只允许订阅自己的主题）、共享订阅插件未启用、\
+                                             主题前缀与账号身份不符",
+                                            opts.host,
+                                            opts.port
+                                        );
+                                    }
+                                } else if let Some(code) = codes.first() {
+                                    log::debug!("MQTT 订阅已确认（{topic}）：返回码 {code:#04x}");
+                                }
+                            }
+                        }
+                    }
                     codec::PINGRESP => {}
                     codec::PUBLISH => {
                         // 订阅下发的发布消息：QoS1 回 PUBACK、QoS2 防御性回 PUBREC；随后广播给应用层
@@ -708,6 +736,26 @@ pub(crate) mod codec {
     /// 解析 PUBACK 的报文 id。
     pub fn parse_puback(data: &[u8]) -> Option<u16> {
         (data.len() >= 2).then(|| u16::from_be_bytes([data[0], data[1]]))
+    }
+
+    /// 解析 SUBACK：返回（报文 id, 每个主题过滤器的返回码）。
+    ///
+    /// - 3.1.1：`id(2) + 返回码…`（每个过滤器 1 字节，`0x80` = 失败/未授权）；
+    /// - 5.0：`id(2) + 属性长度(varint) + 属性 + 原因码…`（本客户端不发属性，属性长度恒 0）。
+    pub fn parse_suback(data: &[u8], version: MqttVersion) -> Option<(u16, Vec<u8>)> {
+        if data.len() < 2 {
+            return None;
+        }
+        let id = u16::from_be_bytes([data[0], data[1]]);
+        let mut pos = 2usize;
+        if version.has_properties() {
+            let (plen, used) = decode_variable_len(&data[pos..])?;
+            pos += used + plen;
+        }
+        if pos > data.len() {
+            return None;
+        }
+        Some((id, data[pos..].to_vec()))
     }
 
     /// 变长整数解码：返回（值, 占用字节数）。
@@ -1164,6 +1212,28 @@ mod tests {
             codec::encode_ack(codec::PUBCOMP, 9),
             vec![0x70, 0x02, 0x00, 0x09]
         );
+    }
+
+    /// SUBACK 解析：3.1.1 与 5.0 两种报文都要能取到 id 与返回码。
+    ///
+    /// 回归点：旧实现把 SUBACK 整个忽略，订阅被拒（0x80）时调用方毫无感知，
+    /// 现场表现为"日志说已订阅，但一条消息都收不到"。
+    #[test]
+    fn parse_suback_v311_and_v500() {
+        let (id, codes) = codec::parse_suback(&[0x00, 0x07, 0x01], MqttVersion::V311).unwrap();
+        assert_eq!(id, 7);
+        assert_eq!(codes, vec![0x01]);
+
+        let (id, codes) = codec::parse_suback(&[0x00, 0x09, 0x80], MqttVersion::V311).unwrap();
+        assert_eq!(id, 9);
+        assert_eq!(codes.first().copied(), Some(0x80));
+
+        // 5.0：id + 属性长度 0 + 原因码 0x87（未授权）
+        let (id, codes) = codec::parse_suback(&[0x00, 0x0B, 0x00, 0x87], MqttVersion::V500).unwrap();
+        assert_eq!(id, 11);
+        assert_eq!(codes, vec![0x87]);
+
+        assert!(codec::parse_suback(&[0x00], MqttVersion::V311).is_none());
     }
 
     #[test]

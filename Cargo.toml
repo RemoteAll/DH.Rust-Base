@@ -159,7 +159,8 @@ term = ["dep:portable-pty"]
 stun = ["dep:tokio"]
 # MQTT 客户端（MQTT 3.1.1：连接认证 / QoS0·1 发布 / 保活 / 断线重连；
 # tcp-scanner-server 对接 WMSMqttServer 现场收编）
-mqtt = ["dep:tokio"]
+# 含 `dep:log`：订阅被拒（SUBACK 0x80 / v5 原因码）必须能打 warn，否则消费方只看到"已订阅"
+mqtt = ["dep:tokio", "dep:log"]
 # HTTP 客户端（hyper 连接层 + tokio；tcp-scanner-server 等“仅需 client”的消费方使用）
 http-client = ["dep:tokio", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 # HTTPS 客户端 TLS（在 http-client 之上追加；不打 WS/服务端证书工具——企业微信推送等 config 驱动场景）
