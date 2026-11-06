@@ -1,128 +1,155 @@
-/* 文件管理：面板共享样式（与 web/fm-transport.js 生成的 DOM 对应）。
+/* 文件管理：面板共享样式（与 web/fm-transport.js 生成的 DOM 一一对应）。
  *
- * 面板按需整段引入；类名固定为 .fm-jobs*（传输任务面板）与 .fm-clip*（剪贴板提示条），
- * 颜色变量优先取面板自己的主题（--brand/--border/--muted），缺失时用兜底色。
+ * 设计原则：**结构写在这里，配色交给面板主题**——每个块先声明一组 `--fm-*` 变量，
+ * 值优先取面板既有的主题变量（RAgent 深色：--surface-2/--brand-500/--text-muted；
+ * 平台浅色：--card/--brand/--muted），取不到时用中性兜底色。
+ * 因此同一份 CSS 在浅色/深色面板里都成立，面板不必再各写一份。
+ *
+ * 引入方式：面板内嵌 `dhrust::assets::FM_TRANSPORT_CSS`，在自有样式**之前**加载
+ * （`<link rel="stylesheet" href="/assets/fm-transport.css">`），自有样式仍可覆盖。
  */
 
-/* 传输任务面板（右下角浮层） */
+/* ── 传输任务面板（右下角浮层） ── */
 .fm-jobs {
+  --fm-bg: var(--surface-2, var(--card, #fff));
+  --fm-fg: var(--text-primary, #111827);
+  --fm-border: var(--border-default, var(--border, #e5e7eb));
+  --fm-brand: var(--brand-500, var(--brand, #4f46e5));
+  --fm-muted: var(--text-muted, var(--muted, #6b7280));
+  --fm-track: var(--surface-3, #e5e7eb);
   position: fixed;
   right: 16px;
   bottom: 16px;
   width: 330px;
+  max-width: calc(100vw - 32px);
   max-height: 52vh;
   overflow: auto;
-  background: #fff;
-  border: 1px solid var(--border, #e5e7eb);
+  background: var(--fm-bg);
+  color: var(--fm-fg);
+  border: 1px solid var(--fm-border);
   border-radius: 10px;
   box-shadow: 0 8px 28px rgba(15, 23, 42, .18);
   font-size: 12px;
-  z-index: 60;
+  z-index: 900;
 }
 .fm-jobs-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 7px 10px;
-  border-bottom: 1px solid var(--border, #e5e7eb);
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--fm-border);
   font-weight: 600;
   position: sticky;
   top: 0;
-  background: #fff;
+  background: var(--fm-bg);
 }
 .fm-jobs-head button {
   background: transparent;
-  color: var(--muted, #6b7280);
+  border: 0;
+  color: var(--fm-muted);
   padding: 0 4px;
   font-size: 13px;
-  border: 0;
+  line-height: 1.2;
   cursor: pointer;
 }
-.fm-job { padding: 7px 10px; border-bottom: 1px solid #f1f5f9; }
+.fm-job { padding: 8px 10px; border-bottom: 1px solid var(--fm-border); }
 .fm-job:last-child { border-bottom: 0; }
 .fm-job-title {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: #111827;
+  margin-bottom: 5px;
+  color: var(--fm-fg);
 }
 .fm-job-bar {
   height: 5px;
-  background: #e5e7eb;
-  border-radius: 999px;
+  border-radius: 3px;
+  background: var(--fm-track);
   overflow: hidden;
-  margin: 4px 0;
 }
 .fm-job-bar i {
   display: block;
   height: 100%;
-  background: var(--brand, #4f46e5);
   width: 0;
+  background: var(--fm-brand);
+  transition: width .2s linear;
 }
 .fm-job-meta {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  color: var(--muted, #6b7280);
+  margin-top: 5px;
+  color: var(--fm-muted);
+  font-size: 11px;
 }
-.fm-job-meta span:first-child {
+.fm-job-meta > span:first-child {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .fm-job-meta button {
   background: transparent;
-  color: var(--brand, #4f46e5);
-  padding: 0 4px;
-  font-size: 12px;
   border: 0;
+  color: var(--fm-brand);
+  padding: 0 4px;
+  font-size: 11px;
   cursor: pointer;
 }
+.fm-job-meta button:hover { text-decoration: underline; }
 
-/* 剪贴板提示条 */
+/* ── 剪贴板提示条 ── */
 .fm-clip {
+  --fm-brand: var(--brand-500, var(--brand, #4f46e5));
+  --fm-fg: var(--text-primary, #111827);
+  --fm-muted: var(--text-muted, var(--muted, #6b7280));
+  --fm-clip-bg: rgba(99, 102, 241, .10);
+  --fm-clip-border: rgba(99, 102, 241, .35);
   display: flex;
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  background: #eef2ff;
-  border: 1px solid #c7d2fe;
-  border-radius: 8px;
+  margin: 6px 0;
   padding: 6px 10px;
   font-size: 12px;
-  margin: 6px 0;
+  border: 1px dashed var(--fm-clip-border);
+  border-radius: 8px;
+  background: var(--fm-clip-bg);
+  color: var(--fm-fg);
 }
-.fm-clip .badge2 {
-  background: var(--brand, #4f46e5);
-  color: #fff;
-  border-radius: 999px;
-  padding: 1px 9px;
-}
-.fm-clip .src {
-  color: #374151;
-  max-width: 46vw;
+.fm-clip[hidden] { display: none !important; }
+.fm-clip-badge { font-weight: 600; color: var(--fm-brand); }
+.fm-clip-count { color: var(--fm-fg); }
+.fm-clip-src {
+  flex: 1;
+  min-width: 120px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--fm-muted);
 }
-.fm-clip button {
+.fm-clip-tip { color: var(--fm-muted); }
+.fm-clip-clear {
   padding: 2px 8px;
   font-size: 12px;
-  background: #fff;
-  color: var(--brand, #4f46e5);
-  border: 1px solid #c7d2fe;
+  background: transparent;
+  color: var(--fm-brand);
+  border: 1px solid var(--fm-clip-border);
   border-radius: 6px;
   cursor: pointer;
 }
+.fm-clip-clear:hover { background: var(--fm-clip-bg); }
 
-/* 拖拽上传高亮（卡片 / 目录行） */
-.fm-drop-active {
-  outline: 2px dashed var(--brand, #4f46e5);
+/* ── 拖拽上传高亮（整卡 / 目录行） ── */
+.fm-drop-active,
+.card.fm-drop-active {
+  outline: 2px dashed var(--brand-500, var(--brand, #4f46e5));
   outline-offset: 2px;
-  background: rgba(79, 70, 229, .05);
+  background: rgba(99, 102, 241, .06);
 }
-.fm-drop-row > td {
-  background: rgba(79, 70, 229, .08);
-  box-shadow: inset 0 0 0 1px var(--brand, #4f46e5);
+.fm-drop-row > td,
+tr.fm-drop-row {
+  background: rgba(99, 102, 241, .08);
+  box-shadow: inset 0 0 0 1px var(--brand-500, var(--brand, #4f46e5));
 }

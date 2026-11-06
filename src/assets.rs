@@ -28,7 +28,8 @@ mod tests {
     fn shared_assets_are_embedded_and_non_empty() {
         let js = super::FM_TRANSPORT_JS;
         assert!(js.len() > 5000, "传输内核 JS 太小，可能 include 路径失效");
-        assert!(js.contains("global.FmClient = {"), "必须导出 FmClient");
+        assert!(js.contains("root.FmClient = {"), "必须导出 FmClient");
+        assert!(js.contains("VERSION:"), "缺少版本号（多平台接入需可辨识版本）");
         // 关键能力缺一个都算回归
         for needle in [
             "uploadChunked",
@@ -37,11 +38,21 @@ mod tests {
             "postPathsChunked",
             "walkEntry",
             "clipLoad",
+            "clipHtml",
+            "clipRender",
+            "globalThis",
+            "store()",
         ] {
             assert!(js.contains(needle), "缺少能力：{needle}");
         }
         let css = super::FM_TRANSPORT_CSS;
-        assert!(css.contains(".fm-jobs"), "传输任务面板样式缺失");
-        assert!(css.contains(".fm-clip"), "剪贴板提示条样式缺失");
+        for needle in [
+            ".fm-jobs", ".fm-job-bar", ".fm-clip", ".fm-clip-badge", ".fm-clip-src",
+            ".fm-clip-clear", ".fm-drop-active", ".fm-drop-row",
+        ] {
+            assert!(css.contains(needle), "缺少样式：{needle}");
+        }
+        // 配色必须走 CSS 变量（同一份样式要能适配浅色/深色面板）
+        assert!(css.contains("var(--fm-brand)"), "配色未变量化");
     }
 }

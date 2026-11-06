@@ -3,19 +3,35 @@
  * Pek.RAgent（web/app.js）与 Pek.RPanlServer（web/index.html）共用这一份实现——
  * 服务端两边都走 `dhrust::fileman`，协议必须一致，逻辑就别抄两遍。
  *
- * 各面板只提供「外壳」（DOM 表格、按钮、样式与鉴权方式），通过 FmClient.configure 注入：
- *   endpoints  接口路径（默认 = RAgent 的 /star/*；平台传 /api/*）
- *   api        JSON 请求函数（沿用各自封装的 api()，负责 401/428 等语义）
- *   token      会话令牌（内联 XHR / fetch 走 Authorization 头时用）
- *   onAuthFail 登录失效回调
- *   join/joinRel 路径拼接（Windows 反斜杠 / Unix 斜杠规则由面板决定）
+ * 设计约束：**不假设宿主是某个特定面板**，第三方面板（多平台/多项目）也能直接接入：
+ *   - 只依赖 `globalThis` / `document` / `XMLHttpRequest` / `fetch` / `Blob` / `URL`，无框架、无构建；
+ *   - 所有路径、文案、鉴权、存储都通过 `configure()` 注入，源码里不出现任何面板专有的 id/函数名；
+ *   - 注入项缺省时都有安全回退（内存存储、简易提示、自动判断路径分隔符）；
+ *   - 同一页面重复加载本文件不会报错（幂等定义 `globalThis.FmClient`）；
+ *   - 打包器（Vite/webpack/ESBuild）场景：`import './fm-transport.js'` 只为触发挂载，
+ *     之后用 `globalThis.FmClient`；CommonJS 下 `require('./fm-transport.js')` 直接返回实例；
+ *   - 桌面端（Tauri/Electron）可把 `filePicker` 设为 false，走内存分片下载。
+ *
+ * configure 可注入项（全部可选）：
+ *   endpoints     接口路径；键：mkdirs/upload/uploadChunk/uploadStatus/uploadAbort/write/download/copy/move/remove
+ *   api           JSON 请求函数 `(path, init) => Promise<{code,message,data}>`（沿用宿主封装，负责 401/428 语义）
+ *   token         会话令牌：字符串或取值函数（便于登录后刷新）
+ *   onAuthFail    登录失效回调
+ *   join/joinRel  路径拼接（缺省按 `dir` 里是否出现反斜杠判断 Windows/Unix）
  *   bytes/toast/esc 展示层小工具
- *   onUploadDone 上传结束后的刷新回调
+ *   onUploadDone  上传结束后的刷新回调
+ *   storage       `{get,set,remove}` 三件套（缺省 localStorage，不可用时自动降级为内存）
  *   storagePrefix localStorage 键前缀（剪贴板 / 下载 ETag 记忆互不干扰）
  *   jobsContainer 传输任务面板容器 id（缺省 fm-jobs）
+ *   filePicker    false = 不调用 showSaveFilePicker（内嵌 WebView / 非 Chrome 环境）
+ *   clipText      `{copy,cut,count,tip,clear,saved}` 文案覆盖（多语言/多面板语气）
  */
-(function (global) {
+(function (root) {
   'use strict';
+
+  if (root.FmClient && root.FmClient.VERSION) return; // 幂等：重复 <script> 不重复定义
+
+  var VERSION = '1.1.0';
 
   var DEFAULTS = {
     endpoints: {
@@ -29,6 +45,14 @@
       copy: '/star/fileCopy',
       move: '/star/fileMove',
       remove: '/star/fileDelete'
+    },
+    clipText: {
+      copy: '📋 复制',
+      cut: '✂ 剪切',
+      count: '项',
+      tip: '→ 进入目标目录后点「📥 粘贴」',
+      clear: '清空',
+      saved: '已保存：'
     }
   };
 
@@ -40,11 +64,16 @@
   var dlParts = new Map();  // 无「另存为」能力时的内存兜底：路径 → Blob[]
   var dlMeta = new Map();   // 下载断点元信息：路径 → {size}
   var jobs = [];
+  var memStore = {};        // localStorage 不可用时的降级存储
 
   function ep(key) { return ((cfg && cfg.endpoints) || DEFAULTS.endpoints)[key]; }
+  function text(key) { return ((cfg && cfg.clipText) || DEFAULTS.clipText)[key]; }
   function bytes(n) { return cfg.bytes ? cfg.bytes(n) : (n || 0) + ' B'; }
-  function toast(msg, err) { if (cfg.toast) cfg.toast(msg, err); }
-  function esc(s) { return cfg.esc ? cfg.esc(s) : String(s == null ? '' : s); }
+  function toast(msg, err) { if (cfg.toast) cfg.toast(msg, err); else console.log('[fm] ' + msg); }
+  function esc(s) {
+    if (cfg.esc) return cfg.esc(s);
+    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
   function rate(n, ms) { return (!ms || ms < 300) ? '…' : bytes(n * 1000 / ms) + '/s'; }
   // token 既可直接给字符串，也可给取值函数（面板的令牌会在登录/刷新后变化）
@@ -56,11 +85,47 @@
     return h;
   }
   function onAuthFail() { if (cfg.onAuthFail) cfg.onAuthFail(); }
-  function join(dir, name) { return cfg.join ? cfg.join(dir, name) : (dir ? dir + '/' + name : name); }
-  function joinRel(dir, rel) { return cfg.joinRel ? cfg.joinRel(dir, rel) : join(dir, rel); }
+  function sepOf(dir) {
+    var s = String(dir || '');
+    return (s.indexOf('\\') >= 0 && s.indexOf('/') < 0) ? '\\' : '/';
+  }
+  function join(dir, name) {
+    if (cfg.join) return cfg.join(dir, name);
+    var d = String(dir || '').replace(/[\\/]+$/, '');
+    return d ? d + sepOf(d) + name : String(name || '');
+  }
+  function joinRel(dir, rel) {
+    if (cfg.joinRel) return cfg.joinRel(dir, rel);
+    var sep = sepOf(dir);
+    var d = String(dir || '').replace(/[\\/]+$/, '');
+    if (!rel) return d;
+    return (d ? d + sep : '') + String(rel).split('/').join(sep);
+  }
+  function store() {
+    if (cfg.storage && typeof cfg.storage.get === 'function') return cfg.storage;
+    return {
+      get: function (k) {
+        try { return root.localStorage ? root.localStorage.getItem(k) : (memStore[k] || null); }
+        catch (e) { return memStore[k] || null; }
+      },
+      set: function (k, v) {
+        try { if (root.localStorage) { root.localStorage.setItem(k, v); return; } } catch (e) { }
+        memStore[k] = v;
+      },
+      remove: function (k) {
+        try { if (root.localStorage) { root.localStorage.removeItem(k); return; } } catch (e) { }
+        delete memStore[k];
+      }
+    };
+  }
+  function fetchOrFail(url, init) {
+    if (typeof root.fetch !== 'function') throw new Error('当前环境不支持 fetch（请升级浏览器或改用桌面客户端）');
+    return root.fetch(url, init);
+  }
 
   /* ── 传输任务面板（上传/下载进度、取消、续传） ── */
   function jobRender() {
+    if (typeof document === 'undefined') return; // 无 DOM 环境（脚本/自动化）只保留任务状态
     var id = cfg.jobsContainer || 'fm-jobs';
     var box = document.getElementById(id);
     if (!jobs.length) { if (box) box.remove(); return; }
@@ -259,7 +324,7 @@
     return downloadResume(path, name, it);
   }
   async function downloadDirect(path, name) {
-    var r = await fetch(ep('download') + '?path=' + encodeURIComponent(path), { headers: authHeaders({}) });
+    var r = await fetchOrFail(ep('download') + '?path=' + encodeURIComponent(path), { headers: authHeaders({}) });
     if (r.status === 401) { onAuthFail(); return; }
     var ct = r.headers.get('content-type') || '';
     if (!r.ok || ct.indexOf('application/json') >= 0) {
@@ -270,19 +335,20 @@
     saveBlob(await r.blob(), name);
   }
   function saveBlob(blob, name) {
+    if (typeof document === 'undefined') { toast('当前环境无法自动保存文件：' + name, true); return; }
     var a = document.createElement('a');
     a.href = URL.createObjectURL(blob); a.download = name;
     document.body.appendChild(a); a.click();
     setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
   }
   function etagKey(path) { return (cfg.storagePrefix || 'fm') + '_dl_etag:' + path; }
-  function etagGet(path) { try { return localStorage.getItem(etagKey(path)) || ''; } catch (e) { return ''; } }
-  function etagSet(path, v) { try { v ? localStorage.setItem(etagKey(path), v) : localStorage.removeItem(etagKey(path)); } catch (e) { } }
+  function etagGet(path) { return store().get(etagKey(path)) || ''; }
+  function etagSet(path, v) { v ? store().set(etagKey(path), v) : store().remove(etagKey(path)); }
   /** 断点续传下载：有「另存为」句柄就落盘（跨次续传），否则内存兜底 */
   async function downloadResume(path, name, it) {
     var handle = null;
-    if (window.showSaveFilePicker) {
-      try { handle = await window.showSaveFilePicker({ suggestedName: name }); }
+    if (cfg.filePicker !== false && typeof root.showSaveFilePicker === 'function') {
+      try { handle = await root.showSaveFilePicker({ suggestedName: name }); }
       catch (e) { if (e && e.name === 'AbortError') return; handle = null; }
     }
     var job = jobAdd('⬇ ' + name);
@@ -391,7 +457,7 @@
       try {
         var h = { 'Range': 'bytes=' + start + '-' + end };
         if (etag) h['If-Range'] = etag;
-        var r = await fetch(ep('download') + '?path=' + encodeURIComponent(path), { headers: authHeaders(h) });
+        var r = await fetchOrFail(ep('download') + '?path=' + encodeURIComponent(path), { headers: authHeaders(h) });
         if (r.status === 401) { onAuthFail(); throw new Error('登录已过期'); }
         var ct = r.headers.get('content-type') || '';
         var m = /\/(\d+)\s*$/.exec(r.headers.get('content-range') || '');
@@ -437,14 +503,56 @@
   function clipKey() { return (cfg.storagePrefix || 'fm') + '_clip'; }
   function clipLoad() {
     try {
-      var raw = localStorage.getItem(clipKey());
+      var raw = store().get(clipKey());
       if (!raw) return null;
       var d = JSON.parse(raw);
       return (d && Array.isArray(d.paths) && d.paths.length && (d.mode === 'cut' || d.mode === 'copy')) ? d : null;
     } catch (e) { return null; }
   }
   function clipSave(d) {
-    try { d ? localStorage.setItem(clipKey(), JSON.stringify(d)) : localStorage.removeItem(clipKey()); } catch (e) { }
+    if (d) store().set(clipKey(), JSON.stringify(d));
+    else store().remove(clipKey());
+  }
+  /** 剪贴板提示条的**内容**（不含外层 .fm-clip 容器；面板已有容器时用它，避免嵌套重复边框） */
+  function clipInner(d) {
+    d = d || clipLoad();
+    if (!d) return '';
+    var names = d.paths.map(function (x) { return String(x).split(/[\\/]/).pop(); }).join('、');
+    return '<span class="fm-clip-badge">' + (d.mode === 'cut' ? text('cut') : text('copy')) + '</span>' +
+      '<span class="fm-clip-count">' + d.paths.length + ' ' + text('count') + '</span>' +
+      '<span class="fm-clip-src" title="' + esc(d.paths.join('\n')) + '">' + esc(names) + '</span>' +
+      '<span class="fm-clip-tip">' + esc(text('tip')) + '</span>' +
+      '<span style="flex:1"></span>' +
+      '<button type="button" class="fm-clip-clear" data-fm-clip-clear="1">' + esc(text('clear')) + '</button>';
+  }
+  /** 剪贴板提示条的完整 HTML（含外层容器；面板把整段塞进自己的模板时用它） */
+  function clipHtml(d) {
+    var body = clipInner(d);
+    return body ? '<div class="fm-clip">' + body + '</div>' : '';
+  }
+  /** 把剪贴板提示条渲染进容器（容器 id 或元素；空剪贴板 → 隐藏并清空） */
+  function clipRender(target) {
+    var el = typeof target === 'string'
+      ? (typeof document === 'undefined' ? null : document.getElementById(target))
+      : target;
+    if (!el) return;
+    var d = clipLoad();
+    if (!d) { el.innerHTML = ''; el.hidden = true; if (el.classList) el.classList.add('hidden'); return; }
+    el.hidden = false;
+    if (el.classList) el.classList.remove('hidden');
+    // 容器自身已是 .fm-clip 时只填内容，避免嵌套出双边框
+    el.innerHTML = (el.classList && el.classList.contains('fm-clip')) ? clipInner(d) : clipHtml(d);
+  }
+  // 「清空」按钮统一走委托事件：面板无需暴露全局函数，也不与面板同名函数冲突
+  if (typeof document !== 'undefined') {
+    document.addEventListener('click', function (e) {
+      var t = e.target;
+      if (!t || !t.closest) return;
+      if (!t.closest('[data-fm-clip-clear]')) return;
+      e.preventDefault();
+      clipSave(null);
+      if (cfg.onClipChange) cfg.onClipChange(null);
+    });
   }
 
   /* ── 拖拽文件夹：webkitGetAsEntry 递归（readEntries 每次最多 100 条，必须循环读到空） ── */
@@ -485,7 +593,8 @@
     return cfg;
   }
 
-  global.FmClient = {
+  root.FmClient = {
+    VERSION: VERSION,
     configure: configure,
     constants: { chunk: CHUNK, dlChunk: DL_CHUNK, dlResumeMin: DL_RESUME_MIN },
     sleep: sleep,
@@ -504,7 +613,7 @@
     postPathsChunked: postPathsChunked,
     readAllEntries: readAllEntries,
     walkEntry: walkEntry,
-    clip: { load: clipLoad, save: clipSave },
+    clip: { load: clipLoad, save: clipSave, html: clipHtml, inner: clipInner, render: clipRender },
     jobs: {
       list: function () { return jobs; },
       add: jobAdd,
@@ -515,4 +624,9 @@
       cancel: function (i) { var j = jobs[i]; if (j && j.onCancel) j.onCancel(); }
     }
   };
-})(typeof window !== 'undefined' ? window : this);
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof window !== 'undefined' ? window : this));
+
+// CommonJS 互操作（Electron / 打包器）：require 时直接拿到实例
+if (typeof module !== 'undefined' && module.exports && typeof globalThis !== 'undefined') {
+  module.exports = globalThis.FmClient;
+}
