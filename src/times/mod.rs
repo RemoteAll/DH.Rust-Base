@@ -228,6 +228,54 @@ pub fn now_local_ms_text() -> String {
     format_datetime_with_digits(&now, 3)
 }
 
+/// 本地日期 → `yyyy-MM-dd` 文本（报表/日志的「今天」口径）。
+///
+/// 与 [`now_local_text`] 的日期部分一致，但只取日期，避免各处手写
+/// `chrono::Local::now().format("%Y-%m-%d")`（2026-11-08 全盘扫到 48 处同类自写格式化）。
+pub fn local_date_text() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+/// 本地日期 → `yyyyMMdd` 整数键（日汇总/配额/「今日」缓存键）。
+///
+/// 例：`20261108`。解析失败不可能发生（格式固定），仍按 `0` 兜底保持总函数。
+pub fn local_date_key() -> i64 {
+    chrono::Local::now()
+        .format("%Y%m%d")
+        .to_string()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// 本地时间 → 紧凑秒级时间戳 `yyyyMMddHHmmss`（文件名/流水号用）。
+///
+/// 例：`20261108143012`。
+pub fn local_stamp_secs() -> String {
+    chrono::Local::now().format("%Y%m%d%H%M%S").to_string()
+}
+
+/// 本地时间 → 紧凑毫秒级时间戳 `yyyyMMddHHmmssSSS`（同一秒内需要唯一时用）。
+///
+/// 例：`20261108143012507`。
+pub fn local_stamp_millis() -> String {
+    chrono::Local::now().format("%Y%m%d%H%M%S%3f").to_string()
+}
+
+/// 今日时间范围 `[今天零点, 明天零点)`（**半开区间**，日汇总/配额比较用）。
+///
+/// 与 [`date_range_of`] 的区别：那个按 `yyyy`/`yyyy-MM`/`yyyy-MM-dd` 模式解析并返回
+/// **闭区间**（`23:59:59` 边界会被漏掉）;本函数固定「今天」，且右端开区间 ——
+/// `CreateTime >= start AND CreateTime < end` 才能覆盖当天最后一毫秒。
+pub fn today_range() -> (NaiveDateTime, NaiveDateTime) {
+    let today = chrono::Local::now().date_naive();
+    let start = today.and_hms_opt(0, 0, 0).unwrap_or_default();
+    let end = today
+        .succ_opt()
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .unwrap_or(start);
+    (start, end)
+}
+
 /// 时间 → System.Text.Json 形态文本（`yyyy-MM-ddTHH:mm:ss`，100ns 精度内尾零裁剪）。
 ///
 /// 对齐 C# `System.Text.Json` 序列化 `DateTime`（本地）的输出：
@@ -327,6 +375,34 @@ mod tests {
             format_datetime_with_digits(&dt, 6),
             "2026-09-26 18:01:02.123000"
         );
+    }
+
+    /// 紧凑日期键 / 时间戳 / 今日半开区间（收编各项目自写的 `%Y%m%d` 系列）。
+    #[test]
+    fn local_date_and_stamp_helpers() {
+        let today = chrono::Local::now().date_naive();
+        let expect_key: i64 = today.format("%Y%m%d").to_string().parse().unwrap();
+        assert_eq!(local_date_key(), expect_key);
+        assert_eq!(local_date_text(), today.format("%Y-%m-%d").to_string());
+
+        // 秒级 14 位、毫秒级 17 位，且都是纯数字
+        let secs = local_stamp_secs();
+        assert_eq!(secs.len(), 14, "{secs}");
+        assert!(secs.chars().all(|c| c.is_ascii_digit()), "{secs}");
+        let millis = local_stamp_millis();
+        assert_eq!(millis.len(), 17, "{millis}");
+        assert!(millis.chars().all(|c| c.is_ascii_digit()), "{millis}");
+        assert!(millis.starts_with(&secs[..12]), "{millis} vs {secs}");
+
+        // 今日范围：左闭右开，长度正好一天
+        let (start, end) = today_range();
+        assert_eq!(start.date(), today);
+        assert_eq!(end.date(), today.succ_opt().unwrap());
+        assert_eq!(end - start, chrono::TimeDelta::days(1));
+        // 边界语义：今天 23:59:59.999 属于本区间，明天 00:00 不属于
+        let last_moment = end - chrono::TimeDelta::milliseconds(1);
+        assert!(last_moment >= start && last_moment < end);
+        assert!(end >= end);
     }
 
     #[test]
