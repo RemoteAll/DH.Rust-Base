@@ -48,6 +48,19 @@ pub fn format_datetime(value: &NaiveDateTime) -> String {
     format_datetime_with_digits(value, DATETIME_FRACTION_DIGITS)
 }
 
+/// 时间 → **秒级**文本（`yyyy-MM-dd HH:mm:ss`，无小数秒）。
+///
+/// 与 [`format_datetime`] 的区别要说清楚，两者**输出不同**：
+/// - [`format_datetime`]：7 位小数秒（`2026-09-26 18:01:02.1230000`），写 XCode 库列时用；
+/// - 本函数：**严格** `%Y-%m-%d %H:%M:%S`，用于业务/界面文本、以及要求秒级严格口径的
+///   字符串比较与 `parse_from_str("%Y-%m-%d %H:%M:%S")` 解析。
+///
+/// 2026-11-08 教训：HLZX.EIP 把「过期时间/日志截止时间」等改用 [`format_datetime`] 后，
+/// 值里多了 `.1234567`，导致严格解析取到 0 —— **要秒级就必须显式用本函数**，不能靠默认。
+pub fn format_datetime_seconds(value: &NaiveDateTime) -> String {
+    format_datetime_with_digits(value, 0)
+}
+
 /// 时间 → 毫秒精度文本（3 位小数秒，如 `2026-09-26 18:01:02.123`），
 /// 对齐 C# `DateTime.ToString("yyyy-MM-dd HH:mm:ss.fff")`（Redis 负载等场景）。
 pub fn format_datetime_ms(value: &NaiveDateTime) -> String {
@@ -403,6 +416,29 @@ mod tests {
         let last_moment = end - chrono::TimeDelta::milliseconds(1);
         assert!(last_moment >= start && last_moment < end);
         assert!(end >= end);
+    }
+
+    #[test]
+    fn seconds_and_fraction_formats_are_distinct() {
+        // 这两个函数**输出不同**，混用会污染库里的时间文本（2026-11-08 HLZX.EIP 踩过）：
+        // 用 format_datetime 写「过期时间」→ 值里多出 `.1234567` → 严格解析取到 0
+        let t = chrono::NaiveDate::from_ymd_opt(2026, 11, 8)
+            .unwrap()
+            .and_hms_milli_opt(15, 4, 5, 123)
+            .unwrap();
+
+        let secs = format_datetime_seconds(&t);
+        assert_eq!(secs, "2026-11-08 15:04:05");
+        assert_eq!(secs.len(), 19, "秒级必须无小数：{secs}");
+        // 秒级结果必须能被严格 `%Y-%m-%d %H:%M:%S` 解析（format_datetime 做不到）
+        assert!(chrono::NaiveDateTime::parse_from_str(&secs, DATETIME_SECONDS_FORMAT).is_ok());
+
+        let fraction = format_datetime(&t);
+        assert_eq!(fraction, "2026-11-08 15:04:05.1230000");
+        assert!(
+            chrono::NaiveDateTime::parse_from_str(&fraction, DATETIME_SECONDS_FORMAT).is_err(),
+            "7 位小数版本不应被秒级严格解析接受"
+        );
     }
 
     #[test]
