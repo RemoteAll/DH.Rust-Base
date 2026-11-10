@@ -1,6 +1,11 @@
 //! 静态文件服务（默认约定 `wwwroot/` 目录）：MIME、默认文档、路径穿越防护、嵌入资源。
 //!
 //! 对齐 C#/NewLife 的静态资源与 `MapEmbedded` 惯例：
+//! - **默认不嵌入**：`wwwroot` 是**运行期资源目录**，默认**不编译进二进制**——
+//!   [`StaticFiles::new`]/[`StaticFiles::default`] 只读盘；`embed`/`embed_many`/`with_embedded`
+//!   都是显式 opt-in（仅单文件部署时使用）；发布包也应把它排除（消费方 `Cargo.toml` `exclude`）。
+//! - **根目录可配**：根目录是 [`StaticFiles::new`] 的参数（**默认约定 `wwwroot` 由调用方决定**），
+//!   业务系统可按自己的配置改成任意路径（如 `data/wwwroot` 或绝对路径）；
 //! - **目录模式**：[`StaticFiles::new`]（或 [`StaticFiles::default`] = `wwwroot`），
 //!   按请求读盘（开发友好，改文件即生效）；
 //! - **嵌入模式**：[`StaticFiles::embed`] / [`StaticFiles::embed_many`] 注册编译期资源
@@ -82,6 +87,8 @@ impl EmbeddedAsset {
 
 impl StaticFiles {
     /// 以目录创建（目录不存在时全部未命中，不报错）。
+    ///
+    /// 目录由业务方决定（默认约定为 `wwwroot`）；**只读盘，不嵌入任何资源**。
     pub fn new(root: impl Into<PathBuf>) -> StaticFiles {
         StaticFiles {
             root: Some(root.into()),
@@ -89,6 +96,32 @@ impl StaticFiles {
             spa: false,
             spa_excludes: Vec::new(),
         }
+    }
+
+    /// 以「磁盘根 + 显式嵌入表」创建（嵌入优先；**空表 = 纯磁盘**）。
+    ///
+    /// 这是单文件部署的唯一入口约定：`wwwroot` 默认不编译进二进制，只有业务方显式把
+    /// `build.rs` 生成的资源表传进来才嵌入：
+    ///
+    /// ```ignore
+    /// include!(concat!(env!("OUT_DIR"), "/spa_files.rs")); // pub static SPA_FILES: &[(&str, &[u8])]
+    /// let statics = StaticFiles::with_embedded("wwwroot", SPA_FILES);
+    /// ```
+    pub fn with_embedded(
+        root: impl Into<PathBuf>,
+        files: &[(&'static str, &'static [u8])],
+    ) -> StaticFiles {
+        let statics = StaticFiles::new(root);
+        if files.is_empty() {
+            statics
+        } else {
+            statics.embed_many(files)
+        }
+    }
+
+    /// 已嵌入资源数量（`0` = 纯磁盘模式，即默认状态）。
+    pub fn embedded_count(&self) -> usize {
+        self.embedded.len()
     }
 
     /// 注册嵌入资源（编译期资源，如 `include_bytes!("webpanel/index.html")`）。
@@ -444,6 +477,38 @@ mod tests {
 
         let icon = statics.try_serve("/favicon.ico").expect("应命中嵌入图标");
         assert_eq!(icon.headers[0].1, "image/x-icon");
+    }
+
+    #[test]
+    fn with_embedded_empty_is_disk_only() {
+        let dir = temp_dir("with-embedded-empty");
+        std::fs::write(dir.join("app.js"), "disk").unwrap();
+
+        let statics = StaticFiles::with_embedded(&dir, &[]);
+        assert_eq!(statics.embedded_count(), 0, "空表必须是纯磁盘模式");
+        let file = statics.try_serve("/app.js").expect("磁盘文件应命中");
+        assert_eq!(String::from_utf8_lossy(&file.body), "disk");
+
+        // 删掉磁盘文件后不再命中（证明没有编译期兜底嵌入）
+        std::fs::remove_file(dir.join("app.js")).unwrap();
+        assert!(statics.try_serve("/app.js").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_embedded_prioritizes_embedded_over_disk() {
+        static FILES: &[(&str, &[u8])] = &[("app.js", b"embedded")];
+
+        let dir = temp_dir("with-embedded-priority");
+        std::fs::write(dir.join("app.js"), "disk").unwrap();
+
+        let statics = StaticFiles::with_embedded(&dir, FILES);
+        assert_eq!(statics.embedded_count(), 1);
+        let file = statics.try_serve("/app.js").expect("嵌入资源应命中");
+        assert_eq!(String::from_utf8_lossy(&file.body), "embedded");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

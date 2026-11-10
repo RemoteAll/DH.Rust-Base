@@ -64,6 +64,9 @@ Controller::new("api")
 //     .mount(&mut router);
 
 // 静态文件 + SPA 一体化：嵌入构建产物（embed_many，嵌入优先→wwwroot 兜底）→
+// 根目录由业务方决定（默认约定 wwwroot，可传任意路径）：StaticFiles::new("data/wwwroot")
+// **默认不嵌入**：wwwroot 是运行期资源目录，不编译进二进制；单文件部署才显式：
+// StaticFiles::with_embedded("wwwroot", SPA_FILES)
 // 深链接回退 index.html（history 路由）；/api 前缀排除于回退之外（保持 JSON 404）；
 // try_serve_request 自带 ETag/304 条件请求（重复打开零正文），响应自动 gzip 协商
 let statics = StaticFiles::default()
