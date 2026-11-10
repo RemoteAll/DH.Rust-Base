@@ -165,6 +165,16 @@ impl Controller {
         self
     }
 
+    /// 设置视图的**区域回退**：控制器前缀为 `{Area}/{Controller}` 时，若在指定区域下
+    /// 找不到视图，回退到 `fallback_area` 的同名视图。
+    ///
+    /// 对齐 ASP.NET Core Areas（`Areas/{Area}/Views`）与 NCube 的「子项目视图重写父项目视图」：
+    /// 默认视图只需维护在默认区域（如 `Admin`）下，消费方改区域名（如 `Biz`）不必复制一份。
+    pub fn with_fallback_area(mut self, fallback_area: impl Into<String>) -> Self {
+        self.views.set_fallback_area(fallback_area);
+        self
+    }
+
     /// 挂载：注册 `/{prefix}/{action}` 统一入口（匹配任意方法，内部按注册方法校验）。
     pub fn mount(self, router: &mut Router) {
         let pattern = format!("/{}/{{action}}", self.prefix);
@@ -309,12 +319,17 @@ thread_local! {
     static ENGINES: RefCell<HashMap<PathBuf, Rc<ViewEngine>>> = RefCell::new(HashMap::new());
 }
 
-/// 视图渲染器：MVC 约定 `Views/{Controller}/{Action}.cshtml`。
+/// 视图渲染器：MVC 约定 `Views/{Controller}/{Action}.cshtml`；控制器前缀可含 `/`（Area）。
 ///
-/// 视图查找大小写宽容：先 Pascal 化（C# 约定目录，如 `Views/Api/Login.cshtml`），
-/// 再按原样（如 `Views/api/login.cshtml`）。
+/// 视图查找大小写宽容：先**逐段 Pascal 化**（C# 约定目录，`admin/config` →
+/// `Views/Admin/Config/Index.cshtml`），再按原样（如 `Views/admin/config/index.cshtml`）。
+///
+/// **区域回退**（[`ViewRenderer::with_fallback_area`]）：`{Area}/{Controller}` 在指定区域
+/// 找不到时，回退到默认区域的同名视图——对齐 ASP.NET Core Areas 与视图重写。
 pub struct ViewRenderer {
     root: PathBuf,
+    /// 回退区域（如 `Admin`）；`None` = 不回退
+    fallback_area: Option<String>,
 }
 
 impl ViewRenderer {
@@ -322,17 +337,43 @@ impl ViewRenderer {
     pub fn new() -> ViewRenderer {
         ViewRenderer {
             root: PathBuf::from("Views"),
+            fallback_area: None,
         }
     }
 
     /// 指定视图根目录。
     pub fn with_root(root: impl Into<PathBuf>) -> ViewRenderer {
-        ViewRenderer { root: root.into() }
+        ViewRenderer {
+            root: root.into(),
+            fallback_area: None,
+        }
     }
 
     /// 视图根目录。
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// 当前回退区域（未设置时为 `None`）。
+    pub fn fallback_area(&self) -> Option<&str> {
+        self.fallback_area.as_deref()
+    }
+
+    /// 设置回退区域（链式；空串/空白 = 取消回退）。
+    pub fn with_fallback_area(mut self, area: impl Into<String>) -> ViewRenderer {
+        self.set_fallback_area(area);
+        self
+    }
+
+    /// 设置回退区域（就地修改；空串/空白 = 取消回退）。
+    pub fn set_fallback_area(&mut self, area: impl Into<String>) {
+        let area = area.into();
+        let trimmed = area.trim();
+        self.fallback_area = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
     }
 
     /// 按约定渲染视图并返回 HTML。
@@ -346,12 +387,14 @@ impl ViewRenderer {
         model: &Json,
     ) -> Result<String, String> {
         let name = self.resolve(controller, view).ok_or_else(|| {
-            format!(
-                "视图不存在：{}/{}.cshtml（视图根 {}）",
-                pascal(controller),
-                pascal(view),
-                self.root.display()
-            )
+            let tried = format!("{}/{}.cshtml", pascal_path(controller), pascal_path(view));
+            match &self.fallback_area {
+                Some(area) if controller.contains('/') => format!(
+                    "视图不存在：{tried}（视图根 {}；已回退区域 {area}）",
+                    self.root.display()
+                ),
+                _ => format!("视图不存在：{tried}（视图根 {}）", self.root.display()),
+            }
         })?;
 
         #[cfg(feature = "razor")]
@@ -375,21 +418,47 @@ impl ViewRenderer {
         }
     }
 
-    /// 约定解析：返回相对视图名（`{Controller}/{View}.cshtml`）。
+    /// 约定解析：返回相对视图名（`{Controller}/{View}`，不含扩展名）。
+    ///
+    /// 候选顺序：控制器/视图各按「逐段 Pascal」与「原样」组合；配了回退区域时，
+    /// 再把控制器首段替换为回退区域重试一遍（`biz/config` → `Admin/Config`）。
     fn resolve(&self, controller: &str, view: &str) -> Option<String> {
-        let controllers = [pascal(controller), controller.to_string()];
-        let views = [pascal(view), view.to_string()];
-        for c in &controllers {
-            for v in &views {
-                // 返回不带扩展名的模板名（DirViewLoader 自行补 `.cshtml`）
-                let name = format!("{c}/{v}");
-                if self.root.join(format!("{name}.cshtml")).is_file() {
-                    return Some(name);
+        let controller = controller.trim_matches('/');
+        let mut candidates = Vec::new();
+        push_candidates(&mut candidates, controller, view);
+        if let Some(fallback) = &self.fallback_area {
+            if let Some((area, rest)) = controller.split_once('/') {
+                if !area.eq_ignore_ascii_case(fallback) {
+                    push_candidates(&mut candidates, &format!("{fallback}/{rest}"), view);
                 }
+            }
+        }
+        for name in candidates {
+            if self.root.join(format!("{name}.cshtml")).is_file() {
+                return Some(name);
             }
         }
         None
     }
+}
+
+/// 候选视图名（逐段 Pascal + 原样，去重）。
+fn push_candidates(out: &mut Vec<String>, controller: &str, view: &str) {
+    let controllers = [pascal_path(controller), controller.to_string()];
+    let views = [pascal_path(view), view.to_string()];
+    for c in &controllers {
+        for v in &views {
+            let name = format!("{c}/{v}");
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+}
+
+/// 逐段 Pascal 化（`admin/config` → `Admin/Config`；单段与 [`pascal`] 等价）。
+fn pascal_path(text: &str) -> String {
+    text.split('/').map(pascal).collect::<Vec<_>>().join("/")
 }
 
 impl Default for ViewRenderer {
@@ -565,5 +634,72 @@ mod tests {
         assert_eq!(pascal("home"), "Home");
         assert_eq!(pascal("Api"), "Api");
         assert_eq!(pascal(""), "");
+    }
+
+    #[test]
+    fn pascal_path_cases_each_segment() {
+        assert_eq!(pascal_path("admin/config"), "Admin/Config");
+        assert_eq!(pascal_path("biz/home"), "Biz/Home");
+        assert_eq!(pascal_path("home"), "Home");
+    }
+
+    /// 造一个临时视图根：`Views/{area}/{controller}/{view}.cshtml`。
+    fn temp_views_root(tag: &str, area: &str, controller: &str, view: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("dhrust-controller-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join(area).join(controller);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{view}.cshtml")), "x").unwrap();
+        root
+    }
+
+    #[test]
+    fn resolve_cases_area_segments() {
+        let root = temp_views_root("area-seg", "Admin", "Config", "Index");
+        let renderer = ViewRenderer::with_root(&root);
+        assert_eq!(
+            renderer.resolve("admin/config", "index").as_deref(),
+            Some("Admin/Config/Index")
+        );
+
+        // 不含回退时，其它区域找不到
+        assert!(renderer.resolve("biz/config", "index").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_default_area() {
+        let root = temp_views_root("area-fallback", "Admin", "Config", "Index");
+        let renderer = ViewRenderer::with_root(&root).with_fallback_area("Admin");
+        assert_eq!(renderer.fallback_area(), Some("Admin"));
+        assert_eq!(
+            renderer.resolve("biz/config", "index").as_deref(),
+            Some("Admin/Config/Index"),
+            "非默认区域应回退到默认区域的同名视图"
+        );
+
+        // 回退区域自身不应无限递归/改写
+        assert_eq!(
+            renderer.resolve("admin/config", "index").as_deref(),
+            Some("Admin/Config/Index")
+        );
+
+        // 空串 = 取消回退
+        let mut renderer = renderer;
+        renderer.set_fallback_area("  ");
+        assert!(renderer.fallback_area().is_none());
+        assert!(renderer.resolve("biz/config", "index").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn controller_exposes_fallback_area() {
+        let controller = Controller::new("biz/config").with_fallback_area("Admin");
+        assert_eq!(controller.views.fallback_area(), Some("Admin"));
+
+        // 未设置时保持默认（无回退）
+        let controller = Controller::new("api");
+        assert!(controller.views.fallback_area().is_none());
     }
 }

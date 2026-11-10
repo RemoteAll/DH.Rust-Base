@@ -55,6 +55,14 @@ Controller::new("api")
 // 视图约定（feature `razor`）：Views/{Controller}/{Action}.cshtml，`view(model)` 渲染 HTML
 // Controller::new("home").get("index", |_ctx| view(model)).mount(&mut router);
 
+// Area（对齐 ASP.NET Core Areas）：控制器前缀可多段（/{area}/{controller}/{action}），
+// 视图按段 Pascal 化（Views/Admin/Config/Index.cshtml）；配 with_fallback_area 后，
+// 新区域（如 Biz）找不到视图时自动回退默认区域（Admin），不必复制一份默认视图：
+// Controller::new("biz/config")
+//     .with_fallback_area("Admin")
+//     .get("index", |_ctx| view(serde_json::json!({ "Title": "站点设置" })))
+//     .mount(&mut router);
+
 // 静态文件 + SPA 一体化：嵌入构建产物（embed_many，嵌入优先→wwwroot 兜底）→
 // 深链接回退 index.html（history 路由）；/api 前缀排除于回退之外（保持 JSON 404）；
 // try_serve_request 自带 ETag/304 条件请求（重复打开零正文），响应自动 gzip 协商
