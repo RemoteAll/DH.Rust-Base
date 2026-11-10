@@ -96,8 +96,18 @@ pub fn is_loopback(ip: &str) -> bool {
 /// 规则（从严）：
 /// 1. `trust = false` → 一律用对端（不看转发头）；
 /// 2. 对端既非回环、也不在 `trusted_proxies`（逗号分隔）里 → 同样用对端（防伪造 `X-Forwarded-For` 绕过限流）；
-/// 3. 否则先取 `X-Forwarded-For` 的**第一段**，其次 `X-Real-IP`；
+/// 3. 否则取 `X-Forwarded-For` 的**最后一段合法 IP**（末段是我们直接信任的那一跳代理写的），
+///    其次 `X-Real-IP`；
 /// 4. 取到的值必须是合法 IP（`parse::<IpAddr>()` 通过），否则继续回落到对端。
+///
+/// **为什么取末段而不是首段（2026-11-10 安全审计）**：nginx 的 `$proxy_add_x_forwarded_for`
+/// 是**追加**语义——客户端自带 `X-Forwarded-For: 1.2.3.4` 会被原样保留在最前面，代理只把
+/// 自己看到的对端 IP（真客户端）追加到**尾部**。取首段 = 直接信任客户端声明，可任意伪造
+/// （绕过 IP 封禁与限流、污染 WAF 统计）；取末段 = 只信任自己这一跳看到的值。
+///
+/// 反代侧两种写法都兼容：
+/// - `proxy_set_header X-Forwarded-For $remote_addr;`（覆盖）→ 头部只有一个值，末段即它；
+/// - `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`（追加）→ 末段是真客户端。
 ///
 /// # 参数
 /// - `peer`：TCP 对端 IP 文本（不带端口）
@@ -136,14 +146,16 @@ pub fn client_ip_behind_proxy(
     }
 
     if let Some(value) = forwarded_for {
-        if let Some(first) = value
+        // 从**右向左**取第一个合法 IP：末段由我们信任的那一跳代理写入（不可伪造），
+        // 左侧各段全部可以来自客户端，不能采信。逆序扫描同时容忍尾部垃圾值。
+        if let Some(last) = value
             .split(',')
             .map(str::trim)
-            .find(|item| !item.is_empty())
+            .filter(|item| !item.is_empty())
+            .rev()
+            .find(|item| item.parse::<std::net::IpAddr>().is_ok())
         {
-            if first.parse::<std::net::IpAddr>().is_ok() {
-                return first.to_string();
-            }
+            return last.to_string();
         }
     }
 
@@ -568,9 +580,28 @@ mod tests {
             "127.0.0.1"
         );
 
-        // 2) 回环对端 + XFF 首段 → 取首段
+        // 2) 回环对端 + XFF 多段 → 取**末段**（末段是代理写入的真实客户端，左侧可伪造）
         assert_eq!(
             client_ip_behind_proxy("127.0.0.1", Some("1.2.3.4, 10.0.0.1"), None, "", true),
+            "10.0.0.1"
+        );
+
+        // 2b) 客户端伪造行首 IP（`$proxy_add_x_forwarded_for` 追加语义）→ 不被采信
+        assert_eq!(
+            client_ip_behind_proxy(
+                "127.0.0.1",
+                Some("9.9.9.9, 1.2.3.4, 203.0.113.7"),
+                None,
+                "",
+                true
+            ),
+            "203.0.113.7",
+            "只有最后一跳写入的值可信"
+        );
+
+        // 2c) 尾部是垃圾/空白 → 逆序继续找最后一个合法 IP
+        assert_eq!(
+            client_ip_behind_proxy("127.0.0.1", Some("1.2.3.4, , garbage, "), None, "", true),
             "1.2.3.4"
         );
 
