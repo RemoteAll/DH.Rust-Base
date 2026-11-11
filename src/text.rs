@@ -2,6 +2,23 @@
 
 use std::collections::HashSet;
 
+/// 常量时间字节比较（长度不等直接 `false`；等长时逐字节异或累加，不提前返回）。
+///
+/// 用于口令 / 令牌 / 签名比对：避免「提前返回」泄露前缀匹配长度（时序侧信道）。
+///
+/// 下沉自 Pek.Proxy `security::constant_time_eq`（Pek.RDbProxy `proxy.rs`、Pek.ROutGuard `config.rs`
+/// 各有一份同款实现）。**不依赖加密库**，所以放在这里而不是 `secret`（后者要开 `secret` 特性）。
+pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 /// 按字符截断（附省略号"…"；不破坏 UTF-8 边界）。
 ///
 /// 字符数不超过 `max` 时原样返回；否则取前 `max` 个字符并追加省略号。
@@ -500,6 +517,18 @@ pub fn normalize_lower(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constant_time_eq_matches_plain_equality() {
+        assert!(constant_time_eq(b"token-123", b"token-123"));
+        assert!(!constant_time_eq(b"token-123", b"token-124"));
+        // 长度不同直接 false（不 panic、不越界）
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(constant_time_eq(b"", b""));
+        // 中文 / 非 ASCII 按字节比较
+        assert!(constant_time_eq("口令".as_bytes(), "口令".as_bytes()));
+        assert!(!constant_time_eq("口令".as_bytes(), "口另".as_bytes()));
+    }
 
     #[test]
     fn truncate_keeps_short_and_clips_long() {

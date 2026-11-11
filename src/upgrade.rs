@@ -200,6 +200,35 @@ pub fn shadow_deploy_base(exe: &Path, base_env: Option<&str>) -> Option<PathBuf>
     exe.parent()?.parent()?.parent().map(Path::to_path_buf)
 }
 
+/// 若路径落在星尘影子目录形态 `<前缀>/shadow/<名>-<十六进制哈希>[/...]` 下，
+/// 返回去掉 `shadow/<...>` 之后的**实际目录**；否则 `None`。
+///
+/// 只认「`shadow` 下一级是 `<名>-<≥6 位十六进制>`」这种形态，避免把 `/data/shadow/iot`
+/// 这类普通目录误判。
+///
+/// 下沉自 Pek.Proxy `settings::strip_shadow_dir`（HlktechIoT `service.rs` 有同款实现，口径一致）。
+pub fn strip_shadow_dir(path: &Path) -> Option<PathBuf> {
+    let comps: Vec<_> = path.components().collect();
+    for (i, c) in comps.iter().enumerate() {
+        if c.as_os_str() != "shadow" || i == 0 || i + 1 >= comps.len() {
+            continue;
+        }
+        let leaf = comps[i + 1].as_os_str().to_string_lossy().to_string();
+        let is_shadow_leaf = match leaf.rsplit_once('-') {
+            Some((_, hash)) => hash.len() >= 6 && hash.chars().all(|ch| ch.is_ascii_hexdigit()),
+            None => false,
+        };
+        if is_shadow_leaf {
+            let mut out = PathBuf::new();
+            for item in &comps[..i] {
+                out.push(item.as_os_str());
+            }
+            return Some(out);
+        }
+    }
+    None
+}
+
 /// 按**魔数**把升级包解到 `dest`：支持 `.zip` 与 `.tar.gz`（不看扩展名，改名也不会解错）。
 ///
 /// - zip：`PK\x03\x04` → `crate::zip::extract_zip`（已防目录穿越 / 占用文件安全替换）；
@@ -1139,6 +1168,25 @@ mod tests {
         assert!(!is_executable(b"PK\x03\x04"));
         assert!(!is_executable(b""));
         assert!(!is_executable(b"M"));
+    }
+
+    #[test]
+    fn strip_shadow_dir_returns_real_dir_only_for_shadow_layout() {
+        // 星尘影子布局：`<实际目录>/shadow/<名>-<hex>/<程序>`
+        assert_eq!(
+            strip_shadow_dir(Path::new("/opt/x/shadow/pek-proxy-1a2b3c4d/pek-proxy")),
+            Some(PathBuf::from("/opt/x"))
+        );
+        assert_eq!(
+            strip_shadow_dir(Path::new("/opt/x/shadow/pek-proxy-1a2b3c4d")),
+            Some(PathBuf::from("/opt/x"))
+        );
+        // 普通目录不能被误判
+        assert_eq!(strip_shadow_dir(Path::new("/data/shadow")), None);
+        assert_eq!(strip_shadow_dir(Path::new("/data/shadow/iot")), None);
+        assert_eq!(strip_shadow_dir(Path::new("/data/shadow/iot-zzz")), None);
+        // 不在影子形态下
+        assert_eq!(strip_shadow_dir(Path::new("/opt/x/bin/pek-proxy")), None);
     }
 
     #[test]
