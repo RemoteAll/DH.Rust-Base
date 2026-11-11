@@ -32,6 +32,8 @@
 #[cfg(feature = "net")]
 pub mod controller;
 #[cfg(feature = "net")]
+pub mod body_budget;
+#[cfg(feature = "net")]
 pub mod http;
 #[cfg(feature = "http-client")]
 pub mod http_client;

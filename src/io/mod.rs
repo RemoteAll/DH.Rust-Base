@@ -329,6 +329,98 @@ pub fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// 探测目录是否可写（建目录 + 写删探测文件）；`None` = 可写，`Some(原因)` = 不可写。
+///
+/// **启动诊断必须先探测再初始化日志**：文件日志是后台线程异步开文件，目录不可写时
+/// 只会静默丢日志，症状就是「程序在跑但一条日志都没有」，很难定位。
+///
+/// 下沉自 Pek.Proxy `main::probe_writable_dir`。
+pub fn probe_writable_dir(dir: &Path) -> Option<String> {
+    if let Err(err) = std::fs::create_dir_all(dir) {
+        return Some(format!("创建目录失败：{err}"));
+    }
+    let probe = dir.join(".dhrust_write_probe");
+    if let Err(err) = std::fs::write(&probe, b"ok") {
+        return Some(format!("写入失败：{err}"));
+    }
+    let _ = std::fs::remove_file(&probe);
+    None
+}
+
+/// 收紧敏感文件权限（Unix：目录 `0700`、文件 `0600`；Windows 无操作，返回 0）。
+///
+/// - `dirs`：相对 `base` 的目录名（如 `["Config", "Data", "Log"]`），存在则设 `0700`；
+/// - `exts`：在上述目录下按**扩展名后缀**命中的普通文件设 `0600`
+///   （如 `["toml", "bak", "db", "db-wal", "db-shm", "log"]`，写成 `.db` 形式亦可）。
+///
+/// 为什么需要：`write_all_text_atomic` 只保证「原子」，**不管权限**；默认 umask 022 下
+/// 这些文件是 `0644`，同机任何本地用户都能读到上游 Key / 数据库口令 / 口令散列。
+/// 目录设 `0700` 还能挡住 SQLite 新建的 `-wal` / `-shm`（它们继承目录而非文件权限）。
+///
+/// 返回本次实际改动的目录/文件数（已是目标权限的不计），便于启动日志。
+/// 幂等，启动时调一次即可。下沉自 Pek.Proxy `security::harden_permissions`。
+pub fn harden_permissions(base: &Path, dirs: &[&str], exts: &[&str]) -> usize {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut changed = 0usize;
+        let mut chmod = |path: &Path, mode: u32| {
+            if !path.exists() {
+                return;
+            }
+            let current = std::fs::metadata(path)
+                .map(|meta| meta.permissions().mode() & 0o777)
+                .unwrap_or(0);
+            if current == mode {
+                return;
+            }
+            if std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).is_ok() {
+                changed += 1;
+            }
+        };
+
+        for dir in dirs {
+            chmod(&base.join(dir), 0o700);
+        }
+        // 扩展名统一去掉前导 `.`，比较时按 `.ext` 后缀
+        let suffixes: Vec<String> = exts
+            .iter()
+            .map(|ext| {
+                let trimmed = ext.trim().trim_start_matches('.');
+                format!(".{}", trimmed.to_ascii_lowercase())
+            })
+            .collect();
+        for dir in dirs {
+            let Ok(entries) = std::fs::read_dir(base.join(dir)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if suffixes.iter().any(|suffix| name.ends_with(suffix.as_str())) {
+                    chmod(&path, 0o600);
+                }
+            }
+        }
+        changed
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Windows 走 ACL（继承自目录），不在这里改；返回 0 表示无操作
+        let _ = (base, dirs, exts);
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
