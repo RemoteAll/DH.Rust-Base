@@ -94,27 +94,27 @@ pub fn form_decode(value: &str) -> String {
     decode_percent(value, true)
 }
 
-/// 百分号解码实现（`plus_as_space` 决定 `+` 的语义）。
-fn decode_percent(value: &str, plus_as_space: bool) -> String {
-    let bytes = value.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+/// 百分号解码**追加**到已有字节缓冲（热路径用：复用缓冲、调用方自己决定 UTF-8 策略）。
+///
+/// 语义与 [`url_decode`]/[`form_decode`] 一致：非法 `%` 序列原样保留，`plus_as_space`
+/// 决定 `+` 是否变空格。收编自 Pek.RWaf 的攻击特征规范化（原先那份实现与本模块重复）。
+pub fn percent_decode_into(value: &[u8], out: &mut Vec<u8>, plus_as_space: bool) {
     let mut index = 0;
-
-    while index < bytes.len() {
-        match bytes[index] {
+    while index < value.len() {
+        match value[index] {
             b'+' if plus_as_space => {
                 out.push(b' ');
                 index += 1;
             }
-            b'%' if index + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
-                match u8::from_str_radix(hex, 16) {
-                    Ok(byte) => {
-                        out.push(byte);
+            b'%' if index + 2 < value.len() => {
+                match (hex_nibble(value[index + 1]), hex_nibble(value[index + 2])) {
+                    (Some(hi), Some(lo)) => {
+                        out.push((hi << 4) | lo);
                         index += 3;
                     }
-                    Err(_) => {
-                        out.push(bytes[index]);
+                    // 非法十六进制（如 `%zz`、`%+1`）→ 保留 `%` 本身，逐个前进
+                    _ => {
+                        out.push(value[index]);
                         index += 1;
                     }
                 }
@@ -125,8 +125,37 @@ fn decode_percent(value: &str, plus_as_space: bool) -> String {
             }
         }
     }
+}
 
-    String::from_utf8_lossy(&out).to_string()
+/// 十六进制半字节（只认 `0-9a-fA-F`）。
+///
+/// 不能用 `u8::from_str_radix`：它接受前导 `+`/`-`，`%+1` 会被解成 `0x01`
+/// （历史实现即如此，收编时一并纠正）。
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// 百分号解码实现（`plus_as_space` 决定 `+` 的语义）。
+///
+/// 性能：不含 `%`（以及需要转的 `+`）时**直接返回原串**；
+/// 否则解码进 `Vec<u8>` 后由 `String::from_utf8` **接管缓冲**（合法 UTF-8 时零额外拷贝）。
+fn decode_percent(value: &str, plus_as_space: bool) -> String {
+    // `str::contains(char)` 走 memchr；不要手写字节循环（长文本会慢一个量级）
+    let needs = value.contains('%') || (plus_as_space && value.contains('+'));
+    if !needs {
+        return value.to_string();
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(value.len());
+    percent_decode_into(value.as_bytes(), &mut out, plus_as_space);
+    match String::from_utf8(out) {
+        Ok(text) => text,
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+    }
 }
 
 /// 解析查询串为键值对（`a=1&b=2`；键与值都做 [`form_decode`]）。
@@ -535,6 +564,17 @@ mod tests {
         assert_eq!(url_decode("%2"), "%2");
         // 非 UTF-8 字节不 panic
         assert_eq!(url_decode("%FF"), "\u{FFFD}");
+        // `%+1`/`%-1` 不是合法十六进制：必须整体原样保留
+        // （旧实现用 `u8::from_str_radix`，会把它解成 0x01/0x0-1 —— 已纠正）
+        assert_eq!(url_decode("%+1"), "%+1");
+        assert_eq!(url_decode("%-1"), "%-1");
+        // 无转义字符时走快路径，语义不变
+        assert_eq!(url_decode("plain/text"), "plain/text");
+        assert_eq!(form_decode("plain"), "plain");
+        // 逐字节解码（含中文多字节 + 大小写十六进制）
+        let mut out = Vec::new();
+        percent_decode_into("a%2B%2b%20b".as_bytes(), &mut out, true);
+        assert_eq!(String::from_utf8(out).unwrap(), "a++ b");
     }
 
     #[test]

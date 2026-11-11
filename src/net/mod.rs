@@ -185,6 +185,46 @@ pub fn split_host_port(text: &str, default_port: u16) -> (String, u16) {
     }
 }
 
+/// 剥掉 `IP:Port` / `host:port` 的端口，返回 host 切片（**零分配**）。
+///
+/// 兼容 `[::1]:8080`（带方括号的 IPv6）与 `1.2.3.4:80` / `example.com:443`；
+/// **裸 IPv6**（`::1`、`fe80::1`，多个冒号）与「端口不是纯数字」（`host:abc`）原样返回。
+/// 首尾空白会被裁掉。
+///
+/// 收编自 Pek.RWaf 的 `strip_port`（原先该函数还返回一个无用的元组，
+/// 且 `panel_auth` / `http` / `ws` 各自内联写了一份等价解析）。
+pub fn strip_port(addr: &str) -> &str {
+    let addr = addr.trim();
+    if addr.is_empty() {
+        return "";
+    }
+    if let Some(rest) = addr.strip_prefix('[') {
+        // `[v6]:port` / `[v6]`
+        return match rest.split_once(']') {
+            Some((host, _)) => host,
+            None => addr,
+        };
+    }
+    // 恰一个冒号且其后全是数字 → host:port；多冒号视为裸 IPv6
+    let candidate = addr.rsplit_once(':').filter(|(_, port)| {
+        addr.matches(':').count() == 1
+            && !port.is_empty()
+            && port.bytes().all(|b| b.is_ascii_digit())
+    });
+    match candidate {
+        Some((host, _)) => host,
+        None => addr,
+    }
+}
+
+/// 剥端口并**追加**到已有缓冲（复用容量、不额外分配）。
+///
+/// 热路径用（HTTP 每请求都要取客户端 IP）：`out.push_str(strip_port(addr))` 的封装，
+/// 语义见 [`strip_port`]。
+pub fn strip_port_into(addr: &str, out: &mut String) {
+    out.push_str(strip_port(addr));
+}
+
 // ———— IP / CIDR（面板 IP 白名单、来源校验；Pek.RPanlServer 与 HlktechIoT 重复实现收编）————
 
 /// 解析 IP 文本（IPv4/IPv6）；**IPv4-mapped IPv6 归一为 IPv4**（`::ffff:1.2.3.4` → `1.2.3.4`）。
@@ -327,6 +367,30 @@ mod tests {
         assert_eq!(split_host_port("host:abc", 80), ("host".to_string(), 80));
         // IPv6 字面量：按最后一个冒号切分（`[::1]:80`）
         assert_eq!(split_host_port("[::1]:80", 0), ("[::1]".to_string(), 80));
+    }
+
+    #[test]
+    fn strip_port_variants() {
+        // IPv4 / 域名 + 端口
+        assert_eq!(strip_port("127.0.0.1:5500"), "127.0.0.1");
+        assert_eq!(strip_port("example.com:443"), "example.com");
+        assert_eq!(strip_port(" 1.2.3.4:80 "), "1.2.3.4", "首尾空白要裁掉");
+        // 无端口原样
+        assert_eq!(strip_port("127.0.0.1"), "127.0.0.1");
+        assert_eq!(strip_port(""), "");
+        // 带方括号的 IPv6（去括号去端口）
+        assert_eq!(strip_port("[::1]:8080"), "::1");
+        assert_eq!(strip_port("[::1]"), "::1");
+        // 裸 IPv6（多冒号）不能被当成 host:port
+        assert_eq!(strip_port("::1"), "::1");
+        assert_eq!(strip_port("fe80::1"), "fe80::1");
+        // 端口不是数字 → 原样返回（不猜）
+        assert_eq!(strip_port("host:abc"), "host:abc");
+        assert_eq!(strip_port("host:"), "host:");
+        // 追加到已有缓冲与直接返回等价
+        let mut out = String::from("prefix:");
+        strip_port_into("10.0.0.9:5000", &mut out);
+        assert_eq!(out, "prefix:10.0.0.9");
     }
 
     #[test]

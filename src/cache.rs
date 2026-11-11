@@ -291,6 +291,127 @@ where
     }
 }
 
+/// 每线程「小 memo」：固定槽位、零分配、无锁。
+///
+/// 解决的场景：**同一串输入在热路径上被反复分类/解析**，且候选值很少——
+/// 典型是 User-Agent（浏览器/SDK 每次请求都一样）、Host、模型名、Content-Type。
+/// 这类判定常常是「几十上百个关键词逐个 `contains`」，不命中时还更慢；
+/// memo 之后重复输入只付一次哈希的代价。
+///
+/// 与 [`TtlCache`] 的分工：`TtlCache` 是**跨线程 + 有容量上限 + 存克隆值**，
+/// 适合元数据；`TinyMemo` 是**每线程 + 固定 8 槽 + 只存 `Copy` 小值**，
+/// 适合「判定结果」这类极热、极小、无需过期的数据。**不要**用它缓存大对象。
+///
+/// 用法：放进 `thread_local!`，值类型用 `Copy`（如 `Option<BotKind>`）：
+///
+/// ```ignore
+/// thread_local! {
+///     static UA_MEMO: RefCell<TinyMemo<Option<BotKind>>> = const { RefCell::new(TinyMemo::new()) };
+/// }
+/// UA_MEMO.with(|m| m.borrow_mut().get_or_insert_ignore_ascii_case(ua, || classify(ua)))
+/// ```
+///
+/// 键用「折叠大小写后的两路 64 位哈希 + 长度」，因此**不需要保存键的副本**；
+/// 两路独立哈希把碰撞概率压到可忽略（碰撞的后果也只是取到别的输入的判定结果）。
+/// 每线程「小 memo」次位数（实际流量里不同输入通常只有个位数）。
+const TINY_MEMO_SLOTS: usize = 8;
+
+pub struct TinyMemo<V: Copy> {
+    /// 槽位（`None` = 空）；轮换写入，不做过期。
+    slots: [Option<(u64, u64, u32, V)>; TINY_MEMO_SLOTS],
+    /// 下一次写入的槽位。
+    next: usize,
+}
+
+impl<V: Copy> TinyMemo<V> {
+    /// 槽位数。
+    pub const SLOTS: usize = TINY_MEMO_SLOTS;
+
+    /// 新建空 memo。
+    pub const fn new() -> Self {
+        Self {
+            slots: [None; TINY_MEMO_SLOTS],
+            next: 0,
+        }
+    }
+
+    /// 槽位数。
+    pub fn capacity(&self) -> usize {
+        Self::SLOTS
+    }
+
+    /// 精确匹配取结果；未命中时用 `compute` 计算并写入（轮换淘汰）。
+    ///
+    /// # 参数
+    /// - `key`：缓存键。
+    /// - `compute`：未命中时的计算闭包（只会在未命中时调用一次）。
+    pub fn get_or_insert<F>(&mut self, key: &str, compute: F) -> V
+    where
+        F: FnOnce() -> V,
+    {
+        self.get_or_insert_with_hash(hash_key(key, false), key.len() as u32, compute)
+    }
+
+    /// 大小写不敏感取结果（ASCII 折叠）：适不适合区分大小写的键（UA / Host / 模型名）。
+    ///
+    /// # 参数
+    /// - `key`：缓存键（比较前按 ASCII 折叠大小写）。
+    /// - `compute`：未命中时的计算闭包。
+    pub fn get_or_insert_ignore_ascii_case<F>(&mut self, key: &str, compute: F) -> V
+    where
+        F: FnOnce() -> V,
+    {
+        self.get_or_insert_with_hash(hash_key(key, true), key.len() as u32, compute)
+    }
+
+    fn get_or_insert_with_hash<F>(&mut self, hash: (u64, u64), len: u32, compute: F) -> V
+    where
+        F: FnOnce() -> V,
+    {
+        if let Some(hit) = self
+            .slots
+            .iter()
+            .flatten()
+            .find(|(a, b, l, _)| *a == hash.0 && *b == hash.1 && *l == len)
+        {
+            return hit.3;
+        }
+        let value = compute();
+        self.slots[self.next] = Some((hash.0, hash.1, len, value));
+        self.next = (self.next + 1) % TINY_MEMO_SLOTS;
+        value
+    }
+
+    /// 清空全部槽位（配置变更后想强制重算时用）。
+    pub fn clear(&mut self) {
+        self.slots = [None; TINY_MEMO_SLOTS];
+        self.next = 0;
+    }
+}
+
+impl<V: Copy> Default for TinyMemo<V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 键哈希：`(h1, h2)` 两路（`fold_case` 决定是否折叠 ASCII 大小写）。
+fn hash_key(key: &str, fold_case: bool) -> (u64, u64) {
+    let mut h1: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a
+    let mut h2: u64 = 0x9e37_79b9_7f4a_7c15; // 另一随机种子
+    for &b in key.as_bytes() {
+        let b = if fold_case { b.to_ascii_lowercase() } else { b };
+        h1 = (h1 ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        h2 = (h2 ^ b as u64).wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h2 = h2.rotate_left(17) ^ (h2 >> 29);
+    }
+    // 长度并入 h1：不同长度撞同一槽的概率进一步降低
+    (
+        h1 ^ (key.len() as u64).wrapping_mul(0x27d4_eb2d),
+        h2,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,5 +572,64 @@ mod tests {
         assert_eq!(cache.get(&2), Some(2));
         cache.clear();
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn tiny_memo_hits_and_rotation() {
+        let mut memo: TinyMemo<i32> = TinyMemo::new();
+        let mut calls = 0;
+        // 首次计算、第二次命中
+        assert_eq!(
+            memo.get_or_insert("curl/8.4.0", || {
+                calls += 1;
+                7
+            }),
+            7
+        );
+        assert_eq!(
+            memo.get_or_insert("curl/8.4.0", || {
+                calls += 1;
+                99
+            }),
+            7,
+            "命中后不应再计算"
+        );
+        assert_eq!(calls, 1);
+
+        // 大小写不敏感：不同写法命中同一槽
+        assert_eq!(
+            memo.get_or_insert_ignore_ascii_case("CURL/8.4.0", || {
+                calls += 1;
+                0
+            }),
+            7
+        );
+        assert_eq!(calls, 1);
+
+        // 超出槽数（8）后仍不能串味
+        for i in 0..40 {
+            let key = format!("Agent-{i}/1.0");
+            assert_eq!(memo.get_or_insert(&key, || i), i as i32);
+        }
+        for i in 0..8 {
+            let key = format!("Agent-{}/1.0", 32 + i);
+            assert_eq!(memo.get_or_insert(&key, || -1), (32 + i) as i32);
+        }
+
+        // 清空后重新计算
+        memo.clear();
+        assert_eq!(memo.get_or_insert("curl/8.4.0", || 5), 5);
+    }
+
+    #[test]
+    fn tiny_memo_distinguishes_similar_keys() {
+        let mut memo: TinyMemo<&'static str> = TinyMemo::new();
+        assert_eq!(memo.get_or_insert("abc", || "abc"), "abc");
+        assert_eq!(memo.get_or_insert("abd", || "abd"), "abd");
+        // 仅大小写不同在「精确模式」下是两个不同的键
+        assert_eq!(memo.get_or_insert("ABC", || "ABC"), "ABC");
+        // 空键也能用
+        assert_eq!(memo.get_or_insert("", || "empty"), "empty");
+        assert_eq!(memo.get_or_insert("", || "miss"), "empty");
     }
 }

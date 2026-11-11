@@ -387,6 +387,81 @@ pub fn conn_same(a: &str, b: &str) -> bool {
     norm(a) == norm(b)
 }
 
+/// 取字节序列前 `max` 字节做 **UTF-8 宽松**预览（合法时**零拷贝借用**，不合法才替换坏字节）。
+///
+/// 为什么不用「先整体 `from_utf8` 失败再 lossy」：那样在合法路径上也要先扫一遍再拷一份。
+/// 这里的语义是「尽量多看，坏字节替换成 `\u{FFFD}` 后继续」，因此**适合安全检测**
+/// （二进制/混合编码的 payload 不会被整段跳过）；若只是想截一段给人看，用
+/// [`truncate_chars`] 更合适（按字符数、附省略号）。
+///
+/// 收编自 Pek.RWaf 的 body 预览（原先每个扫描器各写一份 `from_utf8` + lossy 回退）。
+pub fn utf8_lossy_prefix(bytes: &[u8], max: usize) -> std::borrow::Cow<'_, str> {
+    if max == 0 || bytes.is_empty() {
+        return std::borrow::Cow::Borrowed("");
+    }
+    let cap = bytes.len().min(max);
+    let head = &bytes[..cap];
+    match std::str::from_utf8(head) {
+        // 合法 UTF-8（绝大多数文本 body）：直接借用，不拷贝
+        Ok(text) => std::borrow::Cow::Borrowed(text),
+        // 有坏字节（二进制 / 截断点在多字节字符中间）：替换坏字节后继续
+        Err(_) => std::borrow::Cow::Owned(String::from_utf8_lossy(head).into_owned()),
+    }
+}
+
+/// 折叠空白 + 转小写（特征匹配/搜索归一化）。
+///
+/// 语义：连续空白折叠成一个空格、去掉首尾空白（首部不会有前导空格）、ASCII 字母转小写；
+/// 非 ASCII 字符**不做**大小写变换（与 `str::to_lowercase` 不同，这里只求稳定可比）。
+///
+/// 多段版本把各段视为**直接相连**（分隔符由调用方作为独立段给出），因此可以
+/// 零拼接地规范化「路径 + `?` + 查询串 + 空格 + body」这种组合——
+/// 收编自 Pek.RWaf 的攻击特征扫描（原先用 `format!` 拼一整份正文再处理）。
+pub fn normalize_lower_parts(parts: &[&str]) -> String {
+    let capacity: usize = parts.iter().map(|p| p.len()).sum();
+    // 全 ASCII 走字节路径（不逐 `char` 解码再编码）；`capacity` 必须预分配，
+    // 否则长文本会因 `String` 反复扩容重拷，比不规范化还慢（实测慢 63%）。
+    if parts.iter().all(|s| s.is_ascii()) {
+        let mut out: Vec<u8> = Vec::with_capacity(capacity);
+        let mut last_space = true;
+        for seg in parts {
+            for &b in seg.as_bytes() {
+                if b.is_ascii_whitespace() {
+                    if !last_space {
+                        out.push(b' ');
+                        last_space = true;
+                    }
+                } else {
+                    out.push(b.to_ascii_lowercase());
+                    last_space = false;
+                }
+            }
+        }
+        return String::from_utf8(out).expect("纯 ASCII 缓冲必定是合法 UTF-8");
+    }
+    let mut out = String::with_capacity(capacity);
+    let mut last_space = true;
+    for seg in parts {
+        for c in seg.chars() {
+            if c.is_whitespace() {
+                if !last_space {
+                    out.push(' ');
+                    last_space = true;
+                }
+            } else {
+                out.push(c.to_ascii_lowercase());
+                last_space = false;
+            }
+        }
+    }
+    out
+}
+
+/// 单段版本的 [`normalize_lower_parts`]。
+pub fn normalize_lower(text: &str) -> String {
+    normalize_lower_parts(&[text])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
