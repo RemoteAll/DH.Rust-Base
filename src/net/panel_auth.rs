@@ -127,12 +127,33 @@ pub fn client_ip_behind_proxy(
     trusted_proxies: &str,
     trust: bool,
 ) -> String {
+    let mut out = String::new();
+    client_ip_behind_proxy_into(peer, forwarded_for, real_ip, trusted_proxies, trust, &mut out);
+    out
+}
+
+/// 同 [`client_ip_behind_proxy`]，但写进**已有缓冲**（热路径用：每请求一次、复用容量）。
+///
+/// # 参数
+/// - `out`：输出缓冲（**会先清空**；容量保留）
+/// - 其余参数同 [`client_ip_behind_proxy`]
+pub fn client_ip_behind_proxy_into(
+    peer: &str,
+    forwarded_for: Option<&str>,
+    real_ip: Option<&str>,
+    trusted_proxies: &str,
+    trust: bool,
+    out: &mut String,
+) {
+    out.clear();
     let peer = peer.trim();
     if peer.is_empty() {
-        return "unknown".to_string();
+        out.push_str("unknown");
+        return;
     }
     if !trust {
-        return peer.to_string();
+        out.push_str(peer);
+        return;
     }
 
     let from_trusted = is_loopback(peer)
@@ -142,7 +163,8 @@ pub fn client_ip_behind_proxy(
             .filter(|item| !item.is_empty())
             .any(|item| item.eq_ignore_ascii_case(peer));
     if !from_trusted {
-        return peer.to_string();
+        out.push_str(peer);
+        return;
     }
 
     if let Some(value) = forwarded_for {
@@ -155,18 +177,20 @@ pub fn client_ip_behind_proxy(
             .rev()
             .find(|item| item.parse::<std::net::IpAddr>().is_ok())
         {
-            return last.to_string();
+            out.push_str(last);
+            return;
         }
     }
 
     if let Some(value) = real_ip {
         let trimmed = value.trim();
         if trimmed.parse::<std::net::IpAddr>().is_ok() {
-            return trimmed.to_string();
+            out.push_str(trimmed);
+            return;
         }
     }
 
-    peer.to_string()
+    out.push_str(peer);
 }
 
 /// 请求鉴权：按鉴权级别判定。

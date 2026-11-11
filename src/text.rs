@@ -418,12 +418,25 @@ pub fn utf8_lossy_prefix(bytes: &[u8], max: usize) -> std::borrow::Cow<'_, str> 
 /// 零拼接地规范化「路径 + `?` + 查询串 + 空格 + body」这种组合——
 /// 收编自 Pek.RWaf 的攻击特征扫描（原先用 `format!` 拼一整份正文再处理）。
 pub fn normalize_lower_parts(parts: &[&str]) -> String {
-    let capacity: usize = parts.iter().map(|p| p.len()).sum();
-    // 全 ASCII 走字节路径（不逐 `char` 解码再编码）；`capacity` 必须预分配，
-    // 否则长文本会因 `String` 反复扩容重拷，比不规范化还慢（实测慢 63%）。
+    let mut out: Vec<u8> = Vec::with_capacity(parts.iter().map(|p| p.len()).sum());
+    normalize_lower_bytes_into(parts, &mut out);
+    String::from_utf8(out).expect("规范化输出必定是合法 UTF-8")
+}
+
+/// 折叠空白 + 转小写，写进**已有字节缓冲**（复用容量、零分配）。
+///
+/// 热路径用（每请求都要规范化路径/查询串）：调用方持有 `Vec<u8>` 反复使用，
+/// 只需 `std::str::from_utf8(&buf)` 就能拿去扫描/比较。语义同 [`normalize_lower_parts`]。
+///
+/// # 参数
+/// - `parts`：按顺序直接相连的多段文本（分隔符由调用方作为独立段给出）
+/// - `out`：输出缓冲（**会先清空**；容量保留）
+pub fn normalize_lower_bytes_into(parts: &[&str], out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(parts.iter().map(|p| p.len()).sum::<usize>());
+    let mut last_space = true; // 起始不留前导空格
     if parts.iter().all(|s| s.is_ascii()) {
-        let mut out: Vec<u8> = Vec::with_capacity(capacity);
-        let mut last_space = true;
+        // 全 ASCII 走字节路径（不逐 `char` 解码再编码）
         for seg in parts {
             for &b in seg.as_bytes() {
                 if b.is_ascii_whitespace() {
@@ -437,24 +450,46 @@ pub fn normalize_lower_parts(parts: &[&str]) -> String {
                 }
             }
         }
-        return String::from_utf8(out).expect("纯 ASCII 缓冲必定是合法 UTF-8");
+        return;
     }
-    let mut out = String::with_capacity(capacity);
-    let mut last_space = true;
+    // 含非 ASCII：逐字符判定空白，UTF-8 手工写字节。
+    // **不要**用 `encode_utf8(..).as_bytes()` + `extend_from_slice`：实测 16 KB 中文正文
+    // 规范化 20 µs → 56 µs（慢 2.8 倍，多了临时切片与 memcpy 调用），`push` 才是直写备用容量。
     for seg in parts {
         for c in seg.chars() {
             if c.is_whitespace() {
                 if !last_space {
-                    out.push(' ');
+                    out.push(b' ');
                     last_space = true;
                 }
             } else {
-                out.push(c.to_ascii_lowercase());
+                push_char_lower(out, c);
                 last_space = false;
             }
         }
     }
-    out
+}
+
+/// 把字符（ASCII 转小写、非 ASCII 原样）按 UTF-8 写进字节缓冲。
+///
+/// `char` 不可能是代理项，所以手工编码的结果必定是合法 UTF-8。
+fn push_char_lower(out: &mut Vec<u8>, c: char) {
+    let code = c.to_ascii_lowercase() as u32;
+    if code < 0x80 {
+        out.push(code as u8);
+    } else if code < 0x800 {
+        out.push(0xC0 | (code >> 6) as u8);
+        out.push(0x80 | (code & 0x3F) as u8);
+    } else if code < 0x1_0000 {
+        out.push(0xE0 | (code >> 12) as u8);
+        out.push(0x80 | ((code >> 6) & 0x3F) as u8);
+        out.push(0x80 | (code & 0x3F) as u8);
+    } else {
+        out.push(0xF0 | (code >> 18) as u8);
+        out.push(0x80 | ((code >> 12) & 0x3F) as u8);
+        out.push(0x80 | ((code >> 6) & 0x3F) as u8);
+        out.push(0x80 | (code & 0x3F) as u8);
+    }
 }
 
 /// 单段版本的 [`normalize_lower_parts`]。
@@ -706,5 +741,113 @@ mod tests {
         assert!(!conn_same("Server=a;Database=DH", "Server=b;Database=DH"));
         // 少一个真实段也不算同一个库（ShowSql 是唯一被忽略的段）
         assert!(!conn_same("Server=a", "Server=a;Pooling=false"));
+    }
+
+    #[test]
+    fn normalize_lower_matches_char_collect() {
+        // 中文 / 全角空格 / 表情 / 大小写混杂 / 连续空白
+        let cases = [
+            "Hello   World",
+            "  招商银行\t经典  \n白金卡 ",
+            "ＡＢＣ　全角空格",
+            "emoji 😀 混排",
+            "a\n\tb\r\nc",
+            "",
+        ];
+        for case in cases {
+            let expect: String = {
+                let mut s = String::new();
+                let mut last_space = true;
+                for c in case.chars() {
+                    if c.is_whitespace() {
+                        if !last_space {
+                            s.push(' ');
+                            last_space = true;
+                        }
+                    } else {
+                        s.push(c.to_ascii_lowercase());
+                        last_space = false;
+                    }
+                }
+                s
+            };
+            assert_eq!(normalize_lower(case), expect, "case={case:?}");
+        }
+    }
+
+    /// 基准：非 ASCII 规范化三种实现的同进程对比（避免跨次测量被机器负载带偏）。
+    ///
+    /// 手动跑：`cargo test --release --lib bench::normalize_non_ascii_variants -- --ignored --nocapture`
+    #[test]
+    #[ignore = "bench（手动运行）"]
+    fn bench_normalize_non_ascii_variants() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const N: usize = 3_000;
+        let unit = "{\"role\":\"user\",\"content\":\"请帮我总结这份招标文件里的技术要求与评分办法\"},";
+        let mut text = String::from("{\"messages\":[");
+        while text.len() < 16 * 1024 {
+            text.push_str(unit);
+        }
+        text.push_str("]}");
+
+        let measure = |mut f: Box<dyn FnMut()>| -> f64 {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let started = Instant::now();
+                for _ in 0..N {
+                    f();
+                }
+                best = best.min(started.elapsed().as_nanos() as f64 / N as f64);
+            }
+            best
+        };
+
+        let mut buf = Vec::new();
+        let bytes_impl = measure(Box::new(|| {
+            normalize_lower_bytes_into(&[&text], &mut buf);
+            black_box(&buf);
+        }));
+        let string_impl = measure(Box::new(|| {
+            // 旧实现（String + push(char)）
+            let mut out = String::with_capacity(text.len());
+            let mut last_space = true;
+            for c in text.chars() {
+                if c.is_whitespace() {
+                    if !last_space {
+                        out.push(' ');
+                        last_space = true;
+                    }
+                } else {
+                    out.push(c.to_ascii_lowercase());
+                    last_space = false;
+                }
+            }
+            black_box(&out);
+        }));
+        let encode_utf8_impl = measure(Box::new(|| {
+            // 上一版实现（encode_utf8 + extend_from_slice）
+            let mut out: Vec<u8> = Vec::with_capacity(text.len());
+            let mut scratch = [0u8; 4];
+            let mut last_space = true;
+            for c in text.chars() {
+                if c.is_whitespace() {
+                    if !last_space {
+                        out.push(b' ');
+                        last_space = true;
+                    }
+                } else {
+                    out.extend_from_slice(c.to_ascii_lowercase().encode_utf8(&mut scratch).as_bytes());
+                    last_space = false;
+                }
+            }
+            black_box(&out);
+        }));
+        println!(
+            "16KB 中文正文：字节实现 {bytes_impl:.0} ns；String 实现 {string_impl:.0} ns；\
+             encode_utf8 版 {encode_utf8_impl:.0} ns"
+        );
+        assert!(bytes_impl > 0.0);
     }
 }

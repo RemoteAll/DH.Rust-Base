@@ -382,6 +382,21 @@ impl<V: Copy> TinyMemo<V> {
         value
     }
 
+    /// 用**调用方自算的哈希**取结果（复合键用：如「路径 + 分隔符 + 查询串」）。
+    ///
+    /// 用 [`KeyHasher`] 生成 `hash`/`len`，保证与 [`Self::get_or_insert`] 同一套算法。
+    ///
+    /// # 参数
+    /// - `hash`：两路 64 位哈希
+    /// - `len`：键的总字节数（并入比较，进一步降低碰撞）
+    /// - `compute`：未命中时的计算闭包
+    pub fn get_or_insert_hashed<F>(&mut self, hash: (u64, u64), len: u32, compute: F) -> V
+    where
+        F: FnOnce() -> V,
+    {
+        self.get_or_insert_with_hash(hash, len, compute)
+    }
+
     /// 清空全部槽位（配置变更后想强制重算时用）。
     pub fn clear(&mut self) {
         self.slots = [None; TINY_MEMO_SLOTS];
@@ -397,19 +412,66 @@ impl<V: Copy> Default for TinyMemo<V> {
 
 /// 键哈希：`(h1, h2)` 两路（`fold_case` 决定是否折叠 ASCII 大小写）。
 fn hash_key(key: &str, fold_case: bool) -> (u64, u64) {
-    let mut h1: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a
-    let mut h2: u64 = 0x9e37_79b9_7f4a_7c15; // 另一随机种子
-    for &b in key.as_bytes() {
-        let b = if fold_case { b.to_ascii_lowercase() } else { b };
-        h1 = (h1 ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
-        h2 = (h2 ^ b as u64).wrapping_mul(0xff51_afd7_ed55_8ccd);
-        h2 = h2.rotate_left(17) ^ (h2 >> 29);
+    let mut hasher = KeyHasher::new(fold_case);
+    hasher.write_str(key);
+    hasher.finish().0
+}
+
+/// 增量键哈希器：给**复合键**（多段文本）算 `TinyMemo` 用的两路哈希。
+///
+/// 用法：`KeyHasher::new(false)` 后按顺序 `write_str` 各段（段间建议写一个分隔字节，
+/// 或直接依赖 `len` 一起参与比较），最后 `finish()` 拿 `(hash, len)` 交给
+/// [`TinyMemo::get_or_insert_hashed`]。
+///
+/// 与 `TinyMemo` 内部用的是同一套算法（FNV-1a + 第二路乘法/旋转），换实现时两边一起改。
+pub struct KeyHasher {
+    h1: u64,
+    h2: u64,
+    len: u32,
+    fold_case: bool,
+}
+
+impl KeyHasher {
+    /// 新建（`fold_case` = 是否折叠 ASCII 大小写）。
+    pub fn new(fold_case: bool) -> Self {
+        Self {
+            h1: 0xcbf2_9ce4_8422_2325,           // FNV-1a
+            h2: 0x9e37_79b9_7f4a_7c15,           // 另一随机种子
+            len: 0,
+            fold_case,
+        }
     }
-    // 长度并入 h1：不同长度撞同一槽的概率进一步降低
-    (
-        h1 ^ (key.len() as u64).wrapping_mul(0x27d4_eb2d),
-        h2,
-    )
+
+    /// 写入一段字节。
+    pub fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            let b = if self.fold_case {
+                b.to_ascii_lowercase()
+            } else {
+                b
+            };
+            self.h1 = (self.h1 ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+            self.h2 = (self.h2 ^ b as u64).wrapping_mul(0xff51_afd7_ed55_8ccd);
+            self.h2 = self.h2.rotate_left(17) ^ (self.h2 >> 29);
+        }
+        self.len = self.len.saturating_add(bytes.len() as u32);
+    }
+
+    /// 写入一段文本。
+    pub fn write_str(&mut self, text: &str) {
+        self.write(text.as_bytes());
+    }
+
+    /// 结束：返回 `((h1, h2), 总字节数)`。
+    pub fn finish(self) -> ((u64, u64), u32) {
+        (
+            (
+                self.h1 ^ (self.len as u64).wrapping_mul(0x27d4_eb2d),
+                self.h2,
+            ),
+            self.len,
+        )
+    }
 }
 
 #[cfg(test)]
