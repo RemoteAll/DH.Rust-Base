@@ -193,6 +193,61 @@ pub fn client_ip_behind_proxy_into(
     out.push_str(peer);
 }
 
+/// **反代后的真实客户端 IP + 是否经反代**：返回 `(ip, proxied)`。
+///
+/// 与 [`client_ip_behind_proxy`] 是两个**明确区分**的口径，不要混用：
+///
+/// | 口径 | 头部优先级 | 受信代理列表 | 额外信息 |
+/// |---|---|---|---|
+/// | [`client_ip_behind_proxy`] | XFF 末段 → X-Real-IP | 支持 | 只返回 IP |
+/// | 本函数 | **X-Real-IP → XFF 末段** | 不支持（只认回环） | 返回「是否经反代」 |
+///
+/// 为什么需要第二个：`LocalOnly`（本机回环免登录）这类判定不仅要知道 IP，还要知道
+/// 「这次请求是不是经过反代转来的」——对端是回环又带转发头，说明背后是**远程**客户端，
+/// 不能给本机免登录待遇（否则 nginx 一挂，面板就等于对外开放）。
+///
+/// 判定顺序：
+/// 1. 对端为空 → `("unknown", false)`；对端不是回环 → `(对端, false)`，转发头一概不看（防直连伪造）；
+/// 2. 对端是回环但没有任何转发头 → `(对端, false)`，就是本机自己；
+/// 3. 对端是回环、有转发头但 `trust = false` → `(对端, true)`：IP 仍是回环，但**标记为反代请求**；
+/// 4. `trust = true` → 取 `X-Real-IP`（去引号 / 去端口），没有则取 XFF 末段，都没有则回退对端，返回 `(ip, true)`。
+///
+/// 注意：本函数**不校验**转发头里的值是否是合法 IP（与调用方既有行为一致，转发头原样透传便于排查）；
+/// 需要严格校验请用 [`client_ip_behind_proxy`]。收编自 Pek.RAgent `webpanel::resolve_client_ip`。
+pub fn client_ip_with_proxy_flag(
+    peer: &str,
+    real_ip: Option<&str>,
+    forwarded_for: Option<&str>,
+    trust: bool,
+) -> (String, bool) {
+    let peer = peer.trim();
+    if peer.is_empty() {
+        return ("unknown".to_string(), false);
+    }
+    if !is_loopback(peer) {
+        return (peer.to_string(), false);
+    }
+    let real = real_ip.map(str::trim).filter(|s| !s.is_empty());
+    let xff = forwarded_for.map(str::trim).filter(|s| !s.is_empty());
+    if real.is_none() && xff.is_none() {
+        return (peer.to_string(), false);
+    }
+    if !trust {
+        return (peer.to_string(), true);
+    }
+    let raw = match (real, xff) {
+        (Some(value), _) => value.to_string(),
+        (None, Some(value)) => value.rsplit(',').next().unwrap_or(value).trim().to_string(),
+        (None, None) => peer.to_string(),
+    };
+    let cleaned = crate::net::strip_port(raw.trim().trim_matches('"')).to_string();
+    if cleaned.is_empty() {
+        (peer.to_string(), true)
+    } else {
+        (cleaned, true)
+    }
+}
+
 /// 请求鉴权：按鉴权级别判定。
 ///
 /// - `None`：全部放行；
@@ -662,5 +717,46 @@ mod tests {
 
         // 8) 空对端
         assert_eq!(client_ip_behind_proxy("", Some("1.2.3.4"), None, "", true), "unknown");
+    }
+
+    /// 新口径：`X-Real-IP` 优先 + 返回「是否经反代」（供本机免登录判定用）。
+    #[test]
+    fn client_ip_with_proxy_flag_reports_proxy() {
+        // 直连本机：没有转发头 → 不是反代
+        assert_eq!(
+            client_ip_with_proxy_flag("127.0.0.1", None, None, false),
+            ("127.0.0.1".to_string(), false)
+        );
+        // 回环对端 + 转发头但未信任：IP 仍是回环，但要标记为反代请求（不能给免登录）
+        assert_eq!(
+            client_ip_with_proxy_flag("127.0.0.1", None, Some("203.0.113.9"), false),
+            ("127.0.0.1".to_string(), true)
+        );
+        // 信任后 X-Real-IP 优先，且去掉引号与端口
+        assert_eq!(
+            client_ip_with_proxy_flag(
+                "127.0.0.1",
+                Some("\"203.0.113.9:1234\""),
+                Some("10.0.0.1"),
+                true
+            )
+            .0,
+            "203.0.113.9"
+        );
+        // 没有 X-Real-IP → 取 XFF 末段（左侧可伪造，只信最后一跳）
+        assert_eq!(
+            client_ip_with_proxy_flag("127.0.0.1", None, Some("9.9.9.9, 203.0.113.9"), true).0,
+            "203.0.113.9"
+        );
+        // 非回环对端：转发头一概不采信，且不算反代
+        assert_eq!(
+            client_ip_with_proxy_flag("198.51.100.5", Some("127.0.0.1"), Some("127.0.0.1"), true),
+            ("198.51.100.5".to_string(), false)
+        );
+        // 空对端
+        assert_eq!(
+            client_ip_with_proxy_flag("  ", Some("1.2.3.4"), None, true),
+            ("unknown".to_string(), false)
+        );
     }
 }
