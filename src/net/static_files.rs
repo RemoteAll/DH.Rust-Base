@@ -7,7 +7,13 @@
 //! - **根目录可配**：根目录是 [`StaticFiles::new`] 的参数（**默认约定 `wwwroot` 由调用方决定**），
 //!   业务系统可按自己的配置改成任意路径（如 `data/wwwroot` 或绝对路径）；
 //! - **目录模式**：[`StaticFiles::new`]（或 [`StaticFiles::default`] = `wwwroot`），
-//!   按请求读盘（开发友好，改文件即生效）；
+//!   按请求读盘（开发友好，改文件即生效）；**返回值是流式响应**——磁盘文件只做 `metadata`，
+//!   响应里带路径与长度，由 `net::http` 异步分块发送（不整读进内存，下载大包也不涨内存）；
+//! - **未知扩展名默认拒绝**（对齐 ASP.NET Core `ServeUnknownFileTypes = false`）：
+//!   只下发 MIME 表已知的类型（`.html`/`.js`/`.css`/图片/字体/`.zip`/`.pdf`/`.mp4` …）；
+//!   `.bak`/`.db`/无扩展名这类“非常规文件”默认 404，两种放开方式：
+//!   [`StaticFiles::with_mime_type`]（只放开指定格式）或
+//!   [`StaticFiles::serve_unknown_file_types`]`(true)`（全部放开，适用于“下载任意文件”后台）；
 //! - **嵌入模式**：[`StaticFiles::embed`] / [`StaticFiles::embed_many`] 注册编译期资源
 //!   （`include_bytes!`/`include_str!`），与目录叠加（嵌入优先），适合单文件部署；
 //!   批量资源表一般由消费方 `build.rs` 扫描前端 `dist` 生成（见 `Doc/SPA与MVC一体化.md`）；
@@ -16,7 +22,8 @@
 //!   （如 `/api`）用 [`StaticFiles::spa_excludes`] 排除，保持 JSON 404；
 //! - **条件请求**：静态响应携带 `ETag` 与 `Cache-Control: no-cache`；
 //!   [`StaticFiles::try_serve_request`] 在命中后处理 `If-None-Match`（未变 → `304` 空体），
-//!   面板/资源重复打开与刷新零正文流量（嵌入资源强 ETag；磁盘文件长度+修改时间弱 ETag）；
+//!   面板/资源重复打开与刷新零正文流量（嵌入资源强 ETag；磁盘文件长度+修改时间弱 ETag，
+//!   **304 不打开文件**）；
 //! - **约定**：路径 `/` 或目录尾斜杠命中 `index.html` 默认文档；
 //!   `..`/反斜杠/盘符/空段等危险路径直接拒绝（防目录穿越）；
 //! - **用法**：通常挂到路由 fallback——命中返回文件，未命中 `None` 由调用方决定 404：
@@ -62,6 +69,10 @@ pub struct StaticFiles {
     spa: bool,
     /// SPA 排除前缀（已归一化：小写、前导 `/`、无尾 `/`）
     spa_excludes: Vec<String>,
+    /// 未知扩展名是否允许下载（**默认 `false`**，对齐 ASP.NET Core `ServeUnknownFileTypes = false`）
+    serve_unknown_types: bool,
+    /// 额外 MIME 映射（扩展名小写、不含点 → `Content-Type`）
+    mime_overrides: HashMap<String, String>,
 }
 
 /// 嵌入资源条目（注册期预计算强 ETag：条件请求 304 命中零计算成本）。
@@ -95,6 +106,8 @@ impl StaticFiles {
             embedded: HashMap::new(),
             spa: false,
             spa_excludes: Vec::new(),
+            serve_unknown_types: false,
+            mime_overrides: HashMap::new(),
         }
     }
 
@@ -183,6 +196,44 @@ impl StaticFiles {
         self
     }
 
+    /// 是否允许下载**未知扩展名**的文件（默认 `false`）。
+    ///
+    /// 对齐 ASP.NET Core：`StaticFileOptions` 默认只服务 `FileExtensionContentTypeProvider`
+    /// 已知的类型；`.bak`/`.db`/无扩展名这类“非常规格式”必须显式开启才会下发。
+    pub fn serve_unknown_file_types(mut self, enable: bool) -> StaticFiles {
+        self.serve_unknown_types = enable;
+        self
+    }
+
+    /// 追加/覆盖扩展名的 MIME 映射（`ext` 不带点，大小写不敏感；链式）。
+    ///
+    /// 例：`.with_mime_type("apk", "application/vnd.android.package-archive")`。
+    pub fn with_mime_type(mut self, ext: &str, content_type: &str) -> StaticFiles {
+        self.mime_overrides.insert(
+            ext.trim_start_matches('.').to_ascii_lowercase(),
+            content_type.to_string(),
+        );
+        self
+    }
+
+    /// 扩展名 → `Content-Type`（含覆盖表；未知且未开启 `serve_unknown_file_types` 时返回 `None`）。
+    fn content_type_for(&self, relative: &str) -> Option<String> {
+        let ext = relative
+            .rsplit_once('.')
+            .map(|(_, ext)| ext.to_ascii_lowercase())
+            .unwrap_or_default();
+        if let Some(content_type) = self.mime_overrides.get(&ext) {
+            return Some(content_type.clone());
+        }
+        if let Some(content_type) = known_mime(&ext) {
+            return Some(content_type.to_string());
+        }
+        if self.serve_unknown_types {
+            return Some("application/octet-stream".to_string());
+        }
+        None
+    }
+
     /// 尝试服务请求路径（文件 + 已启用时的 SPA 回退；无 `Accept` 信息，回退按扩展名启发判断）。
     /// 未命中（含被拒绝的危险路径）返回 `None`。
     pub fn try_serve(&self, path: &str) -> Option<HttpResponse> {
@@ -225,6 +276,9 @@ impl StaticFiles {
     }
 
     /// 查嵌入资源（优先）→ 磁盘文件；响应携带 `ETag` 与 `Cache-Control: no-cache`。
+    ///
+    /// 磁盘文件**不再整读进内存**：只 `metadata` 算弱 ETag，响应带文件句柄信息由服务端流式发送；
+    /// 未知扩展名默认不服务（对齐 ASP.NET Core `ServeUnknownFileTypes = false`）。
     fn fetch(&self, relative: &str) -> Option<HttpResponse> {
         if let Some(asset) = self.embedded.get(relative) {
             return Some(
@@ -240,10 +294,11 @@ impl StaticFiles {
         if !meta.is_file() {
             return None;
         }
-        let data = std::fs::read(&full).ok()?;
-        let etag = disk_etag(&meta, &data);
+        // 未知扩展名默认拒绝（否则任意文件都能被猜到 URL 下载）
+        let content_type = self.content_type_for(relative)?;
+        let etag = disk_etag(&meta);
         Some(
-            HttpResponse::bytes(200, mime_type(relative), data)
+            HttpResponse::file(200, &content_type, full, meta.len())
                 .with_header("ETag", &etag)
                 .with_header("Cache-Control", "no-cache"),
         )
@@ -292,15 +347,17 @@ fn etag_matches(if_none_match: &str, etag: &str) -> bool {
     })
 }
 
-/// 磁盘文件弱 ETag：长度 + 最后修改时间（纳秒）；修改时间不可用时回退内容哈希。
-fn disk_etag(meta: &std::fs::Metadata, data: &[u8]) -> String {
+/// 磁盘文件弱 ETag：长度 + 最后修改时间（纳秒）；修改时间不可用时退化为长度。
+///
+/// **不读文件内容**：条件请求（304）因此不需要打开/读取文件。
+fn disk_etag(meta: &std::fs::Metadata) -> String {
     match meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
     {
         Some(modified) => format!("W/\"{:x}-{:x}\"", meta.len(), modified.as_nanos()),
-        None => format!("W/\"{:x}-{:x}\"", data.len(), fnv1a64(data)),
+        None => format!("W/\"{:x}\"", meta.len()),
     }
 }
 
@@ -393,7 +450,12 @@ pub fn mime_type(path: &str) -> &'static str {
         .map(|(_, ext)| ext)
         .unwrap_or("")
         .to_ascii_lowercase();
-    match ext.as_str() {
+    known_mime(&ext).unwrap_or("application/octet-stream")
+}
+
+/// 已知扩展名 → `Content-Type`（未知返回 `None`；用于默认拒绝未知格式）。
+fn known_mime(ext: &str) -> Option<&'static str> {
+    let content_type = match ext {
         "html" | "htm" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
@@ -413,8 +475,9 @@ pub fn mime_type(path: &str) -> &'static str {
         "zip" => "application/zip",
         "pdf" => "application/pdf",
         "mp4" => "video/mp4",
-        _ => "application/octet-stream",
-    }
+        _ => return None,
+    };
+    Some(content_type)
 }
 
 #[cfg(test)]
@@ -434,6 +497,15 @@ mod tests {
         dir
     }
 
+    /// 取响应正文：磁盘文件现在是**流式**响应（`body` 为空 + `file` 路径），
+    /// 测试从路径读回来校对；嵌入资源仍是内存字节。
+    fn body_of(resp: &HttpResponse) -> String {
+        match &resp.file {
+            Some(file) => std::fs::read_to_string(&file.path).unwrap_or_default(),
+            None => String::from_utf8_lossy(&resp.body).to_string(),
+        }
+    }
+
     #[test]
     fn serve_from_disk_with_default_document() {
         let dir = temp_dir("disk");
@@ -446,11 +518,11 @@ mod tests {
 
         // 根路径与目录结尾 → index.html
         let home = statics.try_serve("/").expect("应命中 index.html");
-        assert!(String::from_utf8_lossy(&home.body).contains("首页"));
+        assert!(body_of(&home).contains("首页"));
         assert_eq!(home.headers[0].1, "text/html; charset=utf-8");
 
         let app = statics.try_serve("/app/").expect("应命中子目录 index.html");
-        assert_eq!(String::from_utf8_lossy(&app.body), "app home");
+        assert_eq!(body_of(&app), "app home");
 
         // 普通文件 + MIME
         let css = statics.try_serve("/style.css").expect("应命中 css");
@@ -487,7 +559,7 @@ mod tests {
         let statics = StaticFiles::with_embedded(&dir, &[]);
         assert_eq!(statics.embedded_count(), 0, "空表必须是纯磁盘模式");
         let file = statics.try_serve("/app.js").expect("磁盘文件应命中");
-        assert_eq!(String::from_utf8_lossy(&file.body), "disk");
+        assert_eq!(body_of(&file), "disk");
 
         // 删掉磁盘文件后不再命中（证明没有编译期兜底嵌入）
         std::fs::remove_file(dir.join("app.js")).unwrap();
@@ -638,7 +710,7 @@ mod tests {
         let statics = StaticFiles::new(&dir).spa_fallback(true);
         // 深链接 → 磁盘 index.html
         let page = statics.try_serve("/route/a").expect("应回退磁盘 index");
-        assert_eq!(String::from_utf8_lossy(&page.body), "disk-spa");
+        assert_eq!(body_of(&page), "disk-spa");
         // 真实资源直出；缺失资源 404
         assert!(statics.try_serve("/assets/app.js").is_some());
         assert!(statics.try_serve("/assets/missing.js").is_none());
@@ -726,5 +798,77 @@ mod tests {
                 .status,
             200
         );
+    }
+    #[test]
+    fn disk_file_is_streamed_not_buffered() {
+        use crate::net::http::HttpRequest;
+
+        let dir = temp_dir("stream");
+        std::fs::write(dir.join("app.js"), "console.log(1)").unwrap();
+        let statics = StaticFiles::new(&dir);
+
+        let resp = statics.try_serve("/app.js").expect("应命中 app.js");
+        assert!(resp.body.is_empty(), "磁盘文件不应整读进内存");
+        let file = resp.file.as_ref().expect("磁盘响应应带文件体");
+        assert_eq!(file.len, "console.log(1)".len() as u64);
+        assert!(file.path.ends_with("app.js"));
+        let header = |name: &str| {
+            resp.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(header("content-length").as_deref(), Some("14"));
+
+        // 304：只按 metadata 的弱 ETag 判断，响应不带文件体
+        let etag = header("etag").expect("磁盘响应应带弱 ETag");
+        assert!(etag.starts_with("W/"), "磁盘应为弱 ETag：{etag}");
+        let not_modified = statics
+            .try_serve_request(&HttpRequest {
+                method: "GET".to_string(),
+                path: "/app.js".to_string(),
+                query: String::new(),
+                headers: vec![("If-None-Match".to_string(), etag)],
+                body: hyper::body::Bytes::new(),
+                remote_addr: None,
+            })
+            .expect("条件请求应命中");
+        assert_eq!(not_modified.status, 304);
+        assert!(not_modified.file.is_none(), "304 不应携带文件响应体");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_extension_blocked_by_default() {
+        let dir = temp_dir("unknown-ext");
+        std::fs::write(dir.join("data.bak"), "secret").unwrap();
+        std::fs::write(dir.join("README"), "no-ext").unwrap();
+        std::fs::write(dir.join("db.sqlite3"), "db").unwrap();
+        std::fs::write(dir.join("app.apk"), "apk").unwrap();
+
+        // 默认：未知扩展名 / 无扩展名一律不服务（对齐 ASP.NET ServeUnknownFileTypes=false）
+        let statics = StaticFiles::new(&dir);
+        assert!(statics.try_serve("/data.bak").is_none());
+        assert!(statics.try_serve("/README").is_none());
+        assert!(statics.try_serve("/db.sqlite3").is_none());
+        assert!(statics.try_serve("/app.apk").is_none());
+
+        // 显式映射：只放开指定格式（下载目录的常规做法）
+        let mapped = StaticFiles::new(&dir)
+            .with_mime_type(".apk", "application/vnd.android.package-archive");
+        let apk = mapped.try_serve("/app.apk").expect("显式映射后应可下载");
+        assert_eq!(apk.headers[0].1, "application/vnd.android.package-archive");
+        assert!(
+            mapped.try_serve("/data.bak").is_none(),
+            "未映射格式仍应拒绝"
+        );
+
+        // 全放开：后台类“下载任意文件”的能力必须显式开启
+        let open = StaticFiles::new(&dir).serve_unknown_file_types(true);
+        let bak = open.try_serve("/data.bak").expect("放开后应可下载");
+        assert_eq!(bak.headers[0].1, "application/octet-stream");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -10,16 +10,19 @@
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::{Bytes, Incoming};
+use hyper::body::{Bytes, Frame, Incoming, SizeHint};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
+use tokio::io::AsyncRead;
 use tokio::net::{TcpListener, TcpStream};
 
 use super::ws::{self, WsServerHooks, WsServerOptions};
@@ -117,6 +120,17 @@ pub struct HttpResponse {
     pub headers: Vec<(String, String)>,
     /// 响应体
     pub body: Bytes,
+    /// 文件响应体（非空时忽略 `body`，由服务端**流式**发送，不整读进内存）
+    pub file: Option<FileBody>,
+}
+
+/// 文件响应体：发送时异步打开并分块读（不占用与文件同尺寸的内存）。
+#[derive(Debug, Clone)]
+pub struct FileBody {
+    /// 文件绝对/相对路径
+    pub path: PathBuf,
+    /// 要发送的字节数（从文件开头）
+    pub len: u64,
 }
 
 impl HttpResponse {
@@ -129,6 +143,7 @@ impl HttpResponse {
                 "text/plain; charset=utf-8".to_string(),
             )],
             body: Bytes::from(text.into().into_bytes()),
+            file: None,
         }
     }
 
@@ -141,6 +156,7 @@ impl HttpResponse {
                 "application/json; charset=utf-8".to_string(),
             )],
             body: Bytes::from(json.into().into_bytes()),
+            file: None,
         }
     }
 
@@ -150,6 +166,25 @@ impl HttpResponse {
             status,
             headers: vec![("Content-Type".to_string(), content_type.to_string())],
             body: data.into(),
+            file: None,
+        }
+    }
+
+    /// 文件响应（**流式**：发送时异步打开 + 分块读，内存恒定；自动带 `Content-Length`）。
+    ///
+    /// 适合静态资源/下载：不要再把文件整读成 `Bytes`（那是 `O(文件大小)` 的内存开销）。
+    pub fn file(status: u16, content_type: &str, path: impl Into<PathBuf>, len: u64) -> Self {
+        Self {
+            status,
+            headers: vec![
+                ("Content-Type".to_string(), content_type.to_string()),
+                ("Content-Length".to_string(), len.to_string()),
+            ],
+            body: Bytes::new(),
+            file: Some(FileBody {
+                path: path.into(),
+                len,
+            }),
         }
     }
 
@@ -159,6 +194,7 @@ impl HttpResponse {
             status,
             headers: Vec::new(),
             body: Bytes::new(),
+            file: None,
         }
     }
 
@@ -189,15 +225,128 @@ impl HttpResponse {
         self
     }
 
-    /// 转 hyper 响应。
-    fn into_hyper(self) -> Response<Full<Bytes>> {
+    /// 转 hyper 响应（文件响应转为流式 body）。
+    fn into_hyper(self) -> Response<RespBody> {
         let mut builder = Response::builder().status(self.status);
         for (k, v) in &self.headers {
             builder = builder.header(k.as_str(), v.as_str());
         }
+        let body: RespBody = match self.file {
+            Some(file) => FileStreamBody::new(file).boxed(),
+            None => Full::new(self.body)
+                .map_err(|never: Infallible| -> std::io::Error { match never {} })
+                .boxed(),
+        };
         builder
-            .body(Full::new(self.body))
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+            .body(body)
+            .unwrap_or_else(|_| Response::new(empty_body()))
+    }
+}
+
+/// 服务端响应体（内存字节 或 文件流）。
+type RespBody = BoxBody<Bytes, std::io::Error>;
+
+fn empty_body() -> RespBody {
+    Full::new(Bytes::new())
+        .map_err(|never: Infallible| -> std::io::Error { match never {} })
+        .boxed()
+}
+
+/// 文件流式 body：首次 poll 时异步打开，之后每次读一块（64 KB），不整读进内存。
+///
+/// 错误口径：打开失败、读取失败、**文件中途被截断**（小于声明的 `len`）都返回 `io::Error`，
+/// 由 hyper 终止该响应（客户端会看到不完整响应，而不是静默的短响应）。
+struct FileStreamBody {
+    path: PathBuf,
+    total: u64,
+    remaining: u64,
+    state: FileStreamState,
+    buffer: Box<[u8]>,
+}
+
+enum FileStreamState {
+    /// 尚未打开（首次 poll 时打开）
+    NotOpened,
+    /// 已打开，正在发送
+    Streaming(tokio::fs::File),
+    /// 结束
+    Done,
+}
+
+impl FileStreamBody {
+    fn new(file: FileBody) -> Self {
+        Self {
+            state: FileStreamState::NotOpened,
+            path: file.path,
+            total: file.len,
+            remaining: file.len,
+            buffer: vec![0u8; 64 * 1024].into_boxed_slice(),
+        }
+    }
+}
+
+impl hyper::body::Body for FileStreamBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        loop {
+            match &mut this.state {
+                // 首次 poll 才打开：`open` 是短系统调用；不提前持有句柄（响应可能被丢弃/304）
+                FileStreamState::NotOpened => match std::fs::File::open(&this.path) {
+                    Ok(file) => {
+                        this.state = FileStreamState::Streaming(tokio::fs::File::from_std(file))
+                    }
+                    Err(err) => {
+                        this.state = FileStreamState::Done;
+                        return Poll::Ready(Some(Err(err)));
+                    }
+                },
+                FileStreamState::Streaming(file) => {
+                    if this.remaining == 0 {
+                        this.state = FileStreamState::Done;
+                        return Poll::Ready(None);
+                    }
+                    let want = std::cmp::min(this.remaining, this.buffer.len() as u64) as usize;
+                    let mut read_buf = tokio::io::ReadBuf::new(&mut this.buffer[..want]);
+                    match Pin::new(file).poll_read(cx, &mut read_buf) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(err)) => {
+                            this.state = FileStreamState::Done;
+                            return Poll::Ready(Some(Err(err)));
+                        }
+                        Poll::Ready(Ok(())) => {
+                            let n = read_buf.filled().len();
+                            if n == 0 {
+                                this.state = FileStreamState::Done;
+                                return Poll::Ready(Some(Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    format!(
+                                        "静态文件在发送途中被截断：{}（已声明 {} 字节）",
+                                        this.path.display(),
+                                        this.total
+                                    ),
+                                ))));
+                            }
+                            this.remaining -= n as u64;
+                            return Poll::Ready(Some(Ok(Frame::data(Bytes::copy_from_slice(
+                                &this.buffer[..n],
+                            )))));
+                        }
+                    }
+                }
+                FileStreamState::Done => return Poll::Ready(None),
+            }
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.total)
     }
 }
 
@@ -805,7 +954,7 @@ async fn handle_http(
     options: HttpServerOptions,
     upgrade_slot: Arc<Mutex<Option<(hyper::upgrade::OnUpgrade, WsServerHooks)>>>,
     remote: Option<String>,
-) -> Response<Full<Bytes>> {
+) -> Response<RespBody> {
     // 服务端处理计时（收到请求 → 输出响应）：响应头 X-Elapsed-Ms 供面板页脚展示性能
     let started = std::time::Instant::now();
     // 升级意图必须先登记（handler 返回 WebSocket 时由 hyper 完成移交）
@@ -938,6 +1087,10 @@ fn finalize_http_response(
     accept_gzip: bool,
     options: &HttpServerOptions,
 ) -> HttpResponse {
+    // 文件响应走流式发送，不参与压缩（压缩需要整读，会把内存省下的又吐回去）
+    if resp.file.is_some() {
+        return resp;
+    }
     if !options.gzip {
         return resp;
     }
