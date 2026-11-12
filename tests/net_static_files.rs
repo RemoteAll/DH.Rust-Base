@@ -130,3 +130,94 @@ async fn static_files_stream_and_block_unknown_extensions() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 预压缩（零运行时 CPU）：磁盘同名 `.gz` 与嵌入 gzip 变体都按 `Accept-Encoding` 协商。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn static_files_precompressed_gzip() {
+    let dir = temp_dir("gz");
+    std::fs::write(dir.join("app.js"), "plain-js-body").unwrap();
+    std::fs::write(dir.join("app.js.gz"), "GZIP-BYTES").unwrap();
+    std::fs::write(dir.join("only.css"), "plain-css").unwrap();
+
+    let statics = StaticFiles::new(&dir);
+    let mut r = Router::new();
+    r.fallback(route(move |ctx| {
+        let statics = statics.clone();
+        let req = ctx.req.clone();
+        async move {
+            statics
+                .try_serve_request(&req)
+                .map(HttpOutcome::Response)
+                .unwrap_or_else(|| HttpOutcome::Response(HttpResponse::text(404, "Not Found")))
+        }
+    }));
+    let addr = start(r).await;
+
+    // ① 接受 gzip：下发 .gz 字节 + 编码头 + Vary，Content-Type 仍按原始扩展名
+    let (status, head, body) =
+        http_call_raw(addr, "GET", "/app.js", &[("Accept-Encoding", "gzip, deflate")]).await;
+    assert_eq!(status, 200);
+    let lower_head = head.to_ascii_lowercase();
+    assert!(
+        lower_head.contains("content-encoding: gzip"),
+        "应带 Content-Encoding: gzip：{head}"
+    );
+    assert!(
+        lower_head.contains("vary: accept-encoding"),
+        "应带 Vary: Accept-Encoding：{head}"
+    );
+    assert!(
+        lower_head.contains("content-type: text/javascript"),
+        "Content-Type 应按原始扩展名推断：{head}"
+    );
+    assert_eq!(body, b"GZIP-BYTES");
+
+    // ② 不接受 gzip：原文件，无编码头
+    let (status, head, body) = http_call_raw(addr, "GET", "/app.js", &[]).await;
+    assert_eq!(status, 200);
+    assert!(!head.to_ascii_lowercase().contains("content-encoding"));
+    assert_eq!(body, b"plain-js-body");
+
+    // ③ 没有同名 .gz：回退原文件（不报错、不加头）
+    let (status, head, body) =
+        http_call_raw(addr, "GET", "/only.css", &[("Accept-Encoding", "gzip")]).await;
+    assert_eq!(status, 200);
+    assert!(!head.to_ascii_lowercase().contains("content-encoding"));
+    assert_eq!(body, b"plain-css");
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 单 exe 形态：构建期嵌入的 gzip 变体同样能按 `Accept-Encoding` 下发。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn embedded_gzip_variant_is_served() {
+    static PLAIN: &[u8] = b"plain-body";
+    static GZ: &[u8] = b"GZIP-BODY";
+
+    let statics = StaticFiles::new(std::env::temp_dir().join("dhrust-nonexistent-root"))
+        .embed_many_gzip(&[("app.js", PLAIN, GZ)]);
+    let mut r = Router::new();
+    r.fallback(route(move |ctx| {
+        let statics = statics.clone();
+        let req = ctx.req.clone();
+        async move {
+            statics
+                .try_serve_request(&req)
+                .map(HttpOutcome::Response)
+                .unwrap_or_else(|| HttpOutcome::Response(HttpResponse::text(404, "Not Found")))
+        }
+    }));
+    let addr = start(r).await;
+
+    let (status, head, body) =
+        http_call_raw(addr, "GET", "/app.js", &[("Accept-Encoding", "gzip")]).await;
+    assert_eq!(status, 200);
+    assert!(head.to_ascii_lowercase().contains("content-encoding: gzip"));
+    assert_eq!(body, b"GZIP-BODY");
+
+    let (status, head, body) = http_call_raw(addr, "GET", "/app.js", &[]).await;
+    assert_eq!(status, 200);
+    assert!(!head.to_ascii_lowercase().contains("content-encoding"));
+    assert_eq!(body, b"plain-body");
+}

@@ -16,6 +16,7 @@
 | `app.UseStaticFiles()`（`wwwroot/` 目录） | `StaticFiles::new("wwwroot")` | 按请求读盘，开发期改文件即生效；磁盘文件**流式发送**（只 `metadata` 算弱 ETag，不整读进内存） |
 | `StaticFileOptions.ServeUnknownFileTypes = false`（默认） | 默认同上 | 只下发 MIME 表已知的扩展名；`.bak`/`.db`/无扩展名默认 404 |
 | `StaticFileOptions.ServeUnknownFileTypes = true` / 自定义 `ContentTypeProvider` | `serve_unknown_file_types(true)` / `with_mime_type("apk", …)` | 非常规格式需显式放开（指定格式或全放开） |
+| 预压缩 Content-Encoding: gzip（构建期压一次） | 同名 .gz 优先 / embed_many_gzip（两种部署形态一致） | **零运行时 CPU**：磁盘靠 .gz 文件、单 exe 靠构建期嵌入；Vary: Accept-Encoding，gzip 与明文 ETag 不同 |
 | 单文件发布 / `ManifestEmbeddedFileProvider` | `StaticFiles::embed` / `embed_many`（`include_bytes!`） | 编译期嵌入、嵌入优先，部署不依赖 wwwroot |
 | `endpoints.MapControllers()` | `Controller::new("api")...mount(&mut router)` | JSON 控制器（统一信封 `json_result`） |
 | MVC 视图（`Views/{C}/{A}.cshtml`） | `Controller` + `view(model)`（feature `razor`） | 服务端渲染，与 C# 视图约定一致 |

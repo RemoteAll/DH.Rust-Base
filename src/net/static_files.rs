@@ -84,6 +84,10 @@ struct EmbeddedAsset {
     content_type: &'static str,
     /// 强 ETag（`"长度-内容哈希"`）
     etag: String,
+    /// 构建期生成的 gzip 变体（`None` = 无预压缩）
+    data_gzip: Option<&'static [u8]>,
+    /// gzip 变体的强 ETag（与明文**不同**，避免缓存串味）
+    etag_gzip: Option<String>,
 }
 
 impl EmbeddedAsset {
@@ -92,6 +96,22 @@ impl EmbeddedAsset {
             data,
             content_type,
             etag: format!("\"{:x}-{:x}\"", data.len(), fnv1a64(data)),
+            data_gzip: None,
+            etag_gzip: None,
+        }
+    }
+
+    fn with_gzip(
+        data: &'static [u8],
+        data_gzip: Option<&'static [u8]>,
+        content_type: &'static str,
+    ) -> EmbeddedAsset {
+        EmbeddedAsset {
+            data,
+            content_type,
+            etag: format!("\"{:x}-{:x}\"", data.len(), fnv1a64(data)),
+            data_gzip,
+            etag_gzip: data_gzip.map(|g| format!("\"{:x}-{:x}-gz\"", g.len(), fnv1a64(g))),
         }
     }
 }
@@ -165,6 +185,24 @@ impl StaticFiles {
             self.embedded.insert(
                 normalize_key(path),
                 EmbeddedAsset::new(data, mime_type(path)),
+            );
+        }
+        self
+    }
+
+    /// 批量注册嵌入资源（含**构建期生成的 gzip 变体**）：`(路径, 明文, gzip)`。
+    ///
+    /// 单 exe 部署同样能压缩 —— 预压缩字节随二进制一起嵌入，运行时零 CPU。
+    /// 与 [`StaticFiles::embed_many`] 同口径：`gzip` 传空切片表示该文件不压缩。
+    pub fn embed_many_gzip(
+        mut self,
+        files: &[(&'static str, &'static [u8], &'static [u8])],
+    ) -> StaticFiles {
+        for (path, data, gz) in files {
+            let gzip = if gz.is_empty() { None } else { Some(*gz) };
+            self.embedded.insert(
+                normalize_key(path),
+                EmbeddedAsset::with_gzip(data, gzip, mime_type(path)),
             );
         }
         self
@@ -245,7 +283,7 @@ impl StaticFiles {
     /// 适合非 GET/HEAD 请求：只允许命中真实文件，未知路径仍交还调用方 404。
     pub fn try_serve_file(&self, path: &str) -> Option<HttpResponse> {
         let relative = safe_relative(path)?;
-        self.fetch(&relative)
+        self.fetch(&relative, false)
     }
 
     /// 尝试服务（带 `Accept` 头）：文件优先；已启用 SPA 回退且路径“像前端路由”时
@@ -253,34 +291,52 @@ impl StaticFiles {
     ///
     /// 不做条件请求处理（兼容入口）；推荐改用 [`StaticFiles::try_serve_request`]。
     pub fn try_serve_with_accept(&self, path: &str, accept: Option<&str>) -> Option<HttpResponse> {
-        self.resolve(path, accept)
+        self.resolve(path, accept, false)
     }
 
     /// 按请求服务（推荐入口）：命中后继续处理 `If-None-Match`——ETag 未变化时
     /// 返回 `304 Not Modified`（空体），浏览器重复打开/刷新面板零正文流量。
+    ///
+    /// `Accept-Encoding` 含 `gzip` 且存在预览缩变体时，优先下发预压缩内容（运行时零 CPU）。
     pub fn try_serve_request(&self, req: &HttpRequest) -> Option<HttpResponse> {
-        let response = self.resolve(&req.path, req.header("accept"))?;
+        let accept_gzip = req
+            .header("accept-encoding")
+            .map(|v| v.to_ascii_lowercase().contains("gzip"))
+            .unwrap_or(false);
+        let response = self.resolve(&req.path, req.header("accept"), accept_gzip)?;
         Some(apply_conditional(response, req.header("if-none-match")))
     }
 
     /// 命中解析：真实文件（含默认文档/嵌入资源）优先；SPA 回退条件满足时回退 `index.html`。
-    fn resolve(&self, path: &str, accept: Option<&str>) -> Option<HttpResponse> {
+    fn resolve(&self, path: &str, accept: Option<&str>, accept_gzip: bool) -> Option<HttpResponse> {
         let relative = safe_relative(path)?;
-        if let Some(response) = self.fetch(&relative) {
+        if let Some(response) = self.fetch(&relative, accept_gzip) {
             return Some(response);
         }
         if !self.spa || self.is_spa_excluded(path) || !spa_route_like(path, accept) {
             return None;
         }
-        self.fetch("index.html")
+        self.fetch("index.html", accept_gzip)
     }
 
     /// 查嵌入资源（优先）→ 磁盘文件；响应携带 `ETag` 与 `Cache-Control: no-cache`。
     ///
     /// 磁盘文件**不再整读进内存**：只 `metadata` 算弱 ETag，响应带文件句柄信息由服务端流式发送；
     /// 未知扩展名默认不服务（对齐 ASP.NET Core `ServeUnknownFileTypes = false`）。
-    fn fetch(&self, relative: &str) -> Option<HttpResponse> {
+    fn fetch(&self, relative: &str, accept_gzip: bool) -> Option<HttpResponse> {
         if let Some(asset) = self.embedded.get(relative) {
+            // 单 exe 形态：用构建期嵌入的 gzip 变体（零运行时 CPU）
+            if accept_gzip {
+                if let (Some(gz), Some(etag)) = (asset.data_gzip, asset.etag_gzip.as_deref()) {
+                    return Some(
+                        HttpResponse::bytes(200, asset.content_type, gz)
+                            .with_header("ETag", etag)
+                            .with_header("Cache-Control", "no-cache")
+                            .with_header("Content-Encoding", "gzip")
+                            .with_header("Vary", "Accept-Encoding"),
+                    );
+                }
+            }
             return Some(
                 HttpResponse::bytes(200, asset.content_type, asset.data)
                     .with_header("ETag", &asset.etag)
@@ -290,12 +346,30 @@ impl StaticFiles {
 
         let root = self.root.as_ref()?;
         let full = root.join(relative);
+        // 未知扩展名默认拒绝（否则任意文件都能被猜到 URL 下载）
+        let content_type = self.content_type_for(relative)?;
+
+        // 磁盘形态：同名 `.gz` 存在且客户端接受时直接下发（仍走文件流式，零 CPU）
+        if accept_gzip {
+            let gz = PathBuf::from(format!("{}.gz", full.display()));
+            if let Ok(meta) = std::fs::metadata(&gz) {
+                if meta.is_file() {
+                    let etag = disk_etag(&meta);
+                    return Some(
+                        HttpResponse::file(200, &content_type, gz, meta.len())
+                            .with_header("ETag", &etag)
+                            .with_header("Cache-Control", "no-cache")
+                            .with_header("Content-Encoding", "gzip")
+                            .with_header("Vary", "Accept-Encoding"),
+                    );
+                }
+            }
+        }
+
         let meta = std::fs::metadata(&full).ok()?;
         if !meta.is_file() {
             return None;
         }
-        // 未知扩展名默认拒绝（否则任意文件都能被猜到 URL 下载）
-        let content_type = self.content_type_for(relative)?;
         let etag = disk_etag(&meta);
         Some(
             HttpResponse::file(200, &content_type, full, meta.len())
