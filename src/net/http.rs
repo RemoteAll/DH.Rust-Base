@@ -162,6 +162,27 @@ impl HttpResponse {
         }
     }
 
+    /// 统一信封的**失败**响应：`{"ok":false,"message":"…"}`（节点 / 面板类接口通用口径）。
+    ///
+    /// 收编 Pek.RAgent（`deploy_http` / `db_direct`）、Pek.RDbProxy、Pek.ROutGuard、
+    /// HLZX.EIP 的四份同款私有实现——以前每处各写一遍，文案与字段顺序容易走样。
+    pub fn json_error(status: u16, message: &str) -> Self {
+        Self::json(
+            status,
+            serde_json::json!({ "ok": false, "message": message }).to_string(),
+        )
+    }
+
+    /// 统一信封的**成功**响应：`{"ok":true,"message":"…","data":…}`。
+    ///
+    /// `data` 无负载时传 `&serde_json::Value::Null`（仍保留字段，前端不必判空）。
+    pub fn json_ok(message: &str, data: &serde_json::Value) -> Self {
+        Self::json(
+            200,
+            serde_json::json!({ "ok": true, "message": message, "data": data }).to_string(),
+        )
+    }
+
     /// 追加响应头（链式）。
     pub fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_string(), value.to_string()));
@@ -1294,5 +1315,46 @@ fn push_json_value(out: &mut String, value: &serde_json::Value) {
             }
             out.push('}');
         }
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    /// 失败信封：字段固定 `ok` / `message`，状态码透传。
+    #[test]
+    fn json_error_envelope() {
+        let resp = HttpResponse::json_error(403, "没有权限");
+        assert_eq!(resp.status, 403);
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.starts_with("application/json")),
+            "{:?}",
+            resp.headers
+        );
+        let text = String::from_utf8_lossy(&resp.body).to_string();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(false));
+        assert_eq!(v["message"], serde_json::Value::String("没有权限".to_string()));
+    }
+
+    /// 成功信封：`ok=true` + `message` + `data`（无负载时 data 为 null，前端不必判空）。
+    #[test]
+    fn json_ok_envelope() {
+        let data = serde_json::json!({ "count": 2 });
+        let resp = HttpResponse::json_ok("完成", &data);
+        assert_eq!(resp.status, 200);
+        let text = String::from_utf8_lossy(&resp.body).to_string();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true));
+        assert_eq!(v["message"], serde_json::Value::String("完成".to_string()));
+        assert_eq!(v["data"]["count"], serde_json::json!(2));
+
+        let empty = HttpResponse::json_ok("无负载", &serde_json::Value::Null);
+        let text = String::from_utf8_lossy(&empty.body).to_string();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["data"], serde_json::Value::Null);
     }
 }

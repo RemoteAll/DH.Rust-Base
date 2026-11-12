@@ -26,6 +26,7 @@ pub mod staragent; // 星尘（StarAgent）配置注册：影子模式条目的 
 pub mod term; // 真 PTY 会话引擎（ConPTY/openpty；在线终端等服务端能力共用）
 pub mod text; // 通用文本小工具（按字符截断等；多消费方收编）
 pub mod threading; // 线程与定时调度（对应 DH.NCore Threading）
+pub mod ticket; // 短时效票据库（TTL + 容量 + 配额 + 只读 peek；直连部署/数据库共用）
 pub mod times;
 pub mod upgrade; // 自升级管线·应用层（识别/静置/自检/原子替换/交接重启；Pek.RAgent、Pek.RPanlServer、HLZX.EIP 三套实现收编）
 pub mod verify_code; // 一次性验证码仓库（有效期 + 重发间隔 + 错误上限 + 一次性消费；短信/邮件/图形通用）

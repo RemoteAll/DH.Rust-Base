@@ -995,6 +995,126 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoCertificateV
     }
 }
 
+// ————— 直连调用（多协议候选 + 统一信封） —————
+
+/// 一次直连调用的参数（节点/设备类服务端：自签 TLS、协议不确定、统一 JSON 信封）。
+#[derive(Clone, Debug)]
+pub struct DirectCall<'a> {
+    /// 协议候选（按顺序尝试；空 = `["https","http"]`）
+    pub schemes: &'a [&'a str],
+    /// 主机（IP 或域名，不含协议与端口）
+    pub host: &'a str,
+    /// 端口
+    pub port: i64,
+    /// 路径（以 `/` 开头）
+    pub path: &'a str,
+    /// **已编码**的查询串（不含 `?`；空 = 无查询串）
+    pub query: &'a str,
+    /// 请求内容类型（`None` = 不设置）
+    pub content_type: Option<&'a str>,
+    /// 请求体
+    pub body: Vec<u8>,
+    /// 单次尝试超时
+    pub timeout: Duration,
+    /// 跳过证书校验（自签叶子证书场景；调用方需自行确认风险）
+    pub insecure_tls: bool,
+    /// User-Agent（空 = 不设置）
+    pub user_agent: &'a str,
+}
+
+/// 按 [`DirectCall::schemes`] 逐个尝试，返回成功响应里的 **JSON 信封**（`ok == true`）。
+///
+/// 约定（节点类服务端统一口径）：
+/// - 响应必须是 JSON，且 `ok` 为 `true` 才算成功；
+/// - 失败时把该协议的「HTTP 状态 + 响应片段」或「业务 message」收进汇总，继续试下一个协议
+///   （常见：节点同时开自签 https 与 http，客户端不知道哪个可达）；
+/// - 全部失败时返回**逐协议原因汇总**（`https: …；http: …`，不带固定前缀），
+///   由调用方补自己的业务上下文前缀（如 `直连节点失败（…）`），各调用方自己的日志更易读；
+///   调用方**不应静默回退**到别的链路。
+///
+/// 传输层错误（连接拒绝/超时/证书不受信）与业务错误（`ok=false`）在汇总里文案不同，便于运维判断。
+pub fn direct_json(call: DirectCall<'_>) -> Result<serde_json::Value, String> {
+    if call.host.trim().is_empty() || call.port <= 0 {
+        return Err("直连地址不完整（缺少 host/port）".to_string());
+    }
+    let defaults = ["https", "http"];
+    let schemes: Vec<&str> = if call.schemes.is_empty() {
+        defaults.to_vec()
+    } else {
+        call.schemes.to_vec()
+    };
+    let mut errors: Vec<String> = Vec::new();
+    for scheme in schemes {
+        let url = if call.query.trim().is_empty() {
+            format!(
+                "{scheme}://{}:{}{}",
+                call.host.trim(),
+                call.port,
+                call.path
+            )
+        } else {
+            format!(
+                "{scheme}://{}:{}{}?{}",
+                call.host.trim(),
+                call.port,
+                call.path,
+                call.query.trim()
+            )
+        };
+        let options = HttpClientOptions {
+            timeout: call.timeout,
+            insecure_tls: call.insecure_tls,
+            ca_pem: None,
+        };
+        let headers: Vec<(&str, &str)> = if call.user_agent.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![("User-Agent", call.user_agent.trim())]
+        };
+        match blocking_request_auto_with(
+            "POST",
+            &url,
+            &headers,
+            call.content_type,
+            call.body.clone(),
+            options,
+        ) {
+            Ok(resp) => {
+                let text = String::from_utf8_lossy(&resp.body).to_string();
+                if !(200..300).contains(&resp.status) {
+                    errors.push(format!(
+                        "{scheme}: HTTP {}：{}",
+                        resp.status,
+                        text.chars().take(200).collect::<String>()
+                    ));
+                    continue;
+                }
+                let v: serde_json::Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        errors.push(format!(
+                            "{scheme}: 响应不是 JSON（{e}）：{}",
+                            text.chars().take(200).collect::<String>()
+                        ));
+                        continue;
+                    }
+                };
+                if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+                    return Ok(v);
+                }
+                errors.push(format!(
+                    "{scheme}: {}",
+                    v.get("message")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("服务端未给出原因")
+                ));
+            }
+            Err(e) => errors.push(format!("{scheme}: {e}")),
+        }
+    }
+    Err(errors.join("；"))
+}
+
 // ————— 单元测试（纯函数 + 本地 mock 服务端）————
 
 #[cfg(test)]
