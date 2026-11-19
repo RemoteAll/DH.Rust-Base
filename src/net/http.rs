@@ -423,6 +423,13 @@ pub struct HttpServerOptions {
     /// 而是被浏览器自动升级到加密地址（与宝塔面板开启 SSL 后的体验一致）。
     /// 一般填与监听相同的端口号。
     pub https_redirect_port: Option<u16>,
+    /// **明文 HTTP 豁免前缀**（仅**回环对端**生效，且需 `https_redirect_port` 已设置）：
+    /// 命中这些前缀的明文请求**不跳转**，直接交给业务处理器；其余路径仍 301 到 https。
+    ///
+    /// 用途：本机进程间的只读小接口（如 RAgent 的 `/ipdb`，供 Pek.ZIP 这类本机程序取数据）
+    /// 不必为自签证书去折腾 CA 导入；因为**只对 `127.0.0.1/::1` 放开**，非回环对端不受影响。
+    /// 默认空 = 关闭（保持原有「全量 301」行为）。
+    pub plain_allow_loopback_prefixes: Vec<String>,
 }
 
 impl std::fmt::Debug for HttpServerOptions {
@@ -439,6 +446,10 @@ impl std::fmt::Debug for HttpServerOptions {
             .field("header_timeout", &self.header_timeout)
             .field("request_timeout", &self.request_timeout)
             .field("conn_stack_size", &self.conn_stack_size)
+            .field(
+                "plain_allow_loopback_prefixes",
+                &self.plain_allow_loopback_prefixes.len(),
+            )
             .finish()
     }
 }
@@ -458,6 +469,7 @@ impl Default for HttpServerOptions {
             request_timeout: None,
             conn_stack_size: 0,
             https_redirect_port: None,
+            plain_allow_loopback_prefixes: Vec::new(),
         }
     }
 }
@@ -846,28 +858,33 @@ async fn run_connection(
             // peek 不消费数据；读不到（对端已关）就别折腾了。
             if let Ok(n) = tcp.peek(&mut first).await {
                 if n > 0 && first[0] != 0x16 {
+                    // 回环 + 配置了豁免前缀 → 走真实处理器，只有未命中前缀的才 301
+                    //（本机进程间小接口用明文，省掉自签证书的 CA 导入）
+                    let allow = &options.plain_allow_loopback_prefixes;
+                    let loop_peer = remote.as_deref().map(is_loopback_peer).unwrap_or(false);
+                    if loop_peer && !allow.is_empty() {
+                        let real = handler.clone();
+                        let allow = allow.clone();
+                        let plain = crate::net::http::handler(move |req: HttpRequest| {
+                            let real = real.clone();
+                            let allow = allow.clone();
+                            async move {
+                                if allow
+                                    .iter()
+                                    .any(|p| !p.is_empty() && req.path.starts_with(p.as_str()))
+                                {
+                                    return real(req).await;
+                                }
+                                redirect_to_https(&req, https_port)
+                            }
+                        });
+                        serve_connection(tcp, remote, plain, options).await;
+                        return;
+                    }
                     // 注意：参数名 `handler` 遮蔽了同名构造函数，这里必须走全路径；
                     // 外层 `move` 复制 `https_port`（u16: Copy），闭包保持 `Fn` 可多次调用
                     let redirect = crate::net::http::handler(move |req: HttpRequest| async move {
-                        let host = req.header("host").unwrap_or("127.0.0.1").trim().to_string();
-                        // 去掉 Host 里的原端口（否则会拼成 ip:5501:5501）
-                        let hostname = host
-                            .rsplit_once(':')
-                            .map(|(h, _)| h)
-                            .unwrap_or(&host)
-                            .to_string();
-                        let query = if req.query.is_empty() {
-                            String::new()
-                        } else {
-                            format!("?{}", req.query)
-                        };
-                        let location =
-                            format!("https://{hostname}:{https_port}{}{query}", req.path);
-                        HttpOutcome::Response(
-                            HttpResponse::text(301, "")
-                                .with_header("Location", &location)
-                                .with_header("Connection", "close"),
-                        )
+                        redirect_to_https(&req, https_port)
                     });
                     serve_connection(tcp, remote, redirect, options).await;
                     return;
@@ -882,6 +899,40 @@ async fn run_connection(
     #[cfg(not(feature = "net-tls"))]
     let _ = tls;
     serve_connection(tcp, remote, handler, options).await;
+}
+
+/// 把明文请求 301 到同端口的 https（保留 path 与查询串）。
+fn redirect_to_https(req: &HttpRequest, https_port: u16) -> HttpOutcome {
+    let host = req.header("host").unwrap_or("127.0.0.1").trim().to_string();
+    // 去掉 Host 里的原端口（否则会拼成 ip:5501:5501）
+    let hostname = host
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(&host)
+        .to_string();
+    let query = if req.query.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", req.query)
+    };
+    let location = format!("https://{hostname}:{https_port}{}{query}", req.path);
+    HttpOutcome::Response(
+        HttpResponse::text(301, "")
+            .with_header("Location", &location)
+            .with_header("Connection", "close"),
+    )
+}
+
+/// 对端是否为回环（`127.0.0.1:x` / `[::1]:x` / 裸 `::1`）。
+fn is_loopback_peer(remote: &str) -> bool {
+    let host = if let Some(rest) = remote.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else if remote.matches(':').count() > 1 {
+        remote
+    } else {
+        remote.split(':').next().unwrap_or(remote)
+    };
+    host == "127.0.0.1" || host == "::1"
 }
 
 /// 单连接服务（hyper HTTP/1.1 + 升级支持）。
@@ -1509,5 +1560,16 @@ mod envelope_tests {
         let text = String::from_utf8_lossy(&empty.body).to_string();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["data"], serde_json::Value::Null);
+    }
+
+    /// 回环判定：只认 `127.0.0.1` / `::1`（含带端口与方括号），其它一律 false。
+    #[test]
+    fn loopback_peer_detection() {
+        for ok in ["127.0.0.1:5501", "127.0.0.1", "[::1]:5501", "::1"] {
+            assert!(is_loopback_peer(ok), "{ok} 应判为回环");
+        }
+        for bad in ["192.168.1.10:5501", "10.0.0.1", "[2001:db8::1]:5501", "127.0.0.2:80", ""] {
+            assert!(!is_loopback_peer(bad), "{bad} 不应判为回环");
+        }
     }
 }
