@@ -690,6 +690,11 @@ impl RenderState {
     pub fn take_layout(&self) -> Option<Rc<str>> {
         self.layout.borrow_mut().take()
     }
+
+    /// 预设默认布局（`_ViewStart.cshtml` 里 `Layout = "_Layout"` 的约定值）。
+    pub fn set_layout(&self, name: &str) {
+        *self.layout.borrow_mut() = Some(Rc::from(name));
+    }
 }
 
 /// `Layout = 表达式;`（F008）：仅接受字符串（与 C# 属性类型一致）。

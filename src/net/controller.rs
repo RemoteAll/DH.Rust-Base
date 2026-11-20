@@ -42,7 +42,9 @@ use serde_json::Value as Json;
 #[cfg(feature = "razor")]
 use crate::razor::value::Value as RazorValue;
 #[cfg(feature = "razor")]
-use crate::razor::view::{DirViewLoader, ViewEngine};
+use crate::razor::view::{
+    DirViewLoader, MemoryViewLoader, OverlayViewLoader, SearchContext, ViewEngine, ViewLoader,
+};
 
 use super::http::{json_escape, HttpOutcome, HttpResponse};
 use super::router::{route, Ctx, RouteHandler, Router};
@@ -316,13 +318,259 @@ pub fn json_error(code: i64, message: &str) -> ActionResult {
 // 线程本地引擎缓存（键 = 视图根目录；Razor 解析缓存命中时零文件读取）
 #[cfg(feature = "razor")]
 thread_local! {
-    static ENGINES: RefCell<HashMap<PathBuf, Rc<ViewEngine>>> = RefCell::new(HashMap::new());
+    /// 视图引擎缓存：键 = 视图根路径（可带 `#embedded:N` 后缀，区分是否叠加内置模板）。
+    static ENGINES: RefCell<HashMap<String, Rc<ViewEngine>>> = RefCell::new(HashMap::new());
+}
+
+/// 构建视图引擎：**项目目录优先，其次内置（库自带）模板**。
+///
+/// 对齐 ASP.NET Core「项目视图覆盖引用库视图」：相对路径相同的文件以项目为准；
+/// 项目缺失时回退内置模板，库升级直接生效。
+#[cfg(feature = "razor")]
+fn build_engine(
+    root: PathBuf,
+    embedded: Option<Arc<Vec<(String, String)>>>,
+    stamp_ttl_ms: u64,
+) -> ViewEngine {
+    let options = crate::razor::Options {
+        stamp_ttl_ms,
+        ..Default::default()
+    };
+    let dir = DirViewLoader::new(root);
+    match embedded {
+        None => ViewEngine::with_options(Box::new(dir), options),
+        Some(entries) => {
+            let memory = MemoryViewLoader::new((*entries).clone());
+            ViewEngine::with_options(
+                Box::new(OverlayViewLoader::new(
+                    dir,
+                    Box::new(memory) as Box<dyn ViewLoader>,
+                )),
+                options,
+            )
+        }
+    }
+}
+
+/// 默认解析缓存时长（毫秒）：稳态零 IO，改视图最多延迟 1 秒生效。
+pub const DEFAULT_META_TTL_MS: u64 = 1000;
+
+/// 页面级静态资源类型（决定注入位置与标签）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageAssetKind {
+    /// 样式表：注入到 `</head>` 之前。
+    Style,
+    /// 脚本：注入到 `</body>` 之前（布局 `Scripts` 区之后）。
+    Script,
+}
+
+/// 页面级静态资源规则（扩展点）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageAssetRule {
+    /// 扩展名（不含点，如 `css` / `js`）。
+    pub extension: String,
+    /// 类型（决定标签与插入位置）。
+    pub kind: PageAssetKind,
+}
+
+impl PageAssetRule {
+    /// 新建规则。
+    pub fn new(extension: impl Into<String>, kind: PageAssetKind) -> Self {
+        Self {
+            extension: extension.into(),
+            kind,
+        }
+    }
+}
+
+/// 已解析出的页面资源（注入用，结构小、可缓存）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAsset {
+    /// 资源类型（决定标签与插入位置）。
+    pub kind: PageAssetKind,
+    /// 资源 URL（已按前缀拼好）。
+    pub url: String,
+}
+
+/// 页面级静态资源约定（对齐 JS 生态「同名文件自动加载」）。
+///
+/// 约定：视图 `{Page}` 渲染时，若 `{root}/{Page}.{ext}` 存在，就注入对应标签：
+/// 样式进 `<head>` 末尾、脚本进 `</body>` 之前。项目覆盖库模板时，资源文件与视图
+/// 同名同路径，天然跟着覆盖走。
+///
+/// **性能**：解析结果按页名缓存（默认 30 秒，进程内 `TtlCache`，一次加锁 + 一次查表），
+/// 稳态下每页 **0 次文件系统调用**；未配置本项（`None`）时整条逻辑不进入，零开销。
+/// 调测期可把 TTL 调到 0（不缓存）以获得「改完文件立刻生效」。
+///
+/// **资源只在磁盘**：这里只做 `is_file()` 存在判定 + 拼 URL，**不读取、不嵌入、不压缩**
+/// 任何 css/js 到二进制；实际内容由宿主静态文件服务（带 ETag/304）直接从磁盘发出。
+#[derive(Clone)]
+pub struct PageAssets {
+    /// 资源磁盘根（通常是 `wwwroot/static/views`）。
+    pub root: PathBuf,
+    /// 资源 URL 前缀（通常是 `/static/views`）。
+    pub url_prefix: String,
+    /// 规则（默认 `css` + `js`；可增删改，扩展名与注入位置都由此控制）。
+    pub rules: Vec<PageAssetRule>,
+    /// 按页名缓存的解析结果（避免每页 2 次 `is_file()`）。
+    cache: Arc<crate::cache::TtlCache<String, Vec<ResolvedAsset>>>,
+}
+
+impl std::fmt::Debug for PageAssets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageAssets")
+            .field("root", &self.root)
+            .field("url_prefix", &self.url_prefix)
+            .field("rules", &self.rules)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for PageAssets {
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root
+            && self.url_prefix == other.url_prefix
+            && self.rules == other.rules
+    }
+}
+
+impl Eq for PageAssets {}
+
+impl PageAssets {
+    /// 以磁盘根与 URL 前缀创建（默认 `css` → head、`js` → body 末尾，缓存 30 秒）。
+    pub fn new(root: impl Into<PathBuf>, url_prefix: impl Into<String>) -> Self {
+        Self {
+            root: root.into(),
+            url_prefix: url_prefix.into(),
+            rules: vec![
+                PageAssetRule::new("css", PageAssetKind::Style),
+                PageAssetRule::new("js", PageAssetKind::Script),
+            ],
+            cache: Arc::new(crate::cache::TtlCache::new(30, 1024)),
+        }
+    }
+
+    /// 替换规则表（扩展名 / 注入位置自定义）。
+    pub fn with_rules(mut self, rules: Vec<PageAssetRule>) -> Self {
+        if !rules.is_empty() {
+            self.rules = rules;
+        }
+        self
+    }
+
+    /// 设置解析缓存 TTL（秒；`0` = 不缓存，改文件立即生效，**调测期用**）。
+    pub fn with_cache_ttl(mut self, seconds: u64) -> Self {
+        self.cache = Arc::new(crate::cache::TtlCache::new(seconds, 1024));
+        self
+    }
+
+    /// 让某个页面的解析结果立即失效（热更新资源后调用）。
+    pub fn invalidate(&self, page: &str) {
+        self.cache.remove(&page.to_string());
+    }
+
+    /// 清空解析缓存。
+    pub fn clear_cache(&self) {
+        self.cache.clear();
+    }
+
+    /// 某个规则对应的物理文件。
+    fn file_for(&self, page: &str, rule: &PageAssetRule) -> PathBuf {
+        self.root.join(format!(
+            "{}.{}",
+            page.replace('/', std::path::MAIN_SEPARATOR_STR),
+            rule.extension
+        ))
+    }
+
+    /// 某个规则对应的 URL。
+    fn url_for(&self, page: &str, rule: &PageAssetRule) -> String {
+        format!(
+            "{}/{}.{}",
+            self.url_prefix.trim_end_matches('/'),
+            page,
+            rule.extension
+        )
+    }
+
+    /// 解析某页的资源（先查缓存，未命中才做 `is_file()`）。
+    pub fn resolve(&self, page: &str) -> Vec<ResolvedAsset> {
+        let key = page.to_string();
+        if let Some(hit) = self.cache.get(&key) {
+            return hit;
+        }
+        let mut list = Vec::new();
+        for rule in &self.rules {
+            if self.file_for(page, rule).is_file() {
+                list.push(ResolvedAsset {
+                    kind: rule.kind,
+                    url: self.url_for(page, rule),
+                });
+            }
+        }
+        self.cache.insert(key, list.clone());
+        list
+    }
+}
+
+/// 按约定把页面级资源标签注入渲染结果（无匹配文件时原样返回）。
+///
+/// 顺序：样式按规则顺序拼成一段插到 `</head>` 前；脚本按规则顺序拼一段插到 `</body>` 前。
+/// 锚点缺失（独立整页视图）时跳过，不做启发式插入。
+pub fn inject_page_assets(html: String, page: &str, assets: &PageAssets) -> String {
+    let resolved = assets.resolve(page);
+    if resolved.is_empty() {
+        return html;
+    }
+    let mut head = String::new();
+    let mut body = String::new();
+    for asset in &resolved {
+        match asset.kind {
+            PageAssetKind::Style => {
+                head.push_str("<link rel=\"stylesheet\" href=\"");
+                crate::razor::rt::escape_html_into(&asset.url, &mut head);
+                head.push_str("\" data-view=\"");
+                crate::razor::rt::escape_html_into(page, &mut head);
+                head.push_str("\">\n");
+            }
+            PageAssetKind::Script => {
+                body.push_str("<script src=\"");
+                crate::razor::rt::escape_html_into(&asset.url, &mut body);
+                body.push_str("\" data-view=\"");
+                crate::razor::rt::escape_html_into(page, &mut body);
+                body.push_str("\"></script>\n");
+            }
+        }
+    }
+    let mut out = html;
+    if !head.is_empty() {
+        if let Some(index) = find_ignore_ascii_case(&out, "</head>") {
+            out.insert_str(index, &head);
+        }
+    }
+    if !body.is_empty() {
+        if let Some(index) = find_ignore_ascii_case(&out, "</body>") {
+            out.insert_str(index, &body);
+        }
+    }
+    out
+}
+
+/// 大小写不敏感的子串查找（返回字节位置）。
+fn find_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
+    let bytes = haystack.as_bytes();
+    let target = needle.as_bytes();
+    if target.is_empty() || bytes.len() < target.len() {
+        return None;
+    }
+    bytes
+        .windows(target.len())
+        .position(|window| window.eq_ignore_ascii_case(target))
 }
 
 /// 视图目录约定（C# MVC / Areas）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ViewConvention {
-    /// 平铺约定：`Views/{Area}/{Controller}/{Action}.cshtml`。
+pub enum ViewConvention {    /// 平铺约定：`Views/{Area}/{Controller}/{Action}.cshtml`。
     #[default]
     Flat,
     /// C# Areas 约定：`Areas/{Area}/Views/{Controller}/{Action}.cshtml`。
@@ -335,6 +583,29 @@ impl ViewConvention {
         match self {
             ViewConvention::Flat => "Views",
             ViewConvention::Areas => "Areas",
+        }
+    }
+
+    /// 视图查找位置模板，**顺序即优先级**。
+    ///
+    /// 语义对齐 C# `RazorViewEngineOptions.ViewLocationFormats` /
+    /// `AreaViewLocationFormats`：依次尝试「区域 + 控制器 → 区域 Shared →
+    /// 根控制器 → 根 Shared」，`{area}`/`{controller}`/`{view}` 为占位符。
+    /// 自定义规则用 [`ViewRenderer::with_location_formats`] 覆盖，不要在调用点写死路径。
+    pub fn location_formats(&self) -> &'static [&'static str] {
+        match self {
+            ViewConvention::Flat => &[
+                "{area}/{controller}/{view}",
+                "{area}/{controller}/Shared/{view}",
+                "{controller}/{view}",
+                "Shared/{view}",
+            ],
+            ViewConvention::Areas => &[
+                "{area}/Views/{controller}/{view}",
+                "{area}/Views/Shared/{view}",
+                "Views/{controller}/{view}",
+                "Views/Shared/{view}",
+            ],
         }
     }
 
@@ -361,13 +632,25 @@ impl ViewConvention {
         }
     }
 
-    /// 布局名（供 `@{ Layout = "..."; }`）。
-    pub fn layout_name(&self, area: &str) -> String {
+    /// 从控制器路径反解 `(区域, 控制器)`。
+    ///
+    /// - `Areas`：`Admin/Views/Config` → `(Admin, Config)`
+    /// - `Flat`：`Admin/Config` → `(Admin, Config)`
+    /// - 无区域前缀：`api` → `(None, api)`
+    pub fn split_controller<'a>(&self, controller: &'a str) -> (Option<&'a str>, &'a str) {
+        let controller = controller.trim_matches('/');
         match self {
-            ViewConvention::Flat => "Shared/_Layout".to_string(),
-            ViewConvention::Areas => {
-                format!("{}/Views/Shared/_AdminLayout", area.trim_matches('/'))
-            }
+            ViewConvention::Areas => match controller.split_once('/') {
+                Some((area, rest)) => match rest.strip_prefix("Views/") {
+                    Some(tail) if !tail.is_empty() => (Some(area), tail),
+                    _ => (None, controller),
+                },
+                None => (None, controller),
+            },
+            ViewConvention::Flat => match controller.split_once('/') {
+                Some((area, rest)) if !rest.is_empty() => (Some(area), rest),
+                _ => (None, controller),
+            },
         }
     }
 
@@ -396,6 +679,19 @@ impl ViewConvention {
             }
         }
     }
+
+    /// 区域根目录下的视图文件相对路径（如 `_ViewStart.cshtml`）。
+    ///
+    /// - `Areas`：`{Area}/Views/{name}.cshtml`
+    /// - `Flat`：`{Area}/{name}.cshtml`
+    pub fn area_root_path(&self, area: &str, name: &str) -> String {
+        match self {
+            ViewConvention::Flat => format!("{}/{name}.cshtml", area.trim_matches('/')),
+            ViewConvention::Areas => {
+                format!("{}/Views/{name}.cshtml", area.trim_matches('/'))
+            }
+        }
+    }
 }
 
 /// 视图渲染器：MVC 约定 `Views/{Controller}/{Action}.cshtml`；控制器前缀可含 `/`（Area）。
@@ -413,6 +709,18 @@ pub struct ViewRenderer {
     /// 回退区域（如 `Admin`）；`None` = 不回退
     fallback_area: Option<String>,
     convention: ViewConvention,
+    /// 自定义查找格式；`None` = 用 [`ViewConvention::location_formats`] 的默认规则。
+    formats: Option<Vec<String>>,
+    /// 页面级静态资源约定（`None` = 不注入）。
+    page_assets: Option<PageAssets>,
+    /// 解析结果 / 变更戳缓存有效期（毫秒；`0` = 不缓存，改文件立即生效）。
+    meta_ttl_ms: u64,
+    /// 视图查找结果缓存（键 = 控制器 + 视图；值 = 解析出的相对名）。
+    resolve_cache: Arc<crate::cache::TtlCache<(String, String), Option<String>>>,
+    /// 内置（引用库自带）视图：`名称（不含 .cshtml）→ 源码`。
+    ///
+    /// 项目目录里**存在同名文件时以项目文件为准**（对齐 ASP.NET Core「项目视图重写库视图」）。
+    embedded: Option<Arc<Vec<(String, String)>>>,
 }
 
 impl ViewRenderer {
@@ -422,6 +730,11 @@ impl ViewRenderer {
             root: PathBuf::from("Views"),
             fallback_area: None,
             convention: ViewConvention::Flat,
+            formats: None,
+            page_assets: None,
+            meta_ttl_ms: DEFAULT_META_TTL_MS,
+            resolve_cache: Arc::new(crate::cache::TtlCache::new(1, 2048)),
+            embedded: None,
         }
     }
 
@@ -431,6 +744,11 @@ impl ViewRenderer {
             root: root.into(),
             fallback_area: None,
             convention: ViewConvention::Flat,
+            formats: None,
+            page_assets: None,
+            meta_ttl_ms: DEFAULT_META_TTL_MS,
+            resolve_cache: Arc::new(crate::cache::TtlCache::new(1, 2048)),
+            embedded: None,
         }
     }
 
@@ -440,7 +758,93 @@ impl ViewRenderer {
             root: root.into(),
             fallback_area: None,
             convention: ViewConvention::Areas,
+            formats: None,
+            page_assets: None,
+            meta_ttl_ms: DEFAULT_META_TTL_MS,
+            resolve_cache: Arc::new(crate::cache::TtlCache::new(1, 2048)),
+            embedded: None,
         }
+    }
+
+    /// 设置解析缓存有效期（毫秒；默认 [`DEFAULT_META_TTL_MS`]，`0` = 每次都探盘）。
+    ///
+    /// 稳态（缓存期内）每页 **零文件系统调用**；调测期建议设 `0` 获得「保存即生效」。
+    pub fn with_meta_ttl_ms(mut self, ms: u64) -> Self {
+        self.meta_ttl_ms = ms;
+        let secs = ms.div_ceil(1000);
+        self.resolve_cache = Arc::new(crate::cache::TtlCache::new(secs, 2048));
+        self
+    }
+
+    /// 清除视图查找缓存（部署新视图后调用）。
+    pub fn clear_resolve_cache(&self) {
+        self.resolve_cache.clear();
+    }
+
+    /// 启用页面级静态资源约定（同名 `.css` / `.js` 自动注入）；传 `None` 关闭。
+    pub fn with_page_assets(mut self, assets: Option<PageAssets>) -> Self {
+        self.page_assets = assets;
+        self
+    }
+
+    /// 当前页面资源约定（未启用时为 `None`）。
+    pub fn page_assets(&self) -> Option<&PageAssets> {
+        self.page_assets.as_ref()
+    }
+
+    /// 自定义视图查找格式（覆盖约定默认，语义同 C# `ViewLocationFormats`）。
+    ///
+    /// 占位符：`{area}` / `{controller}` / `{view}`；顺序即优先级。
+    /// 传空表 = 恢复约定默认。
+    pub fn with_location_formats<I, S>(mut self, formats: I) -> ViewRenderer
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let list: Vec<String> = formats.into_iter().map(Into::into).collect();
+        self.formats = if list.is_empty() { None } else { Some(list) };
+        // 规则变了，旧的解析结果必须作废
+        self.resolve_cache.clear();
+        self
+    }
+
+    /// 当前生效的查找格式（自定义优先，否则取约定默认）。
+    pub fn formats(&self) -> Vec<String> {
+        match &self.formats {
+            Some(list) => list.clone(),
+            None => self
+                .convention
+                .location_formats()
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+
+    /// 设置内置（引用库自带）视图：`名称（不含 .cshtml）→ 源码`。
+    ///
+    /// 解析顺序 **项目目录 → 内置模板**：项目里存在同相对路径的文件时用项目文件
+    /// （可按项目定制），否则回退库内置模板（库升级直接生效，不必同步副本）。
+    pub fn with_embedded_views(mut self, entries: Vec<(String, String)>) -> ViewRenderer {
+        self.embedded = if entries.is_empty() {
+            None
+        } else {
+            Some(Arc::new(entries))
+        };
+        self
+    }
+
+    /// 当前内置视图表（未设置时为 `None`）。
+    pub fn embedded_views(&self) -> Option<&[(String, String)]> {
+        self.embedded.as_deref().map(|v| v.as_slice())
+    }
+
+    /// 内置模板名是否可解析出。
+    fn embedded_has(&self, name: &str) -> bool {
+        self.embedded
+            .as_ref()
+            .map(|list| list.iter().any(|(n, _)| n == name))
+            .unwrap_or(false)
     }
 
     /// 视图根目录。
@@ -456,6 +860,7 @@ impl ViewRenderer {
     /// 设置目录约定（链式）。
     pub fn with_convention(mut self, convention: ViewConvention) -> ViewRenderer {
         self.convention = convention;
+        self.resolve_cache.clear();
         self
     }
 
@@ -479,46 +884,109 @@ impl ViewRenderer {
         } else {
             Some(trimmed.to_string())
         };
+        // 回退区域变了，旧的解析结果必须作废
+        self.resolve_cache.clear();
     }
 
-    /// 按约定渲染视图并返回 HTML。
+    /// 按约定渲染视图并返回 HTML（套用 `_ViewStart` 约定布局）。
     ///
     /// 需要启用 `razor` feature（视图引擎）；未启用时返回明确错误。
     pub fn render(
         &self,
         controller: &str,
-        _action: &str,
+        action: &str,
         view: &str,
         model: &Json,
     ) -> Result<String, String> {
+        self.render_with(controller, action, view, model, true)
+    }
+
+    /// 渲染片段视图（**不套用** `_ViewStart` 约定布局，对齐 C# Partial 行为）。
+    pub fn render_isolated(
+        &self,
+        controller: &str,
+        action: &str,
+        view: &str,
+        model: &Json,
+    ) -> Result<String, String> {
+        self.render_with(controller, action, view, model, false)
+    }
+
+    /// 渲染实现（`use_view_start` 控制是否套用 `_ViewStart` 约定布局）。
+    fn render_with(
+        &self,
+        controller: &str,
+        _action: &str,
+        view: &str,
+        model: &Json,
+        use_view_start: bool,
+    ) -> Result<String, String> {
         let name = self.resolve(controller, view).ok_or_else(|| {
-            let tried = format!("{}/{}.cshtml", pascal_path(controller), pascal_path(view));
+            let tried = candidates_for(
+                &self.formats(),
+                self.convention.split_controller(controller).0,
+                self.convention.split_controller(controller).1,
+                view,
+            )
+            .first()
+            .cloned()
+            .unwrap_or_else(|| format!("{}/{}.cshtml", pascal_path(controller), pascal_path(view)));
             match &self.fallback_area {
                 Some(area) if controller.contains('/') => format!(
-                    "视图不存在：{tried}（视图根 {}；已回退区域 {area}）",
+                    "视图不存在：{tried}.cshtml（视图根 {}；已回退区域 {area}）",
                     self.root.display()
                 ),
-                _ => format!("视图不存在：{tried}（视图根 {}）", self.root.display()),
+                _ => format!(
+                    "视图不存在：{tried}.cshtml（视图根 {}）",
+                    self.root.display()
+                ),
             }
         })?;
 
         #[cfg(feature = "razor")]
         {
+            // 缓存键必须区分「有无内置模板 / TTL」，否则不同渲染器会互相串味。
+            let key = match &self.embedded {
+                None => format!("{}#ttl{}", self.root.display(), self.meta_ttl_ms),
+                Some(list) => format!(
+                    "{}#ttl{}#embedded:{}",
+                    self.root.display(),
+                    self.meta_ttl_ms,
+                    list.len()
+                ),
+            };
+            let root = self.root.clone();
+            let embedded = self.embedded.clone();
+            let ttl = self.meta_ttl_ms;
+            // 布局 / Partial 用**裸名**（`Layout = \"_AdminLayout\"`）时，按同一套查找规则定位，
+            // 与 C# 一致：页面上下文（区域 + 控制器）决定了它去哪个 `Shared` 目录找。
+            let (area, ctrl) = self.convention.split_controller(name.as_str());
+            let search = SearchContext {
+                area: area.map(str::to_string),
+                controller: ctrl.to_string(),
+                formats: self.formats(),
+            };
             return ENGINES.with(|slot| {
                 let mut engines = slot.borrow_mut();
-                let engine = engines.entry(self.root.clone()).or_insert_with(|| {
-                    Rc::new(ViewEngine::new(Box::new(DirViewLoader::new(
-                        self.root.clone(),
-                    ))))
-                });
+                let engine = engines
+                    .entry(key)
+                    .or_insert_with(|| Rc::new(build_engine(root, embedded, ttl)));
+                engine.set_search_context(search);
                 let value = RazorValue::from(model.clone());
-                engine.render(&name, &value).map_err(|e| format!("{e}"))
+                let html = engine
+                    .render_page(&name, &value, use_view_start)
+                    .map_err(|e| format!("{e}"))?;
+                // 页面级资源约定：同名 `.css` / `.js` 存在才注入（无文件零开销）。
+                return Ok(match (&self.page_assets, use_view_start) {
+                    (Some(assets), true) => inject_page_assets(html, &name, assets),
+                    _ => html,
+                });
             });
         }
 
         #[cfg(not(feature = "razor"))]
         {
-            let _ = (name, model);
+            let _ = (name, model, use_view_start);
             Err("视图渲染需要启用 dhrust 的 razor feature".to_string())
         }
     }
@@ -555,40 +1023,86 @@ impl ViewRenderer {
 
     /// 约定解析：返回相对视图名（`{Controller}/{View}`，不含扩展名）。
     ///
-    /// 候选顺序：控制器/视图各按「逐段 Pascal」与「原样」组合；配了回退区域时，
-    /// 再把控制器首段替换为回退区域重试一遍（`biz/config` → `Admin/Config`）。
+    /// 按 [`ViewConvention::location_formats`]（或自定义格式）逐条展开候选，
+    /// 每条格式内再按「逐段 Pascal」与「原样」两种写法尝试；
+    /// 配了回退区域时，最后再用回退区域重试一遍（`Biz/View/Config` → `Admin/...`）。
+    ///
+    /// 命中判定：**项目目录优先，其次内置（引用库自带）模板**。
     fn resolve(&self, controller: &str, view: &str) -> Option<String> {
-        let controller = controller.trim_matches('/');
-        let mut candidates = Vec::new();
-        push_candidates(&mut candidates, controller, view);
-        if let Some(fallback) = &self.fallback_area {
-            if let Some((area, rest)) = controller.split_once('/') {
-                if !area.eq_ignore_ascii_case(fallback) {
-                    push_candidates(&mut candidates, &format!("{fallback}/{rest}"), view);
-                }
+        let key = (controller.to_string(), view.to_string());
+        if self.meta_ttl_ms > 0 {
+            if let Some(hit) = self.resolve_cache.get(&key) {
+                return hit;
             }
         }
-        for name in candidates {
-            if self.root.join(format!("{name}.cshtml")).is_file() {
-                return Some(name);
+        let resolved = self.resolve_uncached(controller, view);
+        if self.meta_ttl_ms > 0 {
+            self.resolve_cache.insert(key, resolved.clone());
+        }
+        resolved
+    }
+
+    /// 实际查找（未命中缓存时）。
+    fn resolve_uncached(&self, controller: &str, view: &str) -> Option<String> {
+        let (area, controller) = self.convention.split_controller(controller.trim_matches('/'));
+        let mut areas: Vec<Option<String>> = vec![area.map(str::to_string)];
+        if let Some(fallback) = &self.fallback_area {
+            let same = area
+                .map(|a| a.eq_ignore_ascii_case(fallback))
+                .unwrap_or(false);
+            if !same {
+                areas.push(Some(fallback.clone()));
+            }
+        }
+        let formats = self.formats();
+        for area in areas {
+            for name in candidates_for(&formats, area.as_deref(), controller, view) {
+                if self.root.join(format!("{name}.cshtml")).is_file() || self.embedded_has(&name) {
+                    return Some(name);
+                }
             }
         }
         None
     }
 }
 
-/// 候选视图名（逐段 Pascal + 原样，去重）。
-fn push_candidates(out: &mut Vec<String>, controller: &str, view: &str) {
-    let controllers = [pascal_path(controller), controller.to_string()];
-    let views = [pascal_path(view), view.to_string()];
-    for c in &controllers {
-        for v in &views {
-            let name = format!("{c}/{v}");
-            if !out.contains(&name) {
-                out.push(name);
+/// 展开视图查找格式：`{area}` / `{controller}` / `{view}` 占位符。
+///
+/// 区域缺失时跳过含 `{area}` 的格式（对齐 C#：非区域请求只查根级位置）。
+pub(crate) fn candidates_for(
+    formats: &[String],
+    area: Option<&str>,
+    controller: &str,
+    view: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for format in formats {
+        if format.contains("{area}") && area.is_none() {
+            continue;
+        }
+        let areas = match area {
+            Some(a) => vec![pascal(a), a.to_string()],
+            None => vec![String::new()],
+        };
+        let controllers = [pascal_path(controller), controller.to_string()];
+        let views = [pascal_path(view), view.to_string()];
+        for a in &areas {
+            for c in &controllers {
+                for v in &views {
+                    let name = format
+                        .replace("{area}", a)
+                        .replace("{controller}", c)
+                        .replace("{view}", v)
+                        .replace("//", "/");
+                    let name = name.trim_matches('/').to_string();
+                    if !name.is_empty() && !out.contains(&name) {
+                        out.push(name);
+                    }
+                }
             }
         }
     }
+    out
 }
 
 /// 逐段 Pascal 化（`admin/config` → `Admin/Config`；单段与 [`pascal`] 等价）。
@@ -744,13 +1258,13 @@ mod tests {
         std::fs::create_dir_all(views.join("Config")).unwrap();
         std::fs::create_dir_all(views.join("Shared")).unwrap();
         std::fs::write(
-            views.join("Shared").join("_AdminLayout.cshtml"),
+            views.join("Shared").join("_Layout.cshtml"),
             "<html>@RenderBody()</html>",
         )
         .unwrap();
         std::fs::write(
             views.join("Config").join("Index.cshtml"),
-            "@{ Layout = \"Admin/Views/Shared/_AdminLayout\"; }<p>@Model.Title</p>",
+            "@{ Layout = \"_Layout\"; }<p>@Model.Title</p>",
         )
         .unwrap();
 
@@ -780,8 +1294,15 @@ mod tests {
             "Admin/Views/Shared/_Layout.cshtml"
         );
         assert_eq!(
-            ViewConvention::Areas.layout_name("Admin"),
-            "Admin/Views/Shared/_AdminLayout"
+            ViewConvention::Areas
+                .location_formats()
+                .first()
+                .copied(),
+            Some("{area}/Views/{controller}/{view}")
+        );
+        assert_eq!(
+            ViewConvention::Areas.split_controller("Admin/Views/Config"),
+            (Some("Admin"), "Config")
         );
         assert_eq!(
             ViewConvention::Flat.view_path("Admin", "Config", "Index"),
@@ -900,5 +1421,296 @@ mod tests {
         // 未设置时保持默认（无回退）
         let controller = Controller::new("api");
         assert!(controller.views.fallback_area().is_none());
+    }
+
+    /// 造一个 C# Areas 视图树：`Areas/Admin/Views/{controller}/{view}.cshtml`。
+    fn temp_area_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "dhrust-areas-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("Admin/Views/Config")).unwrap();
+        std::fs::create_dir_all(root.join("Admin/Views/Shared")).unwrap();
+        root
+    }
+
+    #[cfg(feature = "razor")]
+    #[test]
+    fn view_start_provides_conventional_layout() {
+        let root = temp_area_root("viewstart");
+        std::fs::write(
+            root.join("Admin/Views/_ViewStart.cshtml"),
+            "@{ Layout = \"_Layout\"; }",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Admin/Views/Shared/_Layout.cshtml"),
+            "<html><head></head><body>@RenderBody()</body></html>",
+        )
+        .unwrap();
+        // 视图自己不写 Layout，靠 `_ViewStart` 的约定值
+        std::fs::write(
+            root.join("Admin/Views/Config/Index.cshtml"),
+            "<p>@Model.Title</p>",
+        )
+        .unwrap();
+
+        let renderer = ViewRenderer::with_areas_root(&root);
+        let html = renderer
+            .render_area(
+                "Admin",
+                "Config",
+                "Index",
+                "Index",
+                &serde_json::json!({ "Title": "Page" }),
+            )
+            .unwrap();
+        assert!(html.contains("<body><p>Page</p></body>"), "{html}");
+
+        // 关闭约定（片段视图）时不套布局
+        let raw = renderer
+            .render_isolated(
+                "Admin/Views/Config",
+                "Index",
+                "Index",
+                &serde_json::json!({ "Title": "Page" }),
+            )
+            .unwrap();
+        assert_eq!(raw, "<p>Page</p>");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "razor")]
+    #[test]
+    fn nested_view_start_overrides_area_default() {
+        let root = temp_area_root("viewstart-nested");
+        std::fs::write(
+            root.join("Admin/Views/_ViewStart.cshtml"),
+            "@{ Layout = \"_Layout\"; }",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Admin/Views/Shared/_Layout.cshtml"),
+            "<html>@RenderBody()</html>",
+        )
+        .unwrap();
+        // 就近的 `_ViewStart` 用空布局 = 不套布局（独立整页）
+        std::fs::create_dir_all(root.join("Admin/Views/Config")).unwrap();
+        std::fs::write(
+            root.join("Admin/Views/Config/_ViewStart.cshtml"),
+            "@{ Layout = \"\"; }",
+        )
+        .unwrap();
+        std::fs::write(root.join("Admin/Views/Config/Index.cshtml"), "<p>独立</p>").unwrap();
+
+        let html = ViewRenderer::with_areas_root(&root)
+            .render_area(
+                "Admin",
+                "Config",
+                "Index",
+                "Index",
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        assert_eq!(html, "<p>独立</p>");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "razor")]
+    #[test]
+    fn embedded_views_fill_missing_files_and_project_wins() {
+        let root = temp_area_root("embedded");
+        std::fs::write(
+            root.join("Admin/Views/Config/Index.cshtml"),
+            "<p>项目自有</p>",
+        )
+        .unwrap();
+        let embedded = vec![
+            ("Admin/Views/Config/Index".to_string(), "<p>库内置</p>".to_string()),
+            (
+                "Admin/Views/Shared/_Layout".to_string(),
+                "<html>@RenderBody()</html>".to_string(),
+            ),
+        ];
+        std::fs::write(
+            root.join("Admin/Views/Config/_ViewStart.cshtml"),
+            "@{ Layout = \"_Layout\"; }",
+        )
+        .unwrap();
+
+        let html = ViewRenderer::with_areas_root(&root)
+            .with_embedded_views(embedded)
+            .render_area(
+                "Admin",
+                "Config",
+                "Index",
+                "Index",
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        // 项目有同名视图 → 项目优先；布局只存在于库内置 → 库兜底
+        assert!(html.contains("项目自有"), "{html}");
+        assert!(!html.contains("库内置"), "{html}");
+        assert!(html.starts_with("<html>"), "布局应来自内置模板：{html}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "razor")]
+    #[test]
+    fn page_assets_are_injected_by_convention() {
+        let root = temp_area_root("assets");
+        std::fs::write(
+            root.join("Admin/Views/Config/_ViewStart.cshtml"),
+            "@{ Layout = \"_Layout\"; }",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Admin/Views/Shared/_Layout.cshtml"),
+            "<html><head></head><body>@RenderBody()</body></html>",
+        )
+        .unwrap();
+        std::fs::write(root.join("Admin/Views/Config/Index.cshtml"), "<p>x</p>").unwrap();
+
+        let assets_root = root.join("static-views");
+        std::fs::create_dir_all(assets_root.join("Admin/Views/Config")).unwrap();
+        std::fs::write(assets_root.join("Admin/Views/Config/Index.css"), "p{}").unwrap();
+        std::fs::write(assets_root.join("Admin/Views/Config/Index.js"), "void 0").unwrap();
+
+        // 调测口径：TTL = 0（不缓存），改文件立刻生效
+        let assets = PageAssets::new(&assets_root, "/static/views").with_cache_ttl(0);
+        let renderer =
+            ViewRenderer::with_areas_root(&root).with_page_assets(Some(assets.clone()));
+        let html = renderer
+            .render_area(
+                "Admin",
+                "Config",
+                "Index",
+                "Index",
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        assert!(
+            html.contains("href=\"/static/views/Admin/Views/Config/Index.css\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("src=\"/static/views/Admin/Views/Config/Index.js\""),
+            "{html}"
+        );
+        // 顺序：样式在 body 之前，脚本在 </body> 之前
+        let css_at = html.find("Index.css").unwrap();
+        let body_at = html.find("<body>").unwrap();
+        let js_at = html.find("Index.js").unwrap();
+        assert!(css_at < body_at && body_at < js_at, "{html}");
+
+        // 无同名文件 → 不注入
+        std::fs::remove_file(assets_root.join("Admin/Views/Config/Index.css")).unwrap();
+        std::fs::remove_file(assets_root.join("Admin/Views/Config/Index.js")).unwrap();
+        let html = renderer
+            .render_area(
+                "Admin",
+                "Config",
+                "Index",
+                "Index",
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        assert!(
+            !html.contains("Index.css") && !html.contains("Index.js"),
+            "{html}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "razor")]
+    #[test]
+    fn page_assets_cache_hit_and_invalidate() {        let root = temp_area_root("assets-cache");
+        std::fs::write(
+            root.join("Admin/Views/Config/_ViewStart.cshtml"),
+            "@{ Layout = \"_Layout\"; }",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Admin/Views/Shared/_Layout.cshtml"),
+            "<html><head></head><body>@RenderBody()</body></html>",
+        )
+        .unwrap();
+        std::fs::write(root.join("Admin/Views/Config/Index.cshtml"), "<p>x</p>").unwrap();
+
+        let assets_root = root.join("static-views");
+        std::fs::create_dir_all(assets_root.join("Admin/Views/Config")).unwrap();
+        let assets = PageAssets::new(&assets_root, "/static/views");
+        // 首次解析：无文件 → 空列表（结果被缓存）
+        assert!(assets.resolve("Admin/Views/Config/Index").is_empty());
+        std::fs::write(assets_root.join("Admin/Views/Config/Index.css"), "p{}").unwrap();
+        assert!(
+            assets.resolve("Admin/Views/Config/Index").is_empty(),
+            "缓存期内不重新探测（稳态 0 次文件系统调用）"
+        );
+        // 主动失效后命中新文件
+        assets.invalidate("Admin/Views/Config/Index");
+        assert_eq!(assets.resolve("Admin/Views/Config/Index").len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 性能基准（不参与常规回归）：
+    /// `cargo test --release --features net,razor --lib bench_page_render -- --ignored --nocapture`
+    #[cfg(feature = "razor")]
+    #[test]
+    #[ignore = "性能基准：手动运行，输出 ns/次"]
+    fn bench_page_render() {
+        let root = temp_area_root("bench");
+        std::fs::write(
+            root.join("Admin/Views/_ViewStart.cshtml"),
+            "@{ Layout = \"_Layout\"; }",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Admin/Views/Shared/_Layout.cshtml"),
+            "<html><head><title>@Model.title</title></head><body>@RenderBody()</body></html>",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Admin/Views/Config/Index.cshtml"),
+            "<div class=\"page\"><p>@Model.siteName</p></div>",
+        )
+        .unwrap();
+        let assets_root = root.join("static-views");
+        std::fs::create_dir_all(assets_root.join("Admin/Views/Config")).unwrap();
+        std::fs::write(assets_root.join("Admin/Views/Config/Index.css"), "p{}").unwrap();
+        std::fs::write(assets_root.join("Admin/Views/Config/Index.js"), "void 0").unwrap();
+
+        let model = serde_json::json!({ "title": "t", "siteName": "s" });
+        let base = ViewRenderer::with_areas_root(&root);
+        let with_cache = ViewRenderer::with_areas_root(&root)
+            .with_page_assets(Some(PageAssets::new(&assets_root, "/static/views")));
+        let no_cache = ViewRenderer::with_areas_root(&root).with_page_assets(Some(
+            PageAssets::new(&assets_root, "/static/views").with_cache_ttl(0),
+        ));
+
+        let bench = |label: &str, renderer: &ViewRenderer| {
+            for _ in 0..200 {
+                renderer
+                    .render_area("Admin", "Config", "Index", "Index", &model)
+                    .unwrap();
+            }
+            let rounds = 2000;
+            let start = std::time::Instant::now();
+            for _ in 0..rounds {
+                renderer
+                    .render_area("Admin", "Config", "Index", "Index", &model)
+                    .unwrap();
+            }
+            let per = start.elapsed().as_nanos() as f64 / rounds as f64;
+            println!("{label}: {per:.1} ns/页");
+        };
+        bench("无页面资源约定", &base);
+        bench("有约定·缓存命中", &with_cache);
+        bench("有约定·不缓存(调测档)", &no_cache);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

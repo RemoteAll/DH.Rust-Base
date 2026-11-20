@@ -49,6 +49,11 @@ pub struct Options {
     pub escape: bool,
     /// 模板嵌套深度上限（防嵌套炸弹，默认 32）
     pub max_depth: usize,
+    /// 模板变更戳 / 布局解析的缓存有效期（毫秒，默认 1000；`0` = 每次重新 stat）。
+    ///
+    /// 稳态渲染（缓存期内）**零文件系统调用**；代价是改 `.cshtml` 后最多延迟
+    /// `stamp_ttl_ms` 生效。调测期可设 0 获得「保存即生效」。
+    pub stamp_ttl_ms: u64,
 }
 
 impl Default for Options {
@@ -56,6 +61,7 @@ impl Default for Options {
         Self {
             escape: true,
             max_depth: 32,
+            stamp_ttl_ms: 1000,
         }
     }
 }

@@ -110,6 +110,16 @@ impl Ctx {
         find_value(&self.form, name)
     }
 
+    /// urlencoded 表单字段（**大小写不敏感**，对齐 ASP.NET Core 模型绑定）。
+    ///
+    /// 前端 MD5 登录会把 `password=` 改写成 `PASSWORD=`，C# 能自动绑定；Rust 侧用本方法。
+    pub fn form_value_ci(&self, name: &str) -> Option<&str> {
+        self.form
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
     /// 请求头（大小写不敏感）。
     pub fn header(&self, name: &str) -> Option<&str> {
         self.req.header(name)

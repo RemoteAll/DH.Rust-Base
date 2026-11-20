@@ -424,6 +424,7 @@ mod tests {
         let options = Options {
             escape: false,
             max_depth: 32,
+            stamp_ttl_ms: 0,
         };
         let t = Template::parse("@Model.Html").unwrap();
         assert_eq!(t.render_with(&model, &options).unwrap(), "<b>x</b>");
@@ -671,6 +672,7 @@ mod tests {
         let options = Options {
             escape: true,
             max_depth: 100,
+            stamp_ttl_ms: 0,
         };
         assert_eq!(t.render_with(&model, &options).unwrap(), " <i>x</i> ");
     }
