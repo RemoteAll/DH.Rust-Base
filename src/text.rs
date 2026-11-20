@@ -1,6 +1,7 @@
 //! 通用文本小工具（多消费方收编：Pek.RAgent / Pek.RAdmin / DHDeploy.Agent.Rust 等）。
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 
 /// 常量时间字节比较（长度不等直接 `false`；等长时逐字节异或累加，不提前返回）。
 ///
@@ -514,6 +515,109 @@ fn push_char_lower(out: &mut Vec<u8>, c: char) {
 pub fn normalize_lower(text: &str) -> String {
     normalize_lower_parts(&[text])
 }
+
+// ————— HTML 转义（原在 `razor/rt.rs`） —————
+//
+// **为什么搬到这里**：`net::controller::inject_page_assets` 注入页面资源标签时
+// 要转义 URL 与视图名，那是**与模板引擎无关**的纯字符串处理；早先放在 `razor/rt.rs`
+// 里，被 `#[cfg(feature = "razor")] pub mod razor` 一并门控，导致「开 `net` 不开
+// `razor`」的消费方（HLZX.EIP / Pek.Proxy 等）编译报
+// `error[E0433]: cannot find razor in the crate root`。
+
+
+/// v0.1 转义：等价于 .NET 10 `HtmlEncoder.Default`（由互操作工具 `probe-encode` 全字符实测对齐）。
+///
+/// - 原样输出：空格与可打印 ASCII（0x20–0x7E，排除下表中的六个特殊字符）；
+/// - `"`→`&quot;`、`&`→`&amp;`、`'`→`&#x27;`、`+`→`&#x2B;`、`<`→`&lt;`、`>`→`&gt;`；
+/// - 其余字符（含 `\r` `\n`、Tab、非 ASCII、控制符）→ `&#x` + 大写十六进制 + `;`
+///   （非 BMP 按标量编码，如 `😀`→`&#x1F600;`）。
+///
+/// 实现按字节扫描：可打印 ASCII 连续段整段复制（`push_str`），仅在特殊/非 ASCII
+/// 字节处打断；块级快路径用 8 字节 SWAR 探测（无特殊字节整块跳过），避免长文本
+/// 逐字符处理的迭代开销。
+#[inline]
+pub fn escape_html_into(text: &str, out: &mut String) {
+    out.reserve(text.len());
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        // 8 字节快路径：整块均为「无特殊字节的可打印 ASCII」时直接前进
+        while i + 8 <= bytes.len() && boring8(&bytes[i..i + 8]) {
+            i += 8;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let b = bytes[i];
+        // 单字节快路径：可打印 ASCII 且非特殊字符
+        if matches!(b, b' '..=b'~') && !matches!(b, b'"' | b'&' | b'\'' | b'+' | b'<' | b'>') {
+            i += 1;
+            continue;
+        }
+        // 先复制未处理的原样段
+        if start < i {
+            out.push_str(&text[start..i]);
+        }
+        match b {
+            b'"' => out.push_str("&quot;"),
+            b'&' => out.push_str("&amp;"),
+            b'\'' => out.push_str("&#x27;"),
+            b'+' => out.push_str("&#x2B;"),
+            b'<' => out.push_str("&lt;"),
+            b'>' => out.push_str("&gt;"),
+            _ => {
+                // 控制符或非 ASCII：解码首字符（i 恒为字符边界）后整体实体化
+                let c = text[i..].chars().next().expect("i 恒为字符边界");
+                let _ = write!(out, "&#x{:X};", c as u32);
+                i += c.len_utf8();
+                start = i;
+                continue;
+            }
+        }
+        i += 1;
+        start = i;
+    }
+    if start < bytes.len() {
+        out.push_str(&text[start..]);
+    }
+}
+
+/// 8 字节块是否「无特殊字节」（可做整段复制的充分条件）。
+///
+/// 特殊字节 = 需实体化的字符集：控制符（<0x20）、DEL 与非 ASCII（≥0x7F）、
+/// 以及 `"` `&` `'` `+` `<` `>` 六字符。SWAR 探测允许误报（判非平凡而实际平凡），
+/// 但不得漏报——漏报会破坏转义语义。
+#[inline(always)]
+fn boring8(chunk: &[u8]) -> bool {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    #[inline]
+    fn has_zero(x: u64) -> bool {
+        x.wrapping_sub(ONES) & !x & 0x8080_8080_8080_8080 != 0
+    }
+    #[inline]
+    fn has_byte(x: u64, b: u8) -> bool {
+        has_zero(x ^ (ONES * b as u64))
+    }
+    #[inline]
+    fn has_less(x: u64, n: u8) -> bool {
+        // 经典 hasless：n ∈ [1,128]
+        x.wrapping_sub(ONES * n as u64) & !x & 0x8080_8080_8080_8080 != 0
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(chunk);
+    let x = u64::from_le_bytes(buf);
+    if has_less(x, 0x20) || x & 0x8080_8080_8080_8080 != 0 || has_byte(x, 0x7F) {
+        return false;
+    }
+    !(has_byte(x, b'"')
+        || has_byte(x, b'&')
+        || has_byte(x, b'\'')
+        || has_byte(x, b'+')
+        || has_byte(x, b'<')
+        || has_byte(x, b'>'))
+}
+
 
 #[cfg(test)]
 mod tests {

@@ -528,16 +528,16 @@ pub fn inject_page_assets(html: String, page: &str, assets: &PageAssets) -> Stri
         match asset.kind {
             PageAssetKind::Style => {
                 head.push_str("<link rel=\"stylesheet\" href=\"");
-                crate::razor::rt::escape_html_into(&asset.url, &mut head);
+                crate::text::escape_html_into(&asset.url, &mut head);
                 head.push_str("\" data-view=\"");
-                crate::razor::rt::escape_html_into(page, &mut head);
+                crate::text::escape_html_into(page, &mut head);
                 head.push_str("\">\n");
             }
             PageAssetKind::Script => {
                 body.push_str("<script src=\"");
-                crate::razor::rt::escape_html_into(&asset.url, &mut body);
+                crate::text::escape_html_into(&asset.url, &mut body);
                 body.push_str("\" data-view=\"");
-                crate::razor::rt::escape_html_into(page, &mut body);
+                crate::text::escape_html_into(page, &mut body);
                 body.push_str("\"></script>\n");
             }
         }
