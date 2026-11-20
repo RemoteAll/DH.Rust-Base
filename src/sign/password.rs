@@ -282,19 +282,42 @@ pub fn verify_and_upgrade(password: &str, hash: &str) -> (bool, Option<String>) 
 
 /// 用**指定算法**验证 + 按需升级（`md5+sha1` 等固定口径的消费方用这个）。
 ///
-/// 与 [`verify_and_upgrade`] 的差别：判「是否需要升级」时以传入算法为准，
-/// 因此项目统一用 `md5+sha1` 时，**已合规的散列不会被改写**（不会把「前端 MD5 传输」
-/// 误升级成「MD5 摘要再散列」，导致明文登录失效）。
+/// 与 [`verify_and_upgrade`] 的差别：
+/// 1. 判「是否需要升级」时以传入算法为准，因此项目统一用 `md5+sha1` 时，
+///    **已合规的散列不会被改写**（不会把「前端 MD5 传输」误升级成「MD5 摘要再散列」）；
+/// 2. 兼容**历史散列**（如早期默认的 `$sha512$…`）：按存储算法验证一次，
+///    通过后升级到目标算法（迁移期双接受，用户无需重设口令）。
+///
+/// 升级只在「输入不是 32 位 MD5 摘要」时进行：前端只传 MD5 的场景下，
+/// 用摘要再散列会让明文登录失效，留给下一次明文登录升级。
 pub fn verify_and_upgrade_with(
     algorithm: &str,
     password: &str,
     hash: &str,
 ) -> (bool, Option<String>) {
-    match PasswordProvider::with_algorithm(algorithm) {
-        Ok(provider) => provider.verify_and_upgrade(password, hash),
+    let Ok(provider) = PasswordProvider::with_algorithm(algorithm) else {
         // 算法名不认识：按验证失败处理（调用方能从日志看到具体算法）
-        Err(_) => (false, None),
+        return (false, None);
+    };
+    if provider.verify(password, hash) {
+        if provider.needs_upgrade(hash) && !looks_like_md5_hex(password) {
+            return (true, Some(provider.hash(password)));
+        }
+        return (true, None);
     }
+    // 历史算法遗留值（如 `$sha512$…`）：用存储里的算法复核，成功后升级到目标算法
+    if let Some(stored_algorithm) = algorithm_of(hash) {
+        if !stored_algorithm.eq_ignore_ascii_case(algorithm) {
+            if let Ok(legacy) = PasswordProvider::with_algorithm(stored_algorithm) {
+                if legacy.verify(password, hash) {
+                    let upgraded = (!looks_like_md5_hex(password))
+                        .then(|| provider.hash(password));
+                    return (true, upgraded);
+                }
+            }
+        }
+    }
+    (false, None)
 }
 
 /// 是否为旧式散列（不含 `$`，即明文/MD5；C# 升级判据 `!Password.Contains("$")`）。
