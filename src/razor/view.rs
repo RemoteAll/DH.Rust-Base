@@ -398,8 +398,12 @@ impl ViewEngine {
     ///
     /// 对齐 ASP.NET Core：从页面所在目录**由近到远**向上找，最近的一个生效
     /// （`Areas/Admin/Views/Config/_ViewStart.cshtml` → `Areas/Admin/Views/_ViewStart.cshtml`
-    /// → `Views/_ViewStart.cshtml`）；文件里 `@{ Layout = "_Layout"; }` 即默认布局，
-    /// 页面自己再写 `Layout` 时以页面为准。
+    /// → `Views/_ViewStart.cshtml`）；文件里 `@{ Layout = "_Layout"; }` 即默认布局。
+    ///
+    /// **多份布局的取舍**（优先级从高到低）：
+    /// 1. 页面自身 `Layout = "..."`（渲染时覆盖这里的预设值）；
+    /// 2. 页面自身 `Layout = ""`（明确不套布局，独立整页）；
+    /// 3. 本函数返回的约定值（就近目录优先）。
     fn view_start_layout(
         &self,
         page: &str,

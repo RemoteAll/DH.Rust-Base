@@ -1628,7 +1628,8 @@ mod tests {
 
     #[cfg(feature = "razor")]
     #[test]
-    fn page_assets_cache_hit_and_invalidate() {        let root = temp_area_root("assets-cache");
+    fn page_assets_cache_hit_and_invalidate() {
+        let root = temp_area_root("assets-cache");
         std::fs::write(
             root.join("Admin/Views/Config/_ViewStart.cshtml"),
             "@{ Layout = \"_Layout\"; }",
@@ -1657,10 +1658,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 性能基准（不参与常规回归）：
-    /// `cargo test --release --features net,razor --lib bench_page_render -- --ignored --nocapture`
+    /// 多份布局时的抉择顺序（对齐 C#）：
+    /// 1) `_ViewStart.cshtml` 给默认（就近目录生效）；
+    /// 2) 页面里 `Layout = "..."` 覆盖默认；
+    /// 3) 页面里 `Layout = ""` 明确「不套布局」。
     #[cfg(feature = "razor")]
     #[test]
+    fn layout_decision_order_default_override_and_opt_out() {
+        let root = temp_area_root("layout-order");
+        std::fs::create_dir_all(root.join("Admin/Views/Shared")).unwrap();
+        std::fs::create_dir_all(root.join("Admin/Views/Plain")).unwrap();
+        std::fs::write(
+            root.join("Admin/Views/_ViewStart.cshtml"),
+            "@{ Layout = \"_Layout\"; }",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Admin/Views/Shared/_Layout.cshtml"),
+            "<main data-layout=\"default\">@RenderBody()</main>",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Admin/Views/Shared/_LayoutAlt.cshtml"),
+            "<main data-layout=\"alt\">@RenderBody()</main>",
+        )
+        .unwrap();
+        // ① 不声明 Layout → 用 _ViewStart 的默认
+        std::fs::write(root.join("Admin/Views/Config/Index.cshtml"), "<p>A</p>").unwrap();
+        // ② 页面显式指定 → 覆盖默认
+        std::fs::write(
+            root.join("Admin/Views/Plain/Alt.cshtml"),
+            "@{ Layout = \"_LayoutAlt\"; }<p>B</p>",
+        )
+        .unwrap();
+        // ③ 页面显式空布局 → 不套任何布局（独立整页）
+        std::fs::write(
+            root.join("Admin/Views/Plain/Bare.cshtml"),
+            "@{ Layout = \"\"; }<p>C</p>",
+        )
+        .unwrap();
+
+        let renderer = ViewRenderer::with_areas_root(&root);
+        let model = serde_json::json!({});
+
+        let a = renderer
+            .render_area("Admin", "Config", "Index", "Index", &model)
+            .unwrap();
+        assert!(a.contains("data-layout=\"default\""), "① 默认布局：{a}");
+
+        let b = renderer
+            .render_area("Admin", "Plain", "Alt", "Alt", &model)
+            .unwrap();
+        assert!(b.contains("data-layout=\"alt\""), "② 页面覆盖：{b}");
+        assert!(!b.contains("data-layout=\"default\""), "② 不应回落到默认：{b}");
+
+        let c = renderer
+            .render_area("Admin", "Plain", "Bare", "Bare", &model)
+            .unwrap();
+        assert_eq!(c, "<p>C</p>", "③ 空布局应原样输出：{c}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 性能基准（不参与常规回归）：
+    /// `cargo test --release --features net,razor --lib bench_page_render -- --ignored --nocapture`
+    #[cfg(feature = "razor")]    #[test]
     #[ignore = "性能基准：手动运行，输出 ns/次"]
     fn bench_page_render() {
         let root = temp_area_root("bench");
