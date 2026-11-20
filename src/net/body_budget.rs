@@ -79,10 +79,12 @@ impl BodyBudget {
             if next > self.limit {
                 return None;
             }
-            match self
-                .used
-                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed)
-            {
+            match self.used.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => {
                     return Some(BodyLease {
                         budget: self.clone(),

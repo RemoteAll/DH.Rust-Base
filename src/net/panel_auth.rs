@@ -128,7 +128,14 @@ pub fn client_ip_behind_proxy(
     trust: bool,
 ) -> String {
     let mut out = String::new();
-    client_ip_behind_proxy_into(peer, forwarded_for, real_ip, trusted_proxies, trust, &mut out);
+    client_ip_behind_proxy_into(
+        peer,
+        forwarded_for,
+        real_ip,
+        trusted_proxies,
+        trust,
+        &mut out,
+    );
     out
 }
 
@@ -692,7 +699,13 @@ mod tests {
 
         // 4) 受信代理列表命中时也采纳
         assert_eq!(
-            client_ip_behind_proxy("10.0.0.9", Some("1.2.3.4"), None, "10.0.0.9,10.0.0.10", true),
+            client_ip_behind_proxy(
+                "10.0.0.9",
+                Some("1.2.3.4"),
+                None,
+                "10.0.0.9,10.0.0.10",
+                true
+            ),
             "1.2.3.4"
         );
 
@@ -716,7 +729,10 @@ mod tests {
         assert!(is_loopback("::ffff:127.0.0.1"));
 
         // 8) 空对端
-        assert_eq!(client_ip_behind_proxy("", Some("1.2.3.4"), None, "", true), "unknown");
+        assert_eq!(
+            client_ip_behind_proxy("", Some("1.2.3.4"), None, "", true),
+            "unknown"
+        );
     }
 
     /// 新口径：`X-Real-IP` 优先 + 返回「是否经反代」（供本机免登录判定用）。

@@ -29,7 +29,10 @@ mod tests {
         let js = super::FM_TRANSPORT_JS;
         assert!(js.len() > 5000, "传输内核 JS 太小，可能 include 路径失效");
         assert!(js.contains("root.FmClient = {"), "必须导出 FmClient");
-        assert!(js.contains("VERSION:"), "缺少版本号（多平台接入需可辨识版本）");
+        assert!(
+            js.contains("VERSION:"),
+            "缺少版本号（多平台接入需可辨识版本）"
+        );
         // 关键能力缺一个都算回归
         for needle in [
             "uploadChunked",
@@ -47,8 +50,14 @@ mod tests {
         }
         let css = super::FM_TRANSPORT_CSS;
         for needle in [
-            ".fm-jobs", ".fm-job-bar", ".fm-clip", ".fm-clip-badge", ".fm-clip-src",
-            ".fm-clip-clear", ".fm-drop-active", ".fm-drop-row",
+            ".fm-jobs",
+            ".fm-job-bar",
+            ".fm-clip",
+            ".fm-clip-badge",
+            ".fm-clip-src",
+            ".fm-clip-clear",
+            ".fm-drop-active",
+            ".fm-drop-row",
         ] {
             assert!(css.contains(needle), "缺少样式：{needle}");
         }

@@ -15,9 +15,7 @@ fn ping_handler() -> HttpHandler {
     let mut router = Router::new();
     router.map_get(
         "/ping",
-        route(|_ctx: Ctx| async move {
-            HttpOutcome::Response(HttpResponse::text(200, "pong"))
-        }),
+        route(|_ctx: Ctx| async move { HttpOutcome::Response(HttpResponse::text(200, "pong")) }),
     );
     router.into_handler()
 }

@@ -117,7 +117,11 @@ fn current_key() -> Option<[u8; 32]> {
 /// # 返回值
 /// 密钥文件绝对路径。
 pub fn keyfile_path(dir: &Path, rel: &str) -> PathBuf {
-    dir.join(if rel.trim().is_empty() { KEY_FILE } else { rel.trim() })
+    dir.join(if rel.trim().is_empty() {
+        KEY_FILE
+    } else {
+        rel.trim()
+    })
 }
 
 /// 读取或首次生成密钥文件，并初始化进程内全局密钥（幂等）。
@@ -236,8 +240,10 @@ pub fn reveal(text: &str) -> Result<String, String> {
         return Ok(text.to_string());
     }
     let Some(key) = current_key() else {
-        return Err("密文需要密钥文件，但本进程尚未初始化（应先调用 dhrust::secret::init_keyfile）"
-            .to_string());
+        return Err(
+            "密文需要密钥文件，但本进程尚未初始化（应先调用 dhrust::secret::init_keyfile）"
+                .to_string(),
+        );
     };
     decrypt(text, &key)
 }

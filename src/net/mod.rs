@@ -30,9 +30,9 @@
 //! 依赖矩阵与版本锁定见《AgentRust迁移架构》第 3 节（DHDeploy 仓库 `Doc/`）。
 
 #[cfg(feature = "net")]
-pub mod controller;
-#[cfg(feature = "net")]
 pub mod body_budget;
+#[cfg(feature = "net")]
+pub mod controller;
 #[cfg(feature = "net")]
 pub mod http;
 #[cfg(feature = "http-client")]

@@ -153,7 +153,9 @@ mod tests {
         assert_eq!(s.peek("0123456789ABCDEF").as_deref(), Some("payload"));
         assert_eq!(s.peek("0123456789abcdef").as_deref(), Some("payload"));
         // 业务校验失败不扣配额
-        let err = s.take("0123456789abcdef", |_| Err("拒绝".into())).unwrap_err();
+        let err = s
+            .take("0123456789abcdef", |_| Err("拒绝".into()))
+            .unwrap_err();
         assert!(err.contains("拒绝"), "{err}");
         // 两次消费后删除
         assert!(s.take("0123456789abcdef", |_| Ok(())).is_ok());

@@ -1229,7 +1229,8 @@ mod tests {
         assert_eq!(codes.first().copied(), Some(0x80));
 
         // 5.0：id + 属性长度 0 + 原因码 0x87（未授权）
-        let (id, codes) = codec::parse_suback(&[0x00, 0x0B, 0x00, 0x87], MqttVersion::V500).unwrap();
+        let (id, codes) =
+            codec::parse_suback(&[0x00, 0x0B, 0x00, 0x87], MqttVersion::V500).unwrap();
         assert_eq!(id, 11);
         assert_eq!(codes, vec![0x87]);
 

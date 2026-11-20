@@ -519,8 +519,7 @@ pub fn create_dirs(parent: &Path, rels: &[String]) -> Result<u64, String> {
         if !has_segment {
             continue;
         }
-        fs::create_dir_all(&dst)
-            .map_err(|e| format!("创建目录失败（{}）：{e}", dst.display()))?;
+        fs::create_dir_all(&dst).map_err(|e| format!("创建目录失败（{}）：{e}", dst.display()))?;
         created += 1;
     }
     Ok(created)
@@ -542,7 +541,10 @@ pub fn existing_in(dir: &Path, names: &[String]) -> Vec<String> {
 pub fn existing_paths(base: &Path, paths: &[String]) -> Vec<String> {
     let mut existing = Vec::new();
     for text in paths {
-        if resolve_path(base, text).map(|p| p.exists()).unwrap_or(false) {
+        if resolve_path(base, text)
+            .map(|p| p.exists())
+            .unwrap_or(false)
+        {
             existing.push(text.clone());
         }
     }
@@ -1087,8 +1089,24 @@ pub struct ExtractReport {
 pub fn archive_stem(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
     for suffix in [
-        ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tar.zstd", ".tgz", ".tbz2", ".tbz", ".txz",
-        ".tzst", ".tar", ".zip", ".7z", ".gz", ".bz2", ".xz", ".zst", ".zstd",
+        ".tar.gz",
+        ".tar.bz2",
+        ".tar.xz",
+        ".tar.zst",
+        ".tar.zstd",
+        ".tgz",
+        ".tbz2",
+        ".tbz",
+        ".txz",
+        ".tzst",
+        ".tar",
+        ".zip",
+        ".7z",
+        ".gz",
+        ".bz2",
+        ".xz",
+        ".zst",
+        ".zstd",
     ] {
         if lower.ends_with(suffix) {
             let base = &name[..name.len() - suffix.len()];
@@ -1169,7 +1187,9 @@ pub fn detect_archive(path: &Path) -> Result<ArchiveFormat, String> {
         );
     }
     let head = read_head(path, 512)?;
-    if head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") || head.starts_with(b"PK\x07\x08")
+    if head.starts_with(b"PK\x03\x04")
+        || head.starts_with(b"PK\x05\x06")
+        || head.starts_with(b"PK\x07\x08")
     {
         return Ok(ArchiveFormat::Zip);
     }
@@ -1233,7 +1253,11 @@ fn safe_join(target: &Path, rel: &Path) -> Option<PathBuf> {
             _ => return None,
         }
     }
-    if pushed { Some(out) } else { None }
+    if pushed {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 fn extract_zip_entries(
@@ -1484,8 +1508,8 @@ pub fn extract_archive(
             if out.exists() {
                 report.overridden += 1;
             }
-            let mut f =
-                fs::File::create(&out).map_err(|e| format!("写入失败（{}）：{e}", out.display()))?;
+            let mut f = fs::File::create(&out)
+                .map_err(|e| format!("写入失败（{}）：{e}", out.display()))?;
             let n = std::io::copy(&mut dec, &mut f)
                 .map_err(|e| format!("解压失败（{}）：{e}", file_label(src)))?;
             report.files = 1;
@@ -1727,7 +1751,16 @@ mod tests {
         assert!(upload_chunk(&dir, "a.bin", "../escape", 0, 1, b"x", true).is_err());
         assert!(upload_chunk(&dir, "a.bin", "short", 0, 1, b"x", true).is_err());
         // 超过 2GB 上限 → 首片即拒，不白传
-        assert!(upload_chunk(&dir, "a.bin", "abcdefgh1", 0, MAX_UPLOAD_SIZE + 1, b"x", true).is_err());
+        assert!(upload_chunk(
+            &dir,
+            "a.bin",
+            "abcdefgh1",
+            0,
+            MAX_UPLOAD_SIZE + 1,
+            b"x",
+            true
+        )
+        .is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1815,7 +1848,10 @@ mod tests {
         assert_eq!(detect_archive(&src).unwrap(), ArchiveFormat::Gzip);
         let r = extract_archive(&src, &dir.join("out"), None).unwrap();
         assert_eq!(r.files, 1);
-        assert_eq!(fs::read(dir.join("out/note.txt")).unwrap(), b"single payload");
+        assert_eq!(
+            fs::read(dir.join("out/note.txt")).unwrap(),
+            b"single payload"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1916,16 +1952,37 @@ mod tests {
     #[test]
     fn parses_single_byte_ranges() {
         assert_eq!(parse_byte_range(None, 100), ByteRange::None);
-        assert_eq!(parse_byte_range(Some("bytes=0-9"), 100), ByteRange::Valid(0, 9));
-        assert_eq!(parse_byte_range(Some("bytes=90-"), 100), ByteRange::Valid(90, 99));
-        assert_eq!(parse_byte_range(Some("bytes=-10"), 100), ByteRange::Valid(90, 99));
+        assert_eq!(
+            parse_byte_range(Some("bytes=0-9"), 100),
+            ByteRange::Valid(0, 9)
+        );
+        assert_eq!(
+            parse_byte_range(Some("bytes=90-"), 100),
+            ByteRange::Valid(90, 99)
+        );
+        assert_eq!(
+            parse_byte_range(Some("bytes=-10"), 100),
+            ByteRange::Valid(90, 99)
+        );
         // 尾部超界自动收敛到文件末尾
-        assert_eq!(parse_byte_range(Some("bytes=90-999"), 100), ByteRange::Valid(90, 99));
+        assert_eq!(
+            parse_byte_range(Some("bytes=90-999"), 100),
+            ByteRange::Valid(90, 99)
+        );
         // 越界/空区间 → 416
-        assert_eq!(parse_byte_range(Some("bytes=100-"), 100), ByteRange::Unsatisfiable);
-        assert_eq!(parse_byte_range(Some("bytes=-0"), 100), ByteRange::Unsatisfiable);
+        assert_eq!(
+            parse_byte_range(Some("bytes=100-"), 100),
+            ByteRange::Unsatisfiable
+        );
+        assert_eq!(
+            parse_byte_range(Some("bytes=-0"), 100),
+            ByteRange::Unsatisfiable
+        );
         // 多区间/未知单位/语法错误 → 按整文件
-        assert_eq!(parse_byte_range(Some("bytes=0-1,3-4"), 100), ByteRange::None);
+        assert_eq!(
+            parse_byte_range(Some("bytes=0-1,3-4"), 100),
+            ByteRange::None
+        );
         assert_eq!(parse_byte_range(Some("items=0-1"), 100), ByteRange::None);
         assert_eq!(parse_byte_range(Some("bytes=abc"), 100), ByteRange::None);
         assert_eq!(ByteRange::Valid(90, 99).len(100), 10);

@@ -50,7 +50,11 @@ where
         Self {
             ttl: (ttl_secs > 0).then(|| Duration::from_secs(ttl_secs)),
             // `0` 保留为「不限」，不能被 `.max(16)` 吃掉（否则「设 0 = 不限」的调用方会静默变成 16 条）
-            max_entries: if max_entries == 0 { 0 } else { max_entries.max(16) },
+            max_entries: if max_entries == 0 {
+                0
+            } else {
+                max_entries.max(16)
+            },
             map: Mutex::new(HashMap::new()),
         }
     }
@@ -435,8 +439,8 @@ impl KeyHasher {
     /// 新建（`fold_case` = 是否折叠 ASCII 大小写）。
     pub fn new(fold_case: bool) -> Self {
         Self {
-            h1: 0xcbf2_9ce4_8422_2325,           // FNV-1a
-            h2: 0x9e37_79b9_7f4a_7c15,           // 另一随机种子
+            h1: 0xcbf2_9ce4_8422_2325, // FNV-1a
+            h2: 0x9e37_79b9_7f4a_7c15, // 另一随机种子
             len: 0,
             fold_case,
         }

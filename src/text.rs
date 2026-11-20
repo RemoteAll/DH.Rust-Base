@@ -325,7 +325,8 @@ pub fn mask_secret(value: &str, head: usize, tail: usize) -> String {
 /// `true/1/yes/on/是` → `true`，`false/0/no/off/否` → `false`，其余 `None`。
 ///
 /// 供 JSON 宽松取值（`JsonValue::to_bool` / `value_to_bool`）与内存数据库字段值共用。
-pub fn parse_bool(text: &str) -> Option<bool> {    let text = text.trim();
+pub fn parse_bool(text: &str) -> Option<bool> {
+    let text = text.trim();
     if text == "是" {
         return Some(true);
     }
@@ -814,7 +815,8 @@ mod tests {
         use std::time::Instant;
 
         const N: usize = 3_000;
-        let unit = "{\"role\":\"user\",\"content\":\"请帮我总结这份招标文件里的技术要求与评分办法\"},";
+        let unit =
+            "{\"role\":\"user\",\"content\":\"请帮我总结这份招标文件里的技术要求与评分办法\"},";
         let mut text = String::from("{\"messages\":[");
         while text.len() < 16 * 1024 {
             text.push_str(unit);
@@ -867,7 +869,9 @@ mod tests {
                         last_space = true;
                     }
                 } else {
-                    out.extend_from_slice(c.to_ascii_lowercase().encode_utf8(&mut scratch).as_bytes());
+                    out.extend_from_slice(
+                        c.to_ascii_lowercase().encode_utf8(&mut scratch).as_bytes(),
+                    );
                     last_space = false;
                 }
             }

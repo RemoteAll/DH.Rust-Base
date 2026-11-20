@@ -405,7 +405,10 @@ pub fn harden_permissions(base: &Path, dirs: &[&str], exts: &[&str]) -> usize {
                     .and_then(|n| n.to_str())
                     .unwrap_or_default()
                     .to_ascii_lowercase();
-                if suffixes.iter().any(|suffix| name.ends_with(suffix.as_str())) {
+                if suffixes
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix.as_str()))
+                {
                     chmod(&path, 0o600);
                 }
             }

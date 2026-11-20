@@ -1046,12 +1046,7 @@ pub fn direct_json(call: DirectCall<'_>) -> Result<serde_json::Value, String> {
     let mut errors: Vec<String> = Vec::new();
     for scheme in schemes {
         let url = if call.query.trim().is_empty() {
-            format!(
-                "{scheme}://{}:{}{}",
-                call.host.trim(),
-                call.port,
-                call.path
-            )
+            format!("{scheme}://{}:{}{}", call.host.trim(), call.port, call.path)
         } else {
             format!(
                 "{scheme}://{}:{}{}?{}",

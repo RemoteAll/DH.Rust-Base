@@ -154,8 +154,13 @@ async fn static_files_precompressed_gzip() {
     let addr = start(r).await;
 
     // ① 接受 gzip：下发 .gz 字节 + 编码头 + Vary，Content-Type 仍按原始扩展名
-    let (status, head, body) =
-        http_call_raw(addr, "GET", "/app.js", &[("Accept-Encoding", "gzip, deflate")]).await;
+    let (status, head, body) = http_call_raw(
+        addr,
+        "GET",
+        "/app.js",
+        &[("Accept-Encoding", "gzip, deflate")],
+    )
+    .await;
     assert_eq!(status, 200);
     let lower_head = head.to_ascii_lowercase();
     assert!(

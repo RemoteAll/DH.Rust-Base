@@ -564,10 +564,12 @@ impl ConnStats {
         // CAS 循环：兼容老稳定版（不依赖 fetch_update/try_update 的新旧差异），且防下溢
         let mut cur = self.current.load(Ordering::Relaxed);
         while cur > 0 {
-            match self
-                .current
-                .compare_exchange_weak(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
-            {
+            match self.current.compare_exchange_weak(
+                cur,
+                cur - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => return,
                 Err(v) => cur = v,
             }
@@ -1534,14 +1536,18 @@ mod envelope_tests {
         assert!(
             resp.headers
                 .iter()
-                .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.starts_with("application/json")),
+                .any(|(k, v)| k.eq_ignore_ascii_case("content-type")
+                    && v.starts_with("application/json")),
             "{:?}",
             resp.headers
         );
         let text = String::from_utf8_lossy(&resp.body).to_string();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["ok"], serde_json::Value::Bool(false));
-        assert_eq!(v["message"], serde_json::Value::String("没有权限".to_string()));
+        assert_eq!(
+            v["message"],
+            serde_json::Value::String("没有权限".to_string())
+        );
     }
 
     /// 成功信封：`ok=true` + `message` + `data`（无负载时 data 为 null，前端不必判空）。
@@ -1568,7 +1574,13 @@ mod envelope_tests {
         for ok in ["127.0.0.1:5501", "127.0.0.1", "[::1]:5501", "::1"] {
             assert!(is_loopback_peer(ok), "{ok} 应判为回环");
         }
-        for bad in ["192.168.1.10:5501", "10.0.0.1", "[2001:db8::1]:5501", "127.0.0.2:80", ""] {
+        for bad in [
+            "192.168.1.10:5501",
+            "10.0.0.1",
+            "[2001:db8::1]:5501",
+            "127.0.0.2:80",
+            "",
+        ] {
             assert!(!is_loopback_peer(bad), "{bad} 不应判为回环");
         }
     }

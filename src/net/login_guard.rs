@@ -165,22 +165,12 @@ impl Default for UserDelayGuard {
 impl UserDelayGuard {
     /// 默认策略：15 分钟窗口、200ms × 次数、封顶 3s、最多 4096 个账号。
     pub fn new() -> Self {
-        Self::with_policy(
-            15 * 60,
-            200,
-            3_000,
-            4096,
-        )
+        Self::with_policy(15 * 60, 200, 3_000, 4096)
     }
 
     /// 自定义策略。`window_secs`：失败统计窗口（秒）；`base_ms`：每次失败的基准延时；
     /// `cap_ms`：延时封顶；`max_keys`：账号表上限（至少 16）。
-    pub fn with_policy(
-        window_secs: u64,
-        base_ms: u64,
-        cap_ms: u64,
-        max_keys: usize,
-    ) -> Self {
+    pub fn with_policy(window_secs: u64, base_ms: u64, cap_ms: u64, max_keys: usize) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
             window: Duration::from_secs(window_secs.max(1)),
@@ -192,9 +182,7 @@ impl UserDelayGuard {
 
     /// 纯函数：第 `failures` 次失败后应延时多少毫秒（`min(cap, base × 次数)`）。
     pub fn delay_ms(base_ms: u64, cap_ms: u64, failures: u32) -> u64 {
-        (failures as u64)
-            .saturating_mul(base_ms)
-            .min(cap_ms)
+        (failures as u64).saturating_mul(base_ms).min(cap_ms)
     }
 
     /// 该账号当前窗口内的失败次数。

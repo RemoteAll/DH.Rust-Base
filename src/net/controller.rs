@@ -319,6 +319,85 @@ thread_local! {
     static ENGINES: RefCell<HashMap<PathBuf, Rc<ViewEngine>>> = RefCell::new(HashMap::new());
 }
 
+/// 视图目录约定（C# MVC / Areas）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewConvention {
+    /// 平铺约定：`Views/{Area}/{Controller}/{Action}.cshtml`。
+    #[default]
+    Flat,
+    /// C# Areas 约定：`Areas/{Area}/Views/{Controller}/{Action}.cshtml`。
+    Areas,
+}
+
+impl ViewConvention {
+    /// 默认根目录名（`Views` / `Areas`）。
+    pub fn root_name(&self) -> &'static str {
+        match self {
+            ViewConvention::Flat => "Views",
+            ViewConvention::Areas => "Areas",
+        }
+    }
+
+    /// 控制器路径（含 Area 前缀）。
+    pub fn controller(&self, area: &str, controller: &str) -> String {
+        let controller = controller.trim_matches('/');
+        match self {
+            ViewConvention::Flat => format!("{}/{}", area.trim_matches('/'), controller),
+            ViewConvention::Areas => {
+                if controller.is_empty() {
+                    format!("{}/Views", area.trim_matches('/'))
+                } else {
+                    format!("{}/Views/{}", area.trim_matches('/'), controller)
+                }
+            }
+        }
+    }
+
+    /// 共享视图控制器（`Shared` / `{Area}/Views/Shared`）。
+    pub fn shared_controller(&self, area: &str) -> String {
+        match self {
+            ViewConvention::Flat => "Shared".to_string(),
+            ViewConvention::Areas => format!("{}/Views/Shared", area.trim_matches('/')),
+        }
+    }
+
+    /// 布局名（供 `@{ Layout = "..."; }`）。
+    pub fn layout_name(&self, area: &str) -> String {
+        match self {
+            ViewConvention::Flat => "Shared/_Layout".to_string(),
+            ViewConvention::Areas => {
+                format!("{}/Views/Shared/_AdminLayout", area.trim_matches('/'))
+            }
+        }
+    }
+
+    /// 视图文件相对路径（含 `.cshtml`）。
+    pub fn view_path(&self, area: &str, controller: &str, view: &str) -> String {
+        let controller = controller.trim_matches('/');
+        match self {
+            ViewConvention::Flat => {
+                format!("{}/{}/{}.cshtml", area.trim_matches('/'), controller, view)
+            }
+            ViewConvention::Areas => format!(
+                "{}/Views/{}/{}.cshtml",
+                area.trim_matches('/'),
+                controller,
+                view
+            ),
+        }
+    }
+
+    /// 共享视图文件相对路径（含 `.cshtml`）。
+    pub fn shared_path(&self, area: &str, name: &str) -> String {
+        match self {
+            ViewConvention::Flat => format!("Shared/{name}.cshtml"),
+            ViewConvention::Areas => {
+                format!("{}/Views/Shared/{name}.cshtml", area.trim_matches('/'))
+            }
+        }
+    }
+}
+
 /// 视图渲染器：MVC 约定 `Views/{Controller}/{Action}.cshtml`；控制器前缀可含 `/`（Area）。
 ///
 /// 视图查找大小写宽容：先**逐段 Pascal 化**（C# 约定目录，`admin/config` →
@@ -326,10 +405,14 @@ thread_local! {
 ///
 /// **区域回退**（[`ViewRenderer::with_fallback_area`]）：`{Area}/{Controller}` 在指定区域
 /// 找不到时，回退到默认区域的同名视图——对齐 ASP.NET Core Areas 与视图重写。
+///
+/// **目录约定**（[`ViewConvention`]）：默认平铺 `Views/...`；`Areas` 约定下控制器路径为
+/// `{Area}/Views/{Controller}`，视图根为 `Areas`。
 pub struct ViewRenderer {
     root: PathBuf,
     /// 回退区域（如 `Admin`）；`None` = 不回退
     fallback_area: Option<String>,
+    convention: ViewConvention,
 }
 
 impl ViewRenderer {
@@ -338,20 +421,42 @@ impl ViewRenderer {
         ViewRenderer {
             root: PathBuf::from("Views"),
             fallback_area: None,
+            convention: ViewConvention::Flat,
         }
     }
 
-    /// 指定视图根目录。
+    /// 指定视图根目录（平铺约定 `Views/...`）。
     pub fn with_root(root: impl Into<PathBuf>) -> ViewRenderer {
         ViewRenderer {
             root: root.into(),
             fallback_area: None,
+            convention: ViewConvention::Flat,
+        }
+    }
+
+    /// 指定 **C# Areas 根目录**（通常为 `Areas`），使用 `Areas/{Area}/Views/...` 约定。
+    pub fn with_areas_root(root: impl Into<PathBuf>) -> ViewRenderer {
+        ViewRenderer {
+            root: root.into(),
+            fallback_area: None,
+            convention: ViewConvention::Areas,
         }
     }
 
     /// 视图根目录。
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// 当前目录约定。
+    pub fn convention(&self) -> ViewConvention {
+        self.convention
+    }
+
+    /// 设置目录约定（链式）。
+    pub fn with_convention(mut self, convention: ViewConvention) -> ViewRenderer {
+        self.convention = convention;
+        self
     }
 
     /// 当前回退区域（未设置时为 `None`）。
@@ -416,6 +521,36 @@ impl ViewRenderer {
             let _ = (name, model);
             Err("视图渲染需要启用 dhrust 的 razor feature".to_string())
         }
+    }
+
+    /// 按 Area 约定渲染（自动拼控制器路径）。
+    ///
+    /// - `Flat`：`Views/{Area}/{Controller}/{View}.cshtml`
+    /// - `Areas`：`Areas/{Area}/Views/{Controller}/{View}.cshtml`
+    pub fn render_area(
+        &self,
+        area: &str,
+        controller: &str,
+        action: &str,
+        view: &str,
+        model: &Json,
+    ) -> Result<String, String> {
+        let controller = self.convention.controller(area, controller);
+        self.render(&controller, action, view, model)
+    }
+
+    /// 按 Area 约定渲染共享视图。
+    ///
+    /// - `Flat`：`Views/Shared/{Name}.cshtml`
+    /// - `Areas`：`Areas/{Area}/Views/Shared/{Name}.cshtml`
+    pub fn render_shared_area(
+        &self,
+        area: &str,
+        name: &str,
+        model: &Json,
+    ) -> Result<String, String> {
+        let controller = self.convention.shared_controller(area);
+        self.render(&controller, name, name, model)
     }
 
     /// 约定解析：返回相对视图名（`{Controller}/{View}`，不含扩展名）。
@@ -591,6 +726,70 @@ mod tests {
         assert!(
             text.contains("\"code\":401") && text.contains("Unauthorized"),
             "{text}"
+        );
+    }
+
+    #[cfg(feature = "razor")]
+    #[test]
+    fn area_views_follow_csharp_convention() {
+        let dir = std::env::temp_dir().join(format!(
+            "dhrust-area-view-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let views = dir.join("Areas").join("Admin").join("Views");
+        std::fs::create_dir_all(views.join("Config")).unwrap();
+        std::fs::create_dir_all(views.join("Shared")).unwrap();
+        std::fs::write(
+            views.join("Shared").join("_AdminLayout.cshtml"),
+            "<html>@RenderBody()</html>",
+        )
+        .unwrap();
+        std::fs::write(
+            views.join("Config").join("Index.cshtml"),
+            "@{ Layout = \"Admin/Views/Shared/_AdminLayout\"; }<p>@Model.Title</p>",
+        )
+        .unwrap();
+
+        let renderer = ViewRenderer::with_areas_root(dir.join("Areas"));
+        let html = renderer
+            .render_area(
+                "Admin",
+                "Config",
+                "Index",
+                "Index",
+                &serde_json::json!({ "Title": "Admin" }),
+            )
+            .expect("Areas 视图应渲染成功");
+        assert!(html.contains("<p>Admin</p>"), "{html}");
+        assert!(html.contains("<html>"), "应套用 Areas 布局：{html}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn view_convention_paths_match_csharp_layout() {
+        assert_eq!(
+            ViewConvention::Areas.view_path("Admin", "Config", "Index"),
+            "Admin/Views/Config/Index.cshtml"
+        );
+        assert_eq!(
+            ViewConvention::Areas.shared_path("Admin", "_Layout"),
+            "Admin/Views/Shared/_Layout.cshtml"
+        );
+        assert_eq!(
+            ViewConvention::Areas.layout_name("Admin"),
+            "Admin/Views/Shared/_AdminLayout"
+        );
+        assert_eq!(
+            ViewConvention::Flat.view_path("Admin", "Config", "Index"),
+            "Admin/Config/Index.cshtml"
+        );
+        assert_eq!(
+            ViewConvention::Flat.shared_path("Admin", "Prompt"),
+            "Shared/Prompt.cshtml"
         );
     }
 

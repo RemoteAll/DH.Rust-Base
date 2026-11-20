@@ -248,10 +248,7 @@ mod tests {
         );
 
         let json = serde_json::json!({"type":"message_start"});
-        assert_eq!(
-            json_frame(&json),
-            format!("data: {json}\n\n").into_bytes()
-        );
+        assert_eq!(json_frame(&json), format!("data: {json}\n\n").into_bytes());
         assert_eq!(
             event_json_frame("message_start", &json),
             format!("event: message_start\ndata: {json}\n\n").into_bytes()

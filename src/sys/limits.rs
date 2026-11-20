@@ -192,7 +192,11 @@ fn raise_nofile_impl(target: u64) -> Result<(u64, u64, u64, u64), String> {
         let old_soft = cur.rlim_cur as u64;
         let old_hard = cur.rlim_max as u64;
         let root = libc::geteuid() == 0;
-        let mut want_hard = if root { target.max(old_hard) } else { target.min(old_hard) };
+        let mut want_hard = if root {
+            target.max(old_hard)
+        } else {
+            target.min(old_hard)
+        };
         let mut want_soft = target.min(want_hard);
         let mut want = libc::rlimit {
             rlim_cur: want_soft as libc::rlim_t,
@@ -261,7 +265,8 @@ pub fn write_systemd_dropin(unit: &str, want: u64) -> String {
         return "跳过（非 Linux）".to_string();
     }
     if !is_root() {
-        return "!进程非 root，无法写 systemd 单元：请用 root 启动服务，或手工加 LimitNOFILE".to_string();
+        return "!进程非 root，无法写 systemd 单元：请用 root 启动服务，或手工加 LimitNOFILE"
+            .to_string();
     }
     let dir = PathBuf::from(format!("/etc/systemd/system/{unit}.d"));
     let path = dir.join("99-nofile.conf");
@@ -281,7 +286,10 @@ pub fn write_systemd_dropin(unit: &str, want: u64) -> String {
     if let Err(e) = std::fs::write(&path, &body) {
         return format!("!写入 {} 失败：{e}", path.display());
     }
-    match std::process::Command::new("systemctl").arg("daemon-reload").output() {
+    match std::process::Command::new("systemctl")
+        .arg("daemon-reload")
+        .output()
+    {
         Ok(o) if o.status.success() => format!(
             "已写入 {}（LimitNOFILE={want}）并 daemon-reload；**重启服务后生效**",
             path.display()
@@ -315,10 +323,15 @@ mod tests {
                     Max open files            1024                 1048576              files\n";
         assert_eq!(parse_limits(text), Some((1024, 1_048_576)));
 
-        let unlimited = "Max open files            unlimited            unlimited            files\n";
+        let unlimited =
+            "Max open files            unlimited            unlimited            files\n";
         assert_eq!(parse_limits(unlimited), Some((u64::MAX, u64::MAX)));
 
-        assert_eq!(parse_limits("Max processes 100 200\n"), None, "只认 fd 那一行");
+        assert_eq!(
+            parse_limits("Max processes 100 200\n"),
+            None,
+            "只认 fd 那一行"
+        );
     }
 
     #[test]
