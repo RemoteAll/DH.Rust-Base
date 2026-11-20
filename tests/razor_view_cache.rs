@@ -2,7 +2,7 @@
 #![cfg(feature = "razor")]
 
 use dhrust::razor::view::{DirViewLoader, ViewEngine};
-use dhrust::razor::Value;
+use dhrust::razor::{Options, Value};
 
 #[test]
 fn template_cache_invalidates_on_file_change() {
@@ -19,7 +19,14 @@ fn template_cache_invalidates_on_file_change() {
     let tpl = dir.join("template.cshtml");
     std::fs::write(&tpl, "A:@Model.Name").unwrap();
 
-    let engine = ViewEngine::new(Box::new(DirViewLoader::new(&dir)));
+    // ★ 必须关掉「变更戳缓存」（`stamp_ttl_ms` 默认 1000ms）：本用例验的是
+    // 「写完下一次渲染立即可见」，而默认 TTL 会让这里的三次瞬时写入**全部命中缓存**
+    // —— 那是性能设计（稳态渲染零 stat），不是缺陷。要用默认值就得 sleep 过 TTL，
+    // 但那样用例会又慢又依赖文件系统时间粒度；`Options` 注释也写明「调测期可设 0」。
+    let engine = ViewEngine::with_options(
+        Box::new(DirViewLoader::new(&dir)),
+        Options { stamp_ttl_ms: 0, ..Default::default() },
+    );
     let model = Value::from(serde_json::json!({ "Name": "x" }));
 
     // 首次渲染（解析 + 缓存）
