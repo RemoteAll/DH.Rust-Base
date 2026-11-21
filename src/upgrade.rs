@@ -637,27 +637,49 @@ pub fn replace_file_with(
     }
     #[cfg(not(unix))]
     {
+        let stamp = crate::times::now_local_ms_text().replace([' ', ':', '-', '.'], "");
         // 目标先改名让位（运行中的 exe 不能删除/覆盖，但可以改名）
         let mut backup: Option<PathBuf> = None;
         if dst.exists() {
-            let stamp = crate::times::now_local_ms_text().replace([' ', ':', '-', '.'], "");
             let old = PathBuf::from(format!("{}.old-{stamp}", dst.display()));
             std::fs::rename(dst, &old)
                 .map_err(|e| format!("旧程序改名让位失败（{}）：{e}", dst.display()))?;
             backup = Some(old);
         }
+        // ★ 跨盘：`rename` 不能跨卷（Windows `ERROR_NOT_SAME_DEVICE`）。
+        //   实测场景：暂存区在数据目录（`...\Update`，可能在 C:）、程序在另一个盘（如 G:），
+        //   直接 rename 必然失败、重试再多次也没用。此时先复制到**目标同目录**的临时名，
+        //   再同盘 rename 就位；语义与 rename 一致（成功后源文件被消费）。
+        let temp = PathBuf::from(format!("{}.new-{stamp}", dst.display()));
         let mut last = String::new();
-        for i in 0..=retries {
-            match std::fs::rename(src, dst) {
+        let mut via_temp = false;
+        let mut i = 0u32;
+        while i <= retries {
+            let from = if via_temp { temp.as_path() } else { src };
+            match std::fs::rename(from, dst) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     last = e.to_string();
+                    if !via_temp && is_cross_device(&e) {
+                        match std::fs::copy(src, &temp) {
+                            Ok(_) => {
+                                via_temp = true;
+                                let _ = std::fs::remove_file(src);
+                                continue; // 立刻重试，不占用重试次数
+                            }
+                            Err(ce) => {
+                                last = format!("{last}；复制到目标目录失败：{ce}");
+                            }
+                        }
+                    }
                     if i < retries {
                         std::thread::sleep(interval);
                     }
+                    i += 1;
                 }
             }
         }
+        let _ = std::fs::remove_file(&temp);
         // 失败回滚：把旧文件改回来，避免「目标位置空着」
         if let Some(old) = backup {
             let _ = std::fs::rename(&old, dst);
@@ -900,6 +922,18 @@ fn write_atomic(from: &Path, to: &Path) -> Result<(), String> {
         let _ = std::fs::remove_file(&tmp);
         format!("替换失败（{}）：{e}", to.display())
     })
+}
+
+/// `rename` 跨卷失败（Windows `ERROR_NOT_SAME_DEVICE` = 17，Unix `EXDEV` = 18）。
+fn is_cross_device(e: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        e.raw_os_error() == Some(17)
+    }
+    #[cfg(not(windows))]
+    {
+        e.raw_os_error() == Some(18)
+    }
 }
 
 /// 两个文件内容是否一致（先比长度，再逐字节/分块比）。
