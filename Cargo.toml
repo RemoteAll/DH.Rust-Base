@@ -30,6 +30,10 @@ quick-xml = "0.41"
 # ———— feature `plugin`（插件包格式 + 插件源目录 Ed25519 签名；Pek.RAgent ↔ Pek.RPanlServer 共用）————
 ed25519-dalek = { version = "2", optional = true }
 
+# ———— feature `sso-rs256`（OIDC 标准签名：RS256 = RSA PKCS#1 v1.5 + SHA-256；JWKS 出公钥）————
+# 纯 Rust，可 zig 交叉编 musl；只有需要当 IdP（发 id_token）时才编进来。
+rsa = { version = "0.9", optional = true, features = ["sha2", "pem"] }
+
 # ———— feature `toml`（TOML 配置维护管线：保注释补齐/类型修正回写/未知项识别/备份写入）————
 toml = { version = "1", optional = true }
 toml_edit = { version = "0.25", optional = true }
@@ -188,6 +192,14 @@ net-tls = [
     "dep:rustls-pemfile",
     "dep:rcgen",
 ]
+# SSO / OIDC（本库当 IdP 或当 Client 的通用件）：
+#   - `sso`       —— `sso::pkce`（S256 挑战/校验/随机 verifier，零新依赖）
+#   - `sso-rs256` —— `sso::rs256`（RS256 签名 / 公钥 JWK / 用 JWKS 验签；OIDC 标准做法）
+#   - `sso-client` —— `sso::client`（`SsoClient`：授权码 + PKCE + nonce + 换票 + userinfo + refresh）
+# 消费方：HLZX.EIP（当 IdP）。其它 Rust 项目当 RP 时开 `sso-client` 即可，不必自己再写一份。
+sso = []
+sso-rs256 = ["sso", "dep:rsa"]
+sso-client = ["sso", "http-client"]
 
 [profile.release]
 # 发布构建启用全量 LTO 与单代码元：模板引擎等热路径可跨模块内联（基准见 tools/bench-view）

@@ -21,6 +21,8 @@ pub mod secret; // 可逆加密（AES-256-GCM；敏感值“防直读”存储�
 #[cfg(feature = "service")]
 pub mod service; // 跨平台服务管理（Windows SCM / systemd / procd / SysV / launchd；Pek.RAgent 下沉）
 pub mod sign;
+#[cfg(feature = "sso")]
+pub mod sso; // SSO/OIDC 通用件（PKCE / RS256+JWKS / SsoClient）：HLZX.EIP 当 IdP，其它 Rust 项目当 RP
 pub mod staragent; // 星尘（StarAgent）配置注册：影子模式条目的 upsert/移除（Pek.RPanlServer 与 HlktechIoT MQTT 共用）
 #[cfg(feature = "term")]
 pub mod term; // 真 PTY 会话引擎（ConPTY/openpty；在线终端等服务端能力共用）
