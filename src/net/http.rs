@@ -904,6 +904,9 @@ async fn run_connection(
 }
 
 /// 把明文请求 301 到同端口的 https（保留 path 与查询串）。
+///
+/// 只在 `net-tls` 的同端口升级分支使用；不加 cfg 的话，未启用 TLS 的消费方会报 dead_code。
+#[cfg(feature = "net-tls")]
 fn redirect_to_https(req: &HttpRequest, https_port: u16) -> HttpOutcome {
     let host = req.header("host").unwrap_or("127.0.0.1").trim().to_string();
     // 去掉 Host 里的原端口（否则会拼成 ip:5501:5501）
@@ -926,6 +929,9 @@ fn redirect_to_https(req: &HttpRequest, https_port: u16) -> HttpOutcome {
 }
 
 /// 对端是否为回环（`127.0.0.1:x` / `[::1]:x` / 裸 `::1`）。
+///
+/// 只在 `net-tls` 的回环豁免分支使用（同上，避免未启用 TLS 时 dead_code）。
+#[cfg(feature = "net-tls")]
 fn is_loopback_peer(remote: &str) -> bool {
     let host = if let Some(rest) = remote.strip_prefix('[') {
         rest.split(']').next().unwrap_or("")
@@ -1569,6 +1575,7 @@ mod envelope_tests {
     }
 
     /// 回环判定：只认 `127.0.0.1` / `::1`（含带端口与方括号），其它一律 false。
+    #[cfg(feature = "net-tls")]
     #[test]
     fn loopback_peer_detection() {
         for ok in ["127.0.0.1:5501", "127.0.0.1", "[::1]:5501", "::1"] {
