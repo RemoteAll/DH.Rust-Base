@@ -6,6 +6,7 @@
 //! - [`apply_type_fixes`]：把字段级容错（[`coerce_json`](super::coerce_json)）结果回写文档
 //! - [`unknown_keys`]：收集无法识别的配置项（键名拼错/放错 `[段]`，支持自由映射段豁免）
 //! - [`backup_and_write`]：先备份 `.bak` 再覆盖写入
+//! - [`sanitize_control_chars`]：清掉 TOML 里**任何位置都不接受**的 ASCII 控制字符（先备份，自愈而非报错）
 //!
 //! 完整流程编排（加载/热解析/损坏重建/未知项提示）由调用方组合，参考
 //! tcp-scanner-server 的 config.rs（本模块的实践来源）。
@@ -138,6 +139,8 @@ pub fn prune_to_schema(
     template: &Value,
     free_form_sections: &[&str],
 ) -> io::Result<usize> {
+    // 先自愈非法控制字符：它们会让解析**必然**失败，清理是唯一可做的事（有改动先备份）
+    sanitize_control_chars(path)?;
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
@@ -418,6 +421,52 @@ pub fn backup_and_write(path: &Path, content: &str) -> io::Result<PathBuf> {
     Ok(bak)
 }
 
+/// 该字节是否是 TOML **任何位置都不接受**的 ASCII 控制字符（`\t` / `\n` / `\r` 之外）。
+fn is_forbidden_control(b: u8) -> bool {
+    b <= 0x08 || b == 0x0B || b == 0x0C || (0x0E..=0x1F).contains(&b)
+}
+
+/// 修掉 TOML 配置文本里的**非法控制字符**（`\t` / `\n` / `\r` 之外的 ASCII 控制符）。
+///
+/// 为什么需要：任何 TOML 解析器都不接受这些字节（`invalid comment character,
+/// expected printable characters`），而它们**不可能有任何合法用途**。现场来源之一是
+/// PowerShell **双引号 here-string** 把反引号当转义写进文件（如注释里的 `` `a `` → BEL `0x07`），
+/// 部署模板生成/手工粘贴都可能带进来。
+///
+/// 行为：
+/// - 文件不存在 / 没有这类字节 → `Ok(0)`，**不碰文件**；
+/// - 有 → 先备份为 `<file>.bak`（与 [`backup_and_write`] 同一约定）再覆盖写；
+/// - 清理后不是合法 UTF-8 → 不写，返回错误（不猜着改）。
+///
+/// [`prune_to_schema`] 会先调用本函数，所以配置维护链路天然自愈；
+/// 不走 prune 的调用方（只读解析自己的配置）可单独调用。
+///
+/// # 参数
+/// - `path`：配置文件路径。
+///
+/// # 返回值
+/// 删除的控制字符个数（0 = 无需处理）。
+pub fn sanitize_control_chars(path: &Path) -> io::Result<usize> {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let clean: Vec<u8> = bytes
+        .iter()
+        .copied()
+        .filter(|b| !is_forbidden_control(*b))
+        .collect();
+    let removed = bytes.len().saturating_sub(clean.len());
+    if removed == 0 {
+        return Ok(0);
+    }
+    let text = String::from_utf8(clean)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("清理后不是合法 UTF-8：{e}")))?;
+    backup_and_write(path, &text)?;
+    Ok(removed)
+}
+
 /// TOML **基本字符串**转义（不含两端引号；写 `Key = "…"` 时用）。
 ///
 /// 转义：`\` → `\\`、`"` → `\"`、`\n` → `\n`（字面两字符）、`\r`、`\t`，
@@ -463,6 +512,42 @@ pub fn quote_key(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 非法控制字符（BEL 等）必须被清掉，而 Tab/换行/CR 原样保留；改动前留 `.bak`，且幂等。
+    ///
+    /// 现场来源：PowerShell 双引号 here-string 里的反引号被当转义 → BEL(`0x07`) 落进注释，
+    /// TOML 报 `invalid comment character`（2026-11-25 生产）。
+    #[test]
+    fn sanitize_control_chars_removes_bel_and_keeps_whitespace() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("dhrust-toml-sanitize-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("cfg.toml");
+        // BEL(0x07) + 制表符(Tab 保留) + 换行(Tab 后) + CRLF 里的 CR 都要保留
+        std::fs::write(&p, b"# Seed the \x07rea table\tok\r\nkey = 1\n").unwrap();
+
+        assert_eq!(sanitize_control_chars(&p).unwrap(), 1, "应清掉 1 个控制字符");
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(text, "# Seed the rea table\tok\r\nkey = 1\n");
+        assert!(!text.contains('\u{7}'));
+
+        // 备份保留原始字节
+        let bak = backup_path(&p);
+        assert_eq!(
+            std::fs::read(&bak).unwrap(),
+            b"# Seed the \x07rea table\tok\r\nkey = 1\n"
+        );
+
+        // 幂等
+        assert_eq!(sanitize_control_chars(&p).unwrap(), 0);
+        // 不存在 = 0，不创建文件
+        assert_eq!(sanitize_control_chars(&dir.join("none.toml")).unwrap(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn merge_backfills_with_comments_and_keeps_values() {
