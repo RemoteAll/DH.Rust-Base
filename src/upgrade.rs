@@ -925,6 +925,10 @@ fn write_atomic(from: &Path, to: &Path) -> Result<(), String> {
 }
 
 /// `rename` 跨卷失败（Windows `ERROR_NOT_SAME_DEVICE` = 17，Unix `EXDEV` = 18）。
+///
+/// 只在 `#[cfg(not(unix))]` 的替换分支用到；Unix 分支是直接 `rename`，所以这里也要同样门控，
+/// 否则交叉编译 Linux/musl 时会报 `dead_code`。
+#[cfg(not(unix))]
 fn is_cross_device(e: &std::io::Error) -> bool {
     #[cfg(windows)]
     {
