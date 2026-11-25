@@ -97,7 +97,9 @@ webpki-roots = { version = "0.26", optional = true }
 # PEM 证书/私钥解析（HTTPS 服务端证书加载）
 rustls-pemfile = { version = "2", optional = true }
 # 自签证书生成（Agent HTTPS 监听开箱即用；纯 Rust，ring 后端）
-rcgen = { version = "0.13", optional = true, default-features = false, features = ["pem", "ring"] }
+# x509-parser：仅用于 `CertificateParams::from_ca_cert_pem`（续期时从磁盘恢复 CA 继续签发，
+# 客户端信任的根 CA 不变，设备不用重新导入）
+rcgen = { version = "0.13", optional = true, default-features = false, features = ["pem", "ring", "x509-parser"] }
 
 [target.'cfg(unix)'.dependencies]
 # 进程管理/系统采集：signal、sysconf、statvfs、malloc_trim、clock_settime 等
